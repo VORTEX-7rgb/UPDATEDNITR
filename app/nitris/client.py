@@ -280,5 +280,98 @@ class NitrisClient:
             return options[fallback_idx][0]
         return ""
 
+    # ── Messages Workflow ───────────────────────────────────────
+
+    async def fetch_messages_list(self) -> str:
+        """Fetch the AllMessages.aspx page."""
+        from app.nitris.constants import MESSAGES_PAGE_PATH
+        logger.info("Fetching all messages list...")
+        headers = {"Referer": f"{self.base_url}/nitris/Student/Home/Home.aspx"}
+        resp = await self.client.get(MESSAGES_PAGE_PATH, headers=headers, follow_redirects=False)
+        
+        if resp.status_code in (301, 302, 303, 307, 308):
+            loc = resp.headers.get("Location", "")
+            if "Login.aspx" in loc:
+                raise SessionExpiredError("Session expired — redirected to login.")
+            raise AttendanceWorkflowError(f"Messages GET redirected to {loc}")
+            
+        if resp.status_code != 200:
+            raise AttendanceWorkflowError(f"Messages GET returned {resp.status_code}")
+            
+        return resp.text
+
+    async def fetch_message_detail(self, token: str) -> str:
+        """Fetch details of a single message by token."""
+        from app.nitris.constants import MESSAGE_DETAIL_PATH
+        logger.info("Fetching message detail for token: %s", token)
+        url = f"{MESSAGE_DETAIL_PATH}?i={token}"
+        headers = {"Referer": f"{self.base_url}/nitris/Student/Home/AllMessages.aspx"}
+        resp = await self.client.get(url, headers=headers, follow_redirects=False)
+        
+        if resp.status_code in (301, 302, 303, 307, 308):
+            loc = resp.headers.get("Location", "")
+            if "Login.aspx" in loc:
+                raise SessionExpiredError("Session expired — redirected to login.")
+            raise AttendanceWorkflowError(f"Message Detail GET redirected to {loc}")
+            
+        if resp.status_code != 200:
+            raise AttendanceWorkflowError(f"Message Detail GET returned {resp.status_code}")
+            
+        return resp.text
+
+    async def submit_message_postback(self, event_target: str) -> tuple[str, str]:
+        """Submit an ASP.NET postback for the message list and follow redirect to detail page.
+        
+        Returns tuple of (real_token, detail_html).
+        """
+        from app.nitris.constants import MESSAGES_PAGE_PATH
+        from app.nitris.aspnet import extract_form_fields
+        from app.nitris.exceptions import AttendanceWorkflowError
+        import urllib.parse
+        
+        # 1. Fetch current list page to get fresh __VIEWSTATE and form fields
+        list_html = await self.fetch_messages_list()
+        form_state = extract_form_fields(list_html)
+        
+        # 2. Build postback payload
+        payload = {
+            **form_state,
+            "__EVENTTARGET": event_target,
+            "__EVENTARGUMENT": "",
+        }
+        
+        # 3. Post to AllMessages.aspx and follow redirects to detail page!
+        url = MESSAGES_PAGE_PATH
+        headers = {"Referer": f"{self.base_url}{MESSAGES_PAGE_PATH}"}
+        resp = await self.client.post(url, data=payload, headers=headers, follow_redirects=True)
+        
+        if resp.status_code != 200:
+            raise AttendanceWorkflowError(f"Message Postback returned status {resp.status_code}")
+            
+        # Extract token from final redirect URL
+        final_url = str(resp.url)
+        parsed_url = urllib.parse.urlparse(final_url)
+        params = urllib.parse.parse_qs(parsed_url.query)
+        token = params.get("i", [""])[0]
+        
+        if not token:
+            # Fallback: try parsing from response HTML or a query string
+            if "Message.aspx?i=" in final_url:
+                token = final_url.split("Message.aspx?i=")[-1]
+                
+        return token, resp.text
+
+    async def download_attachment(self, attachment_path: str) -> bytes:
+        """Download binary attachment files with active session cookies."""
+        logger.info("Downloading attachment path: %s", attachment_path)
+        headers = {"Referer": f"{self.base_url}/nitris/Student/Home/AllMessages.aspx"}
+        resp = await self.client.get(attachment_path, headers=headers)
+        
+        if resp.status_code != 200:
+            raise AttendanceWorkflowError(f"Failed to download attachment (status {resp.status_code})")
+            
+        return resp.content
+
     async def close(self) -> None:
         await self.client.aclose()
+

@@ -10,8 +10,8 @@ async def test():
     client = NitrisClient()
     url = client._build_attendance_url()
     print(f"  URL: {url}")
-    assert "Mw==" in url, "FAIL: = signs got encoded!"
-    assert "5a3+" in url, "FAIL: + sign got encoded!"
+    assert "Mw==" in str(url), "FAIL: = signs got encoded!"
+    assert "5a3+" in str(url), "FAIL: + sign got encoded!"
     print("  PASS: No URL encoding corruption.\n")
     
     print("[TEST 2] Attendance Fetch Flow requires valid credentials to test fully.")

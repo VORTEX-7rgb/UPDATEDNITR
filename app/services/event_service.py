@@ -4,7 +4,7 @@ import logging
 from typing import Optional, Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import Snapshot, Event
+from app.db.models import Snapshot, Event, EventType
 from app.db.repositories.event_repository import EventRepository
 
 logger = logging.getLogger(__name__)
@@ -62,7 +62,7 @@ class EventService:
                 }
                 event = await self.event_repo.create_event(
                     user_id=user_id,
-                    event_type="new_subject_added",
+                    event_type=EventType.NEW_SUBJECT_ADDED,
                     payload_json=payload,
                 )
                 events_created.append(event)
@@ -89,7 +89,7 @@ class EventService:
                 }
                 event = await self.event_repo.create_event(
                     user_id=user_id,
-                    event_type="new_subject_added",
+                    event_type=EventType.NEW_SUBJECT_ADDED,
                     payload_json=payload,
                 )
                 events_created.append(event)
@@ -114,7 +114,7 @@ class EventService:
                 }
                 event = await self.event_repo.create_event(
                     user_id=user_id,
-                    event_type="attendance_updated",
+                    event_type=EventType.ATTENDANCE_UPDATED,
                     payload_json=payload,
                 )
                 events_created.append(event)
@@ -132,7 +132,7 @@ class EventService:
                     }
                     absence_event = await self.event_repo.create_event(
                         user_id=user_id,
-                        event_type="new_absence_detected",
+                        event_type=EventType.NEW_ABSENCE_DETECTED,
                         payload_json=absence_payload,
                     )
                     events_created.append(absence_event)

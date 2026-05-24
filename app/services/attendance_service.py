@@ -2,6 +2,7 @@
 
 import logging
 import asyncio
+from typing import Optional
 
 import httpx
 
@@ -15,18 +16,21 @@ MAX_RETRIES = 2
 RETRY_DELAY = 2.0
 
 
-async def get_attendance_data(username: str, password: str) -> AttendanceResult:
+async def get_attendance_data(username: str, password: str, client: Optional[NitrisClient] = None) -> AttendanceResult:
     """Login → fetch attendance via postback workflow → parse.
 
     Retries ONLY on transient network/workflow failures.
     Auth and parse errors are raised immediately.
     ONE client instance — session persists across retries.
     """
-    client = NitrisClient()
-    try:
+    should_close = False
+    if client is None:
+        client = NitrisClient()
+        should_close = True
         # Login once
         await client.login(username, password)
 
+    try:
         # Fetch with retry on transient failures
         last_error: Exception | None = None
         for attempt in range(1, MAX_RETRIES + 1):
@@ -44,4 +48,5 @@ async def get_attendance_data(username: str, password: str) -> AttendanceResult:
         raise last_error or AttendanceWorkflowError("All attempts failed.")
 
     finally:
-        await client.close()
+        if should_close:
+            await client.close()

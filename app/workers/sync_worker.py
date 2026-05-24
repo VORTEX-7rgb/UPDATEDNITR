@@ -3,7 +3,13 @@
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Any
+
+def normalize_to_utc(dt: datetime) -> datetime:
+    """Normalize any datetime (aware or naive) to UTC timezone-aware datetime."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 from aiogram import Bot
 from aiogram.enums import ParseMode
@@ -12,8 +18,9 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from app.db.database import get_db_session, is_db_connection_error
-from app.db.models import User, SyncState, Event
+from app.db.models import User, SyncState, Event, EventType
 from app.db.crypto import decrypt_password
+from app.db.repositories.event_repository import EventRepository
 from app.services.attendance_service import get_attendance_data
 from app.services.snapshot_service import SnapshotService
 
@@ -57,8 +64,129 @@ async def wait_for_db_recovery(worker_name: str) -> None:
                 raise
 
 
-async def sync_user_data(user_id: int, roll_number: str, encrypted_pass: str, semaphore: asyncio.Semaphore) -> None:
-    """Sync attendance data for a single user with failure isolation and health tracking."""
+async def sync_messages_for_user(
+    user_id: int, 
+    roll_number: str, 
+    password: str, 
+    bot: Optional[Any] = None, 
+    client: Optional[Any] = None
+) -> None:
+    """Sync inbox messages for a single user using an active NitrisClient session."""
+    from app.nitris.client import NitrisClient
+    from app.nitris.parser import parse_messages_list_html, parse_message_detail_html
+    from app.db.repositories.inbox_repository import InboxRepository
+    from app.db.repositories.event_repository import EventRepository
+    
+    should_close = False
+    if client is None:
+        client = NitrisClient()
+        should_close = True
+        await client.login(roll_number, password)
+        
+    try:
+        # 1. Fetch raw messages list HTML
+        list_html = await client.fetch_messages_list()
+        scraped_messages = parse_messages_list_html(list_html)
+        
+        if not scraped_messages:
+            logger.info("No messages found on portal for user_id=%s", user_id)
+            return
+            
+        await wait_for_db_recovery(f"Sync-Inbox-{user_id}")
+        async with get_db_session() as session:
+            async with session.begin():
+                inbox_repo = InboxRepository(session)
+                event_repo = EventRepository(session)
+                
+                # Check each scraped message against database
+                for msg in scraped_messages:
+                    # Normalize scraped naive/aware sent_on to UTC
+                    normalized_scraped_sent_on = normalize_to_utc(msg["sent_on"])
+                    
+                    # Uniqueness query using stable portal_message_id!
+                    existing = await inbox_repo.get_by_portal_message_id(user_id, msg["portal_message_id"])
+                    
+                    if not existing:
+                        # 2. Brand new message!
+                        if msg["token"].startswith("postback:"):
+                            # Older historical message: store header only, do NOT fetch detail/notify
+                            new_msg = await inbox_repo.create_message(
+                                user_id=user_id,
+                                portal_message_id=msg["portal_message_id"],
+                                token=msg["token"],
+                                sender=msg["sender"],
+                                subject=msg["subject"],
+                                sent_on=normalized_scraped_sent_on,
+                                body=None,
+                                attachment_url=None
+                            )
+                            logger.info("Sync registered historical message ID %s for user %s (header only)", new_msg.portal_message_id, user_id)
+                        else:
+                            # Newly arrived message: fetch details live and emit notification event
+                            detail_html = await client.fetch_message_detail(msg["token"])
+                            detail_data = parse_message_detail_html(detail_html)
+                            
+                            new_msg = await inbox_repo.create_message(
+                                user_id=user_id,
+                                portal_message_id=msg["portal_message_id"],
+                                token=msg["token"],
+                                sender=msg["sender"],
+                                subject=msg["subject"],
+                                sent_on=normalized_scraped_sent_on,
+                                body=detail_data["body"],
+                                attachment_url=detail_data["attachment_url"]
+                            )
+                            
+                            await event_repo.create_event(
+                                user_id=user_id,
+                                event_type="new_message_received",
+                                payload_json={
+                                    "message_id": new_msg.id,
+                                    "sender": new_msg.sender,
+                                    "subject": new_msg.subject,
+                                    "body_snippet": new_msg.body[:150] + "..." if new_msg.body else "",
+                                    "has_attachment": bool(new_msg.attachment_url)
+                                }
+                            )
+                            logger.info("Sync detected new message ID %s for user %s", new_msg.portal_message_id, user_id)
+                        
+                    else:
+                        # 3. Message exists. Update token dynamically if it shifted to prevent duplicates and maintain callback functionality.
+                        if existing.token != msg["token"]:
+                            logger.info("Message token shifted from %s to %s for user %s. Updating token dynamically.", existing.token, msg["token"], user_id)
+                            existing.token = msg["token"]
+                            
+                        # Normalize existing timestamp to UTC before comparing
+                        existing_sent_on_utc = normalize_to_utc(existing.sent_on)
+                        
+                        # Check for edits safely in UTC
+                        if existing.subject != msg["subject"] or existing_sent_on_utc != normalized_scraped_sent_on:
+                            logger.info("Sync detected edited notice. Invalidating cache for token: %s", msg["token"])
+                            existing.subject = msg["subject"]
+                            existing.sent_on = normalized_scraped_sent_on
+                            existing.body = None
+                            existing.attachment_url = None
+                            existing.is_read = False
+                            
+                            await event_repo.create_event(
+                                user_id=user_id,
+                                event_type="message_updated",
+                                payload_json={
+                                    "message_id": existing.id,
+                                    "sender": existing.sender,
+                                    "subject": existing.subject,
+                                }
+                            )
+                            
+    except Exception as e:
+        logger.error("Failed to sync messages for User ID %d: %r", user_id, e)
+    finally:
+        if should_close:
+            await client.close()
+
+
+async def sync_user_data(user_id: int, roll_number: str, encrypted_pass: str, semaphore: asyncio.Semaphore, bot: Optional[Any] = None) -> None:
+    """Sync attendance and inbox messages for a single user with isolated failure tracking."""
     async with semaphore:
         now = datetime.now(timezone.utc)
         logger.info("Starting background sync for Roll: %s (User ID: %d)", roll_number, user_id)
@@ -71,15 +199,45 @@ async def sync_user_data(user_id: int, roll_number: str, encrypted_pass: str, se
             await _update_sync_state(user_id, success=False, error_msg=f"Decryption failed: {str(e)}", sync_time=now)
             return
 
-        # 2. Fetch latest attendance from NITRIS
+        from app.nitris.client import NitrisClient
+
+        # ONE authenticated session per user sync cycle
+        client = NitrisClient()
+        login_success = False
+        attendance_success = False
+        data = None
+
         try:
-            data = await get_attendance_data(roll_number, password)
+            logger.info("Single login path: authenticating session for User ID %d...", user_id)
+            await client.login(roll_number, password)
+            login_success = True
         except Exception as e:
-            logger.warning("Scraper failed to fetch data for Roll %s: %r", roll_number, e)
-            await _update_sync_state(user_id, success=False, error_msg=f"Scraper failed: {str(e)}", sync_time=now)
+            logger.error("Single login session failed for Roll %s: %r", roll_number, e)
+            await _update_sync_state(user_id, success=False, error_msg=f"Login failed: {str(e)}", sync_time=now)
+
+        try:
+            if login_success:
+                # 2. Fetch latest attendance using reuse client instance
+                try:
+                    data = await get_attendance_data(roll_number, password, client=client)
+                    attendance_success = True
+                except Exception as e:
+                    logger.warning("Scraper failed to fetch attendance for Roll %s: %r", roll_number, e)
+                    await _update_sync_state(user_id, success=False, error_msg=f"Scraper failed: {str(e)}", sync_time=now)
+
+                # 3. Fetch latest inbox messages using the SAME active client session
+                try:
+                    await sync_messages_for_user(user_id, roll_number, password, bot, client=client)
+                except Exception as e:
+                    logger.error("Inbox sync failed for Roll %s: %r", roll_number, e)
+        finally:
+            await client.close()
+            logger.info("Closed NitrisClient session for Roll %s (User ID: %d)", roll_number, user_id)
+
+        if not attendance_success or data is None:
             return
 
-        # 3. Save snapshot & events atomically in a transaction
+        # 4. Save snapshot & events atomically in a transaction
         try:
             await wait_for_db_recovery(f"Sync-User-{user_id}")
             async with get_db_session() as session:
@@ -91,13 +249,14 @@ async def sync_user_data(user_id: int, roll_number: str, encrypted_pass: str, se
                         attendance_result=data
                     )
             
-            # 4. Mark success in health tracker
+            # 5. Mark success in health tracker
             await _update_sync_state(user_id, success=True, error_msg=None, sync_time=now)
             logger.info("Successfully completed background sync for Roll: %s", roll_number)
 
         except Exception as e:
             logger.error("Failed to persist snapshot/events in database for User ID %d: %r", user_id, e)
             await _update_sync_state(user_id, success=False, error_msg=f"Database save failed: {str(e)}", sync_time=now)
+
 
 
 async def _update_sync_state(user_id: int, success: bool, error_msg: Optional[str], sync_time: datetime) -> None:
@@ -156,7 +315,8 @@ async def run_sync_worker(bot: Bot) -> None:
                         user_id=u.id,
                         roll_number=u.roll_number,
                         encrypted_pass=u.encrypted_password,
-                        semaphore=semaphore
+                        semaphore=semaphore,
+                        bot=bot
                     )
                     for u in users
                 ]
@@ -176,12 +336,12 @@ async def run_sync_worker(bot: Bot) -> None:
             await asyncio.sleep(SYNC_INTERVAL_SECONDS)
 
 
-def format_notification_message(event_type: str, payload: dict) -> str:
+def format_notification_message(event_type: EventType | str, payload: dict) -> str:
     """Build highly aesthetic HTML messages for different event types."""
     sub_name = payload.get("subject_name") or payload.get("subject_code", "Unknown")
     sub_code = payload.get("subject_code", "")
     
-    if event_type == "new_subject_added":
+    if event_type == EventType.NEW_SUBJECT_ADDED:
         return (
             f"📚 <b>New Subject Registered</b>\n\n"
             f"🎓 Course: <b>{sub_name}</b> ({sub_code})\n"
@@ -189,7 +349,7 @@ def format_notification_message(event_type: str, payload: dict) -> str:
             f"📊 Initial Stats: TC: {payload.get('tc', '0')} | UA: {payload.get('ua', '0')} | OA: 0\n"
         )
         
-    elif event_type == "attendance_updated":
+    elif event_type == EventType.ATTENDANCE_UPDATED:
         msg = f"📊 <b>Attendance Update Detected</b>\n\n🔸 Subject: <b>{sub_name}</b> ({sub_code})\n📈 Class Stats changed:\n"
         changes = payload.get("changes", {})
         for field, delta in changes.items():
@@ -197,7 +357,7 @@ def format_notification_message(event_type: str, payload: dict) -> str:
             msg += f"  • {name}: <b>{delta.get('old')} ➡️ {delta.get('new')}</b>\n"
         return msg
         
-    elif event_type == "new_absence_detected":
+    elif event_type == EventType.NEW_ABSENCE_DETECTED:
         return (
             f"🚨 <b>New Absence Logged!</b>\n\n"
             f"🔸 Subject: <b>{sub_name}</b> ({sub_code})\n"
@@ -205,6 +365,25 @@ def format_notification_message(event_type: str, payload: dict) -> str:
             f"📉 Unauthorized Absences: <b>{payload.get('old_ua', '0')} ➡️ {payload.get('new_ua', '0')}</b>\n"
             f"📊 Current Stats: TC: {payload.get('total_classes', '0')} | UA: {payload.get('new_ua', '0')}\n\n"
             f"<i>Keep an eye on your attendance to avoid debarment!</i>"
+        )
+        
+    elif event_type == EventType.NEW_MESSAGE_RECEIVED:
+        attach_str = "📎 Attachment included" if payload.get("has_attachment") else "No attachments"
+        return (
+            f"📩 <b>New Message Received!</b>\n\n"
+            f"👤 From: <b>{payload.get('sender')}</b>\n"
+            f"📌 Subject: <b>{payload.get('subject')}</b>\n\n"
+            f"<i>\"{payload.get('body_snippet')}\"</i>\n\n"
+            f"💡 {attach_str}\n"
+            f"👉 Use /latest or open your Inbox to read the full notice!"
+        )
+        
+    elif event_type == EventType.MESSAGE_UPDATED:
+        return (
+            f"🔄 <b>Notice Updated!</b>\n\n"
+            f"👤 From: <b>{payload.get('sender')}</b>\n"
+            f"📌 Subject: <b>{payload.get('subject')}</b>\n\n"
+            f"⚠️ The university has updated this notice. Open your Inbox to read the revised version."
         )
         
     return f"ℹ️ <b>System Alert</b>\n\nSubject <b>{sub_name}</b> ({sub_code}) changed: {payload}"
@@ -243,21 +422,31 @@ async def run_dispatch_worker(bot: Bot) -> None:
                         await wait_for_db_recovery("Dispatcher")
                         async with get_db_session() as session:
                             async with session.begin():
-                                db_event = await session.get(Event, event.id)
-                                if db_event:
-                                    db_event.sent = True
+                                event_repo = EventRepository(session)
+                                await event_repo.mark_sent([event.id])
                         continue
 
                     # Construct message
                     msg = format_notification_message(event.event_type, event.payload_json)
                     
+                    # Custom Keyboard for message notifications
+                    reply_markup = None
+                    if event.event_type in (EventType.NEW_MESSAGE_RECEIVED, EventType.MESSAGE_UPDATED):
+                        from aiogram.utils.keyboard import InlineKeyboardBuilder
+                        from aiogram import types
+                        builder = InlineKeyboardBuilder()
+                        msg_id = event.payload_json.get("message_id")
+                        builder.row(types.InlineKeyboardButton(text="📖 Read Full Notice", callback_data=f"msg_{msg_id}"))
+                        reply_markup = builder.as_markup()
+                        
                     # Dispatch to Telegram Bot
                     success = False
                     try:
                         await bot.send_message(
                             chat_id=user.telegram_id,
                             text=msg,
-                            parse_mode=ParseMode.HTML
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=reply_markup
                         )
                         success = True
                     except TelegramForbiddenError:
@@ -277,9 +466,8 @@ async def run_dispatch_worker(bot: Bot) -> None:
                         try:
                             async with get_db_session() as session:
                                 async with session.begin():
-                                    db_event = await session.get(Event, event.id)
-                                    if db_event:
-                                        db_event.sent = True
+                                    event_repo = EventRepository(session)
+                                    await event_repo.mark_sent([event.id])
                             logger.info("Successfully dispatched event ID %d to telegram_id=%d", event.id, user.telegram_id)
                         except Exception as e:
                             logger.error("Failed to mark event ID %d as sent in database: %r", event.id, e)

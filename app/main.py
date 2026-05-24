@@ -3,6 +3,7 @@ import sys
 import logging
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from app.config import config
 from app.bot.telegram import dp
@@ -22,8 +23,10 @@ async def main():
         logging.error("BOT_TOKEN is not set in .env")
         return
 
+    session = AiohttpSession(timeout=300)
     bot = Bot(
         token=config.BOT_TOKEN, 
+        session=session,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML)
     )
     logging.info("Starting Telegram Bot...")

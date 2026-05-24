@@ -2,7 +2,16 @@
 
 from datetime import datetime
 from typing import Optional, Any
+from enum import Enum
 from sqlalchemy import BigInteger, String, ForeignKey, DateTime, Boolean, Index, JSON
+
+class EventType(str, Enum):
+    NEW_SUBJECT_ADDED = "new_subject_added"
+    ATTENDANCE_UPDATED = "attendance_updated"
+    NEW_ABSENCE_DETECTED = "new_absence_detected"
+    NEW_MESSAGE_RECEIVED = "new_message_received"
+    MESSAGE_UPDATED = "message_updated"
+
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.sql import func
@@ -39,6 +48,10 @@ class User(Base):
     sync_state: Mapped[Optional["SyncState"]] = relationship(
         "SyncState", back_populates="user", uselist=False, cascade="all, delete-orphan"
     )
+    inbox_messages: Mapped[list["InboxMessage"]] = relationship(
+        "InboxMessage", back_populates="user", cascade="all, delete-orphan"
+    )
+
 
     def __repr__(self) -> str:
         # Secure representation: Never print password field
@@ -115,4 +128,41 @@ class SyncState(Base):
 # Explicit composite or specific index declarations for high performance lookups
 Index("idx_snapshots_user_module", Snapshot.user_id, Snapshot.module_name)
 Index("idx_events_user_sent", Event.user_id, Event.sent)
+
+
+class InboxMessage(Base):
+    """Secure message headers, body caches, and attachment details scraped from NITRIS."""
+
+    __tablename__ = "inbox_messages"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    portal_message_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    token: Mapped[str] = mapped_column(String(200), nullable=False)
+    
+    sender: Mapped[str] = mapped_column(String(200), nullable=False)
+    subject: Mapped[str] = mapped_column(String(500), nullable=False)
+    body: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    
+    attachment_url: Mapped[Optional[str]] = mapped_column(String(1000), nullable=True)
+    telegram_file_id: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    
+    is_read: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+    sent_on: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    # Relationships
+    user: Mapped["User"] = relationship("User", back_populates="inbox_messages")
+
+    def __repr__(self) -> str:
+        return f"<InboxMessage id={self.id} user_id={self.user_id} sender='{self.sender}' subject='{self.subject[:20]}...' is_read={self.is_read}>"
+
+
+# Token-level stable unique constraint per user
+Index("idx_inbox_user_token", InboxMessage.user_id, InboxMessage.token, unique=True)
+
 

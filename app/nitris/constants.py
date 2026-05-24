@@ -31,3 +31,15 @@ CTL_SESSION = "ctl00$ctl00$ctl00$ContentPlaceHolder2$ContentPlaceHolder1$mainCon
 # Parser element IDs
 ATTENDANCE_TABLE_ID = "ContentPlaceHolder2_ContentPlaceHolder1_mainContent_gvSubjects"
 STUDENT_INFO_LABEL_ID = "ContentPlaceHolder2_ContentPlaceHolder1_mainContent_lblSnameroll"
+
+# Messages Endpoints
+MESSAGES_PAGE_PATH = "/nitris/Student/Home/AllMessages.aspx"
+MESSAGE_DETAIL_PATH = "/nitris/Student/Home/Message.aspx"
+
+# Messages Parser element IDs
+MESSAGES_TABLE_ID = "ContentPlaceHolder2_gvSubjects"
+MSG_FROM_LABEL_ID = "ContentPlaceHolder2_lblFrom"
+MSG_SENTON_LABEL_ID = "ContentPlaceHolder2_lblSenton"
+MSG_SUBJECT_LABEL_ID = "ContentPlaceHolder2_lblSubject"
+MSG_BODY_LABEL_ID = "ContentPlaceHolder2_lblBody"
+
