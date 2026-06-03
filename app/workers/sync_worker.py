@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Any
 
 def normalize_to_utc(dt: datetime) -> datetime:
@@ -14,7 +14,7 @@ def normalize_to_utc(dt: datetime) -> datetime:
 from aiogram import Bot
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramForbiddenError, TelegramAPIError
-from sqlalchemy import select
+from sqlalchemy import select, or_
 from sqlalchemy.orm import selectinload
 
 from app.db.database import get_db_session, is_db_connection_error
@@ -186,8 +186,16 @@ async def sync_messages_for_user(
 
 
 async def sync_user_data(user_id: int, roll_number: str, encrypted_pass: str, semaphore: asyncio.Semaphore, bot: Optional[Any] = None) -> None:
-    """Sync attendance and inbox messages for a single user with isolated failure tracking."""
+    """Sync attendance and inbox messages for a single user with isolated failure tracking and performance telemetry."""
     async with semaphore:
+        import time
+        start_sync = time.time()
+        
+        login_time = 0.0
+        attendance_fetch_time = 0.0
+        inbox_fetch_time = 0.0
+        db_write_time = 0.0
+        
         now = datetime.now(timezone.utc)
         logger.info("Starting background sync for Roll: %s (User ID: %d)", roll_number, user_id)
         
@@ -209,27 +217,90 @@ async def sync_user_data(user_id: int, roll_number: str, encrypted_pass: str, se
 
         try:
             logger.info("Single login path: authenticating session for User ID %d...", user_id)
+            login_start = time.time()
             await client.login(roll_number, password)
+            login_time = time.time() - login_start
             login_success = True
         except Exception as e:
             logger.error("Single login session failed for Roll %s: %r", roll_number, e)
-            await _update_sync_state(user_id, success=False, error_msg=f"Login failed: {str(e)}", sync_time=now)
+            metrics_fail = {
+                "login_time": round(login_time, 2),
+                "attendance_fetch_time": 0.0,
+                "inbox_fetch_time": 0.0,
+                "db_write_time": 0.0,
+                "full_sync_time": round(time.time() - start_sync, 2)
+            }
+            await _update_sync_state(user_id, success=False, error_msg=f"Login failed: {str(e)}", sync_time=now, metrics=metrics_fail)
 
         try:
             if login_success:
                 # 2. Fetch latest attendance using reuse client instance
                 try:
+                    att_start = time.time()
                     data = await get_attendance_data(roll_number, password, client=client)
+                    attendance_fetch_time = time.time() - att_start
                     attendance_success = True
                 except Exception as e:
                     logger.warning("Scraper failed to fetch attendance for Roll %s: %r", roll_number, e)
-                    await _update_sync_state(user_id, success=False, error_msg=f"Scraper failed: {str(e)}", sync_time=now)
+                    metrics_fail = {
+                        "login_time": round(login_time, 2),
+                        "attendance_fetch_time": round(attendance_fetch_time, 2),
+                        "inbox_fetch_time": 0.0,
+                        "db_write_time": 0.0,
+                        "full_sync_time": round(time.time() - start_sync, 2)
+                    }
+                    await _update_sync_state(user_id, success=False, error_msg=f"Scraper failed: {str(e)}", sync_time=now, metrics=metrics_fail)
 
                 # 3. Fetch latest inbox messages using the SAME active client session
                 try:
+                    inbox_start = time.time()
                     await sync_messages_for_user(user_id, roll_number, password, bot, client=client)
+                    inbox_fetch_time = time.time() - inbox_start
                 except Exception as e:
                     logger.error("Inbox sync failed for Roll %s: %r", roll_number, e)
+
+                # 4. Proactive Background Pre-Caching for Question Papers
+                is_mock = (
+                    "Mock" in client.__class__.__name__ or
+                    (hasattr(client, "fetch_question_papers") and "Mock" in client.fetch_question_papers.__class__.__name__)
+                )
+                if data and data.records and not is_mock:
+                    try:
+                        logger.info("Proactively pre-caching question papers for Roll %s...", roll_number)
+                        from app.bot.telegram import YEAR_MAP
+                        from app.services.examination_service import ExaminationService
+                        from app.db.models import QuestionPaperCache
+                        
+                        async with get_db_session() as session:
+                            for record in data.records:
+                                subject_code = record.subject_code
+                                clean_code = subject_code.upper().replace(" ", "").replace("-", "").replace("_", "")
+                                if not clean_code:
+                                    continue
+                                
+                                for year_code, full_year_str in YEAR_MAP.items():
+                                    stmt = (
+                                        select(QuestionPaperCache)
+                                        .where(QuestionPaperCache.subject_code == clean_code)
+                                        .where(QuestionPaperCache.academic_year == full_year_str)
+                                    )
+                                    res = await session.execute(stmt)
+                                    if res.first() is not None:
+                                        continue
+                                    
+                                    logger.info("Pre-cache miss for Subject: %s, Year: %s. Syncing...", clean_code, full_year_str)
+                                    exam_service = ExaminationService(session)
+                                    await exam_service.sync_subject_papers_metadata(
+                                        username=roll_number,
+                                        password=password,
+                                        academic_year=full_year_str,
+                                        subject_code=clean_code,
+                                        client=client
+                                    )
+                                    await session.commit()
+                                    await asyncio.sleep(0.5)
+                    except Exception as e:
+                        logger.error("Proactive pre-caching failed for Roll %s: %r", roll_number, e)
         finally:
             await client.close()
             logger.info("Closed NitrisClient session for Roll %s (User ID: %d)", roll_number, user_id)
@@ -240,6 +311,7 @@ async def sync_user_data(user_id: int, roll_number: str, encrypted_pass: str, se
         # 4. Save snapshot & events atomically in a transaction
         try:
             await wait_for_db_recovery(f"Sync-User-{user_id}")
+            db_start = time.time()
             async with get_db_session() as session:
                 async with session.begin():
                     snapshot_service = SnapshotService(session)
@@ -248,18 +320,40 @@ async def sync_user_data(user_id: int, roll_number: str, encrypted_pass: str, se
                         module_name="attendance",
                         attendance_result=data
                     )
+            db_write_time = time.time() - db_start
             
-            # 5. Mark success in health tracker
-            await _update_sync_state(user_id, success=True, error_msg=None, sync_time=now)
+            full_sync_time = time.time() - start_sync
+            
+            metrics = {
+                "login_time": round(login_time, 2),
+                "attendance_fetch_time": round(attendance_fetch_time, 2),
+                "inbox_fetch_time": round(inbox_fetch_time, 2),
+                "db_write_time": round(db_write_time, 2),
+                "full_sync_time": round(full_sync_time, 2)
+            }
+            
+            # 5. Mark success in health tracker and save metrics
+            await _update_sync_state(user_id, success=True, error_msg=None, sync_time=now, metrics=metrics)
+            
+            logger.info(
+                "[METRICS] User=%s LOGIN=%.2fs ATTENDANCE=%.2fs INBOX=%.2fs DB=%.2fs TOTAL=%.2fs",
+                roll_number, login_time, attendance_fetch_time, inbox_fetch_time, db_write_time, full_sync_time
+            )
             logger.info("Successfully completed background sync for Roll: %s", roll_number)
 
         except Exception as e:
             logger.error("Failed to persist snapshot/events in database for User ID %d: %r", user_id, e)
-            await _update_sync_state(user_id, success=False, error_msg=f"Database save failed: {str(e)}", sync_time=now)
+            metrics_db_fail = {
+                "login_time": round(login_time, 2),
+                "attendance_fetch_time": round(attendance_fetch_time, 2),
+                "inbox_fetch_time": round(inbox_fetch_time, 2),
+                "db_write_time": round(time.time() - db_start, 2),
+                "full_sync_time": round(time.time() - start_sync, 2)
+            }
+            await _update_sync_state(user_id, success=False, error_msg=f"Database save failed: {str(e)}", sync_time=now, metrics=metrics_db_fail)
 
 
-
-async def _update_sync_state(user_id: int, success: bool, error_msg: Optional[str], sync_time: datetime) -> None:
+async def _update_sync_state(user_id: int, success: bool, error_msg: Optional[str], sync_time: datetime, metrics: Optional[dict] = None) -> None:
     """Update or create the SyncState tracking record for a user."""
     try:
         await wait_for_db_recovery(f"SyncState-{user_id}")
@@ -274,6 +368,8 @@ async def _update_sync_state(user_id: int, success: bool, error_msg: Optional[st
                     session.add(state)
                 
                 state.last_sync = sync_time
+                if metrics:
+                    state.last_metrics = metrics
                 if success:
                     state.last_success = sync_time
                     state.last_error = None
@@ -390,7 +486,7 @@ def format_notification_message(event_type: EventType | str, payload: dict) -> s
 
 
 async def run_dispatch_worker(bot: Bot) -> None:
-    """Periodically queries unsent events and dispatches beautiful Telegram alerts."""
+    """Periodically queries unsent events and dispatches beautiful Telegram alerts in batches."""
     logger.info("Notification Dispatcher Worker initialized.")
 
     while True:
@@ -414,16 +510,12 @@ async def run_dispatch_worker(bot: Bot) -> None:
             if unsent_events:
                 logger.info("Found %d unsent events to dispatch.", len(unsent_events))
                 
+                successful_ids = []
                 for event in unsent_events:
                     user = event.user
                     if not user:
                         logger.error("Orphaned Event found: ID %d has no associated user.", event.id)
-                        # Mark as sent so we don't try again
-                        await wait_for_db_recovery("Dispatcher")
-                        async with get_db_session() as session:
-                            async with session.begin():
-                                event_repo = EventRepository(session)
-                                await event_repo.mark_sent([event.id])
+                        successful_ids.append(event.id)  # Mark as sent so we clear it
                         continue
 
                     # Construct message
@@ -460,17 +552,21 @@ async def run_dispatch_worker(bot: Bot) -> None:
                     except Exception as e:
                         logger.error("Unexpected error sending message to telegram_id %d: %r", user.telegram_id, e)
                     
-                    # Update status in DB
                     if success:
-                        await wait_for_db_recovery("Dispatcher")
-                        try:
-                            async with get_db_session() as session:
-                                async with session.begin():
-                                    event_repo = EventRepository(session)
-                                    await event_repo.mark_sent([event.id])
-                            logger.info("Successfully dispatched event ID %d to telegram_id=%d", event.id, user.telegram_id)
-                        except Exception as e:
-                            logger.error("Failed to mark event ID %d as sent in database: %r", event.id, e)
+                        successful_ids.append(event.id)
+                        logger.info("Successfully dispatched event ID %d to telegram_id=%d", event.id, user.telegram_id)
+                
+                # Bulk update status in DB
+                if successful_ids:
+                    await wait_for_db_recovery("Dispatcher")
+                    try:
+                        async with get_db_session() as session:
+                            async with session.begin():
+                                event_repo = EventRepository(session)
+                                await event_repo.mark_sent(successful_ids)
+                        logger.info("Successfully marked %d events as sent in database", len(successful_ids))
+                    except Exception as e:
+                        logger.error("Failed to mark events as sent in database: %r", e)
             
             dispatch_completed_successfully = True
 

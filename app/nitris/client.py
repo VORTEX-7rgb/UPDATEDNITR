@@ -28,61 +28,87 @@ class NitrisClient:
     def __init__(self) -> None:
         self.base_url = config.NITRIS_BASE_URL
         self._debug = os.getenv("DEBUG_ATTENDANCE", "").lower() in ("1", "true")
+        limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
         self.client = httpx.AsyncClient(
             base_url=self.base_url,
             headers=DEFAULT_HEADERS,
             timeout=30.0,
             follow_redirects=True,
+            limits=limits,
         )
 
     # ── Login Flow ──────────────────────────────────────────────
 
     async def login(self, username: str, password: str) -> None:
-        """Authenticate: init session → transform password → login → visit home."""
-        # Step 0: Seed ASP.NET_SessionId
-        try:
-            resp = await self.client.get(LOGIN_PAGE_URL)
-            resp.raise_for_status()
-            logger.info("Session initialized via Login.aspx")
-        except Exception as e:
-            raise LoginError("Could not initialize NITRIS session.") from e
+        """Authenticate: init session → transform password → login → visit home.
+        
+        Retries up to 3 times with exponential backoff on transient network/IIS errors.
+        """
+        import asyncio
+        max_attempts = 3
+        backoff = 1.0
+        
+        for attempt in range(1, max_attempts + 1):
+            try:
+                # Step 0: Seed ASP.NET_SessionId
+                try:
+                    resp = await self.client.get(LOGIN_PAGE_URL)
+                    resp.raise_for_status()
+                    logger.info("Session initialized via Login.aspx")
+                except Exception as e:
+                    raise LoginError("Could not initialize NITRIS session.") from e
 
-        # Step 1: Server-side password transformation
-        try:
-            resp = await self.client.post(GET_PASSWORD_ENDPOINT, json={"password": password}, headers=AJAX_HEADERS)
-            resp.raise_for_status()
-            transformed = resp.json().get("d", "")
-            if not transformed:
-                raise LoginError("Server returned empty transformed password.")
-            logger.info("Password transformed OK")
-        except LoginError:
-            raise
-        except Exception as e:
-            raise LoginError("Password transformation failed.") from e
+                # Step 1: Server-side password transformation
+                try:
+                    resp = await self.client.post(GET_PASSWORD_ENDPOINT, json={"password": password}, headers=AJAX_HEADERS)
+                    resp.raise_for_status()
+                    transformed = resp.json().get("d", "")
+                    if not transformed:
+                        raise LoginError("Server returned empty transformed password.")
+                    logger.info("Password transformed OK")
+                except LoginError:
+                    raise
+                except Exception as e:
+                    raise LoginError("Password transformation failed.") from e
 
-        # Step 2: Authenticate
-        try:
-            resp = await self.client.post(
-                LOGIN_USER_ENDPOINT,
-                json={"username": username, "logpassword": transformed},
-                headers=AJAX_HEADERS,
-            )
-            resp.raise_for_status()
-            result = resp.json().get("d", "")
-        except Exception as e:
-            raise LoginError("Login request failed.") from e
+                # Step 2: Authenticate
+                try:
+                    resp = await self.client.post(
+                        LOGIN_USER_ENDPOINT,
+                        json={"username": username, "logpassword": transformed},
+                        headers=AJAX_HEADERS,
+                    )
+                    resp.raise_for_status()
+                    result = resp.json().get("d", "")
+                except Exception as e:
+                    raise LoginError("Login request failed.") from e
 
-        if not result or "SUCCESS" not in result:
-            raise LoginError(f"Invalid credentials. Server: {result}")
+                if not result or "SUCCESS" not in result:
+                    raise LoginError(f"Invalid credentials. Server: {result}")
 
-        # Step 3: Visit home page to finalize session
-        parts = result.split(":", 1)
-        if len(parts) > 1 and parts[1].strip():
-            resp = await self.client.get(parts[1].strip())
-            resp.raise_for_status()
-            logger.info("Session finalized via home page")
+                # Step 3: Visit home page to finalize session
+                parts = result.split(":", 1)
+                if len(parts) > 1 and parts[1].strip():
+                    resp = await self.client.get(parts[1].strip())
+                    resp.raise_for_status()
+                    logger.info("Session finalized via home page")
 
-        logger.info("Login successful for %s", username)
+                logger.info("Login successful for %s", username)
+                return
+                
+            except LoginError:
+                # Hard authentication/invalid credentials fail fast and bypass retries
+                raise
+            except Exception as e:
+                # Catch transient network/HTTP/IIS errors
+                logger.warning(
+                    "Login attempt %d/%d failed for %s: %s", 
+                    attempt, max_attempts, username, e
+                )
+                if attempt == max_attempts:
+                    raise LoginError(f"Login failed after {max_attempts} attempts.") from e
+                await asyncio.sleep(backoff)
+                backoff *= 2.0  # 1s, 2s, 4s backoff
 
     # ── Attendance Workflow ─────────────────────────────────────
 
@@ -273,10 +299,19 @@ class NitrisClient:
     @staticmethod
     def _pick_option(options: list[tuple[str, str]], preferred: str, fallback_idx: int = -1) -> str:
         """Pick a dropdown option by text match, falling back to index."""
+        # Normalize preferred string by removing all whitespace, slashes, and dashes
+        pref_clean = preferred.lower().replace(" ", "").replace("/", "").replace("-", "")
         for value, text in options:
-            if preferred.lower() in text.lower():
+            text_clean = text.lower().replace(" ", "").replace("/", "").replace("-", "")
+            if pref_clean in text_clean or text_clean in pref_clean:
+                return value
+        for value, text in options:
+            if preferred.lower() in text.lower() or text.lower() in preferred.lower():
                 return value
         if options:
+            # Avoid picking `--Select--` (value '0' or empty) if fallback_idx is 0 and valid options exist
+            if fallback_idx == 0 and len(options) > 1 and options[0][0] in ("0", ""):
+                return options[1][0]
             return options[fallback_idx][0]
         return ""
 
@@ -372,6 +407,208 @@ class NitrisClient:
             
         return resp.content
 
+    async def fetch_question_papers_page_url(self) -> httpx.URL:
+        """Visit Home.aspx, extract dynamic AppId and AppName parameters for QP page from the sidebar menu, and return URL.
+        
+        Uses a self-healing link auto-resolver to bypass transient Base64 navigation parameters.
+        """
+        from bs4 import BeautifulSoup
+        import urllib.parse
+        
+        home_url = "/nitris/Student/Home/Home.aspx"
+        headers = {"Referer": f"{self.base_url}/nitris/Student/Home/Home.aspx"}
+        resp = await self.client.get(home_url, headers=headers)
+        
+        if resp.status_code != 200:
+            resp = await self.client.get("/nitris/Student/Default.aspx", headers=headers)
+            
+        html = resp.text
+        soup = BeautifulSoup(html, "html.parser")
+        
+        qp_link = None
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if "previousyear_questions.aspx" in href.lower():
+                qp_link = href
+                break
+                
+        if qp_link:
+            if "../../" in qp_link:
+                qp_link = "/nitris/Student/" + qp_link.split("../../Student/")[-1]
+            elif qp_link.startswith("/"):
+                pass
+            else:
+                qp_link = f"/nitris/Student/Examination/QuestionPaperUpload/{qp_link}"
+            
+            logger.info("Auto-resolved Previous Year Questions URL: %s", qp_link)
+            parsed = urllib.parse.urlparse(qp_link)
+            raw_path = f"{parsed.path}?{parsed.query}".encode("ascii")
+            return httpx.URL(self.base_url).copy_with(raw_path=raw_path)
+            
+        # Fallback to hardcoded query structure if sidebar parsing fails
+        from app.nitris.constants import QUESTION_PAPERS_PATH
+        fallback_query = "AppId=Ng%3d%3d-dYSTlPCIpzE%3d&AppName=RXhhbWluYXRpb24%3d-%2fdxDr14tNrU%3d&SubModId=NTM%3d-%2fZhjgU%2bo648%3d&ModId=MzE%3d-4rLwL%2batXX4%3d"
+        logger.warning("Auto-resolver failed to find PreviousYear_Questions.aspx in sidebar. Using fallback query parameters.")
+        raw_path = f"{QUESTION_PAPERS_PATH}?{fallback_query}".encode("ascii")
+        return httpx.URL(self.base_url).copy_with(raw_path=raw_path)
+
+    async def fetch_question_papers(self, academic_year: str = "2025-26/Spring", department_value: str = "", subject_query: str = "") -> str:
+        """Execute the ASP.NET postback flow to search for question papers on the portal."""
+        from app.nitris.constants import CTL_QP_ACADEMIC_YEAR, CTL_QP_DEPARTMENT, CTL_QP_SUBJECT_SEARCH, CTL_QP_SEARCH_BTN
+        from app.nitris.aspnet import extract_form_fields, extract_dropdown_options, submit_postback
+        from app.nitris.exceptions import AttendanceWorkflowError
+        
+        # Step 0: Visit Module Default page to initialize the server-side ASP.NET module session context
+        url = await self.fetch_question_papers_page_url()
+        import urllib.parse
+        parsed_url = urllib.parse.urlparse(str(url))
+        default_raw_path = f"/nitris/Student/Default.aspx?{parsed_url.query}".encode("ascii")
+        default_url = httpx.URL(self.base_url).copy_with(raw_path=default_raw_path)
+        
+        logger.info("[QP-Step0] Initializing module session context via Default.aspx")
+        # Visit default page to seed context (ignore redirects or follow them)
+        await self.client.get(default_url, headers={"Referer": f"{self.base_url}/nitris/Student/Home/Home.aspx"})
+        
+        # Step 1: GET initial QP page via resolved URL
+        logger.info("[QP-Step1] GET previous question papers page")
+        resp = await self.client.get(url, headers={"Referer": str(default_url)}, follow_redirects=False)
+        
+        if resp.status_code != 200:
+            # Check if it was a 302 redirect. If so, follow it to handle potential context updates or auth drops
+            if resp.status_code in (301, 302, 303, 307, 308):
+                location = resp.headers.get("Location", "")
+                logger.info("[QP-Step1] Page redirected to %s. Retrying with redirected URL.", location)
+                if "Login.aspx" in location:
+                    from app.nitris.exceptions import SessionExpiredError
+                    raise SessionExpiredError("Session expired — redirected to login.")
+                if "503.aspx" in location or "Error Pages" in location:
+                    raise AttendanceWorkflowError("NITRIS portal returned a 503 Service Unavailable / Error Page. This usually indicates invalid/expired query parameters or lack of session context on the portal.")
+                # If redirected to another dynamic URL, let's update url and fetch again!
+                if location.startswith("/"):
+                    redirect_url = httpx.URL(self.base_url).copy_with(raw_path=location.encode("ascii"))
+                else:
+                    redirect_url = httpx.URL(location)
+                resp = await self.client.get(redirect_url, headers={"Referer": str(default_url)}, follow_redirects=True)
+                if resp.status_code != 200:
+                    raise AttendanceWorkflowError(f"Failed to load Question Papers page after redirect (status {resp.status_code})")
+            else:
+                raise AttendanceWorkflowError(f"Failed to load initial Question Papers page (status {resp.status_code})")
+            
+        html = resp.text
+        from app.nitris.aspnet import is_error_page
+        if is_error_page(html, resp):
+            raise AttendanceWorkflowError("NITRIS portal returned a 503 Service Unavailable / Error Page. This usually indicates invalid/expired query parameters or lack of session context on the portal.")
+        
+        # Step 2: Select Academic Year dropdown
+        form_state = extract_form_fields(html)
+        year_options = extract_dropdown_options(html, CTL_QP_ACADEMIC_YEAR)
+        
+        # Match preferred academic year or fallback
+        selected_year_value = self._pick_option(year_options, academic_year, fallback_idx=0)
+        if not selected_year_value:
+            logger.warning("No valid academic year options found in QP dropdown. Proceeding with form defaults.")
+            selected_year_value = ""
+            
+        logger.info("[QP-Step2] Selecting Academic Year: %s", selected_year_value)
+        
+        # Postback to update form state for the selected academic year
+        html = await submit_postback(
+            self.client, url, form_state, CTL_QP_ACADEMIC_YEAR,
+            {CTL_QP_ACADEMIC_YEAR: selected_year_value}, "qp_step2_year", self._debug
+        )
+        
+        # Step 3: Populate Subject Search and trigger Search Button
+        form_state = extract_form_fields(html)
+        
+        form_updates = {
+            CTL_QP_ACADEMIC_YEAR: selected_year_value,
+            CTL_QP_SUBJECT_SEARCH: subject_query,
+        }
+        
+        # If department specified, select it too
+        if department_value:
+            dept_options = extract_dropdown_options(html, CTL_QP_DEPARTMENT)
+            selected_dept = self._pick_option(dept_options, department_value, fallback_idx=-1)
+            if selected_dept:
+                form_updates[CTL_QP_DEPARTMENT] = selected_dept
+                 
+        logger.info("[QP-Step3] Triggering subject search postback. Query: '%s'", subject_query)
+        
+        # Submit postback triggering the search button
+        html = await submit_postback(
+            self.client, url, form_state, CTL_QP_SEARCH_BTN,
+            form_updates, "qp_step3_search", self._debug
+        )
+        
+        return html
+
+    async def download_question_paper_pdf(self, academic_year: str, subject_query: str, event_target: str) -> bytes:
+        """Submit postback for the GridView download button and download the PDF file bytes directly from response stream."""
+        from app.nitris.aspnet import extract_form_fields
+        from app.nitris.exceptions import AttendanceWorkflowError
+        
+        # 1. Fetch current search page to get fresh __VIEWSTATE and form fields
+        search_html = await self.fetch_question_papers(academic_year=academic_year, subject_query=subject_query)
+        form_state = extract_form_fields(search_html)
+        
+        # 2. Build postback payload
+        payload = {
+            **form_state,
+            "__EVENTTARGET": event_target,
+            "__EVENTARGUMENT": "",
+        }
+        
+        # Exclude the search button from the postback payload to prevent re-triggering search event
+        from app.nitris.constants import CTL_QP_SEARCH_BTN
+        payload.pop(CTL_QP_SEARCH_BTN, None)
+        
+        url = await self.fetch_question_papers_page_url()
+        headers = {"Referer": str(url)}
+        
+        logger.info("[QP-Download] Submitting postback for PDF target: %s", event_target)
+        resp = await self.client.post(url, data=payload, headers=headers, follow_redirects=False)
+        
+        if resp.status_code != 200:
+            raise AttendanceWorkflowError(f"Question Paper PDF postback returned status {resp.status_code}")
+            
+        content_type = resp.headers.get("Content-Type", "").lower()
+        logger.info("[QP-Download] Received response: %d bytes, Content-Type: %s", len(resp.content), content_type)
+        
+        # 3. Check if it returned a direct PDF binary or a window.open redirection HTML
+        if "application/pdf" in content_type:
+            return resp.content
+            
+        html = resp.text
+        # Search for window.open script tag
+        import re
+        import urllib.parse
+        match = re.search(r"window\.open\(\"([^\"]*)\"", html)
+        if not match:
+            match = re.search(r"window\.open\(\'([^\']*)\'", html)
+            
+        if match:
+            pdf_relative_path = match.group(1)
+            pdf_absolute_url = urllib.parse.urljoin(str(url), pdf_relative_path)
+            logger.info("[QP-Download] Resolved window.open PDF URL: %s", pdf_absolute_url)
+            
+            # Fetch the actual PDF bytes
+            pdf_resp = await self.client.get(pdf_absolute_url, headers={"Referer": str(url)})
+            if pdf_resp.status_code != 200:
+                raise AttendanceWorkflowError(f"Failed to fetch PDF file from resolved URL (status {pdf_resp.status_code})")
+                
+            pdf_content_type = pdf_resp.headers.get("Content-Type", "").lower()
+            if "application/pdf" not in pdf_content_type and b"%PDF" not in pdf_resp.content[:10]:
+                raise AttendanceWorkflowError("Resolved URL did not return PDF binary bytes.")
+                
+            return pdf_resp.content
+            
+        # Ensure response is actually a PDF file or binary stream, not an HTML error
+        if "text/html" in content_type and b"__VIEWSTATE" in resp.content:
+            raise AttendanceWorkflowError("Server returned form HTML instead of PDF binary bytes. Postback failed.")
+            
+        return resp.content
+
     async def close(self) -> None:
         await self.client.aclose()
+
 

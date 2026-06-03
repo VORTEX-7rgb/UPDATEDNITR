@@ -12,8 +12,8 @@ from app.nitris.exceptions import LoginError, AttendanceParseError, AttendanceWo
 
 logger = logging.getLogger(__name__)
 
-MAX_RETRIES = 2
-RETRY_DELAY = 2.0
+MAX_RETRIES = 3
+RETRY_DELAY = 1.0
 
 
 async def get_attendance_data(username: str, password: str, client: Optional[NitrisClient] = None) -> AttendanceResult:
@@ -33,6 +33,7 @@ async def get_attendance_data(username: str, password: str, client: Optional[Nit
     try:
         # Fetch with retry on transient failures
         last_error: Exception | None = None
+        backoff = RETRY_DELAY
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 html = await client.fetch_attendance()
@@ -43,7 +44,8 @@ async def get_attendance_data(username: str, password: str, client: Optional[Nit
                 last_error = e
                 logger.warning("Attempt %d/%d failed: %s", attempt, MAX_RETRIES, e)
                 if attempt < MAX_RETRIES:
-                    await asyncio.sleep(RETRY_DELAY)
+                    await asyncio.sleep(backoff)
+                    backoff *= 2.0
 
         raise last_error or AttendanceWorkflowError("All attempts failed.")
 
