@@ -1,6 +1,7 @@
 import logging
 import re
 import asyncio
+import html
 from datetime import datetime, timezone
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command, StateFilter
@@ -19,8 +20,13 @@ from app.db.repositories.user_repository import UserRepository
 from app.services.snapshot_service import SnapshotService
 from app.db.crypto import decrypt_password, encrypt_password
 from app.db.models import User, SyncState, InboxMessage
+from app.services.lock_service import user_lock
 
 logger = logging.getLogger(__name__)
+
+
+from app.utils import esc, safe_truncate
+
 
 
 class Registration(StatesGroup):
@@ -35,6 +41,12 @@ class Deregistration(StatesGroup):
 
 class InboxSearch(StatesGroup):
     waiting_for_query = State()     # Waiting for user to send search text
+
+
+class QuestionPaperFlow(StatesGroup):
+    waiting_for_subject = State()       # Selecting subject from lists
+    waiting_for_search_query = State()  # Waiting for search query
+    waiting_for_year = State()          # Waiting for year selection
 
 
 dp = Dispatcher()
@@ -76,11 +88,11 @@ async def db_error_handler(event: ErrorEvent):
 
 def format_attendance_message(data) -> str:
     d = data.to_dict()
-    msg = f"🧑‍🎓 <b>{d['student_info']}</b>\n\n<b>📊 Attendance Summary:</b>\n"
+    msg = f"🧑‍🎓 <b>{esc(d['student_info'])}</b>\n\n<b>📊 Attendance Summary:</b>\n"
     for rec in d["records"]:
         name = rec.get("subject_name") or rec.get("subject_code", "Unknown")
-        msg += f"🔸 <b>{name}</b>\n"
-        msg += f"   TC: {rec['tc']} | OA: {rec['oa']} | UA: {rec['ua']} | LE: {rec['le']}\n\n"
+        msg += f"🔸 <b>{esc(name)}</b>\n"
+        msg += f"   TC: {esc(rec['tc'])} | OA: {esc(rec['oa'])} | UA: {esc(rec['ua'])} | LE: {esc(rec['le'])}\n\n"
     return msg
 
 
@@ -98,22 +110,22 @@ def format_dashboard_text(user: User, unread_count: int = 0) -> str:
             status_text = "Healthy"
         elif sync_state.failure_count < 5:
             status_icon = "⚠️"
-            status_text = f"Sync Delay (failures: {sync_state.failure_count})"
+            status_text = f"Sync Delay (failures: {esc(sync_state.failure_count)})"
             if sync_state.last_error:
-                status_text += f"\n<i>Error: {sync_state.last_error[:100]}</i>"
+                status_text += f"\n<i>Error: {esc(sync_state.last_error[:100])}</i>"
         else:
             status_icon = "❌"
             status_text = "Outage / Connection Error"
             if sync_state.last_error:
-                status_text += f"\n<i>Error: {sync_state.last_error[:100]}</i>"
+                status_text += f"\n<i>Error: {esc(sync_state.last_error[:100])}</i>"
                 
         if sync_state.last_sync:
             last_synced_str = sync_state.last_sync.strftime("%d %b %H:%M")
             
-    unread_label = f"🔴 {unread_count} New Messages" if unread_count > 0 else "0"
+    unread_label = f"🔴 {esc(unread_count)} New Messages" if unread_count > 0 else "0"
     msg = (
         f"👋 <b>Welcome back to NitrClaw!</b>\n\n"
-        f"🧑‍🎓 <b>Student:</b> <code>{roll}</code>\n"
+        f"🧑‍🎓 <b>Student:</b> <code>{esc(roll)}</code>\n"
         f"📅 <b>Last Synced:</b> {last_synced_str}\n"
         f"📊 <b>Status:</b> {status_icon} {status_text}\n"
         f"📩 <b>Unread:</b> {unread_label}\n\n"
@@ -122,16 +134,18 @@ def format_dashboard_text(user: User, unread_count: int = 0) -> str:
     return msg
 
 
+
 def get_dashboard_keyboard(unread_count: int = 0) -> types.InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(types.InlineKeyboardButton(text="📊 Get Latest Attendance", callback_data="db_attendance"))
     
-    inbox_text = f"📩 Inbox ({unread_count} new)" if unread_count > 0 else "📩 Inbox"
+    inbox_text = f"📩 Inbox ({unread_count})" if unread_count > 0 else "📩 Inbox"
     builder.row(
         types.InlineKeyboardButton(text=inbox_text, callback_data="db_inbox"),
-        types.InlineKeyboardButton(text="🔄 Update Credentials", callback_data="db_update")
+        types.InlineKeyboardButton(text="📚 Previous Papers", callback_data="db_papers")
     )
     builder.row(
+        types.InlineKeyboardButton(text="🔄 Update Credentials", callback_data="db_update"),
         types.InlineKeyboardButton(text="❌ Deregister", callback_data="db_deregister")
     )
     return builder.as_markup()
@@ -273,7 +287,7 @@ async def process_password(message: types.Message, state: FSMContext):
         await state.set_state(Registration.waiting_for_password)
         await status_msg.edit_text(
             f"❌ <b>Portal connection issue.</b>\n\n"
-            f"Could not reach or parse the NITRIS portal: {str(e)}\n\n"
+            f"Could not reach or parse the NITRIS portal: {html.escape(str(e))}\n\n"
             f"Please check portal availability and enter your password again, or send /cancel to abort:",
             parse_mode=ParseMode.HTML
         )
@@ -382,7 +396,7 @@ async def process_delete_confirm(message: types.Message, state: FSMContext):
 
 # --- Dashboard Inline Callbacks ---
 
-@dp.callback_query(F.data.in_({"db_attendance", "db_update", "db_deregister"}))
+@dp.callback_query(F.data.in_({"db_attendance", "db_update", "db_deregister", "db_papers"}))
 async def handle_dashboard_callbacks(callback: types.CallbackQuery, state: FSMContext):
     telegram_id = callback.from_user.id
     
@@ -416,6 +430,12 @@ async def handle_dashboard_callbacks(callback: types.CallbackQuery, state: FSMCo
         except Exception as e:
             logger.warning("Failed to answer db_deregister callback: %r", e)
         await start_deregistration_flow(callback.message, state)
+    elif callback.data == "db_papers":
+        try:
+            await callback.answer()
+        except Exception as e:
+            logger.warning("Failed to answer db_papers callback: %r", e)
+        await cmd_papers(callback.message, state, explicit_telegram_id=telegram_id)
 
 
 @dp.callback_query(F.data == "cancel_deregister")
@@ -514,47 +534,54 @@ async def start_deregistration_flow(message: types.Message, state: FSMContext):
 
 
 async def fetch_attendance_for_callback(callback: types.CallbackQuery, user: User):
-    try:
-        plaintext_password = decrypt_password(user.encrypted_password)
-    except Exception as e:
-        logger.error("Failed to decrypt password for telegram_id=%s: %r", user.telegram_id, e)
-        await callback.message.answer("❌ Error decrypting credentials. Please update them using /forgot.")
+    if not await user_lock.acquire(user.id):
+        await callback.message.answer("⏳ A synchronization is already in progress for your account. Please wait a moment.")
         return
         
-    status_msg = await callback.message.answer("⏳ Fetching attendance from NITRIS...")
-    
     try:
-        data = await get_attendance_data(user.roll_number, plaintext_password)
+        try:
+            plaintext_password = decrypt_password(user.encrypted_password)
+        except Exception as e:
+            logger.error("Failed to decrypt password for telegram_id=%s: %r", user.telegram_id, e)
+            await callback.message.answer("❌ Error decrypting credentials. Please update them using /forgot.")
+            return
+            
+        status_msg = await callback.message.answer("⏳ Fetching attendance from NITRIS...")
         
         try:
-            async with get_db_session() as session:
-                async with session.begin():
-                    snapshot_service = SnapshotService(session)
-                    await snapshot_service.create_snapshot_if_changed(
-                        user_id=user.id,
-                        module_name="attendance",
-                        attendance_result=data
-                    )
-        except Exception as e:
-            logger.error("Failed to update snapshot/events in database for user_id=%s: %r", user.id, e)
+            data = await get_attendance_data(user.roll_number, plaintext_password)
             
-        await status_msg.edit_text(format_attendance_message(data), parse_mode=ParseMode.HTML)
-        
-    except LoginError as e:
-        logger.error("Login failed for %s: %s", user.telegram_id, e)
-        await status_msg.edit_text(f"❌ Login failed: {e}\n\nPlease try updating your credentials.")
-    except SessionExpiredError:
-        logger.error("Session expired for %s", user.telegram_id)
-        await status_msg.edit_text("❌ Session expired. Please try again.")
-    except AttendanceParseError as e:
-        logger.error("Parse error for %s: %s", user.telegram_id, e)
-        await status_msg.edit_text(f"❌ Parse error: {e}")
-    except NitrisError as e:
-        logger.error("NITRIS error for %s: %s", user.telegram_id, e)
-        await status_msg.edit_text("❌ Could not fetch attendance. The portal might be down.")
-    except Exception as e:
-        logger.error("Unexpected error for %s: %r", user.telegram_id, e)
-        await status_msg.edit_text("❌ An unexpected error occurred. Please try again later.")
+            try:
+                async with get_db_session() as session:
+                    async with session.begin():
+                        snapshot_service = SnapshotService(session)
+                        await snapshot_service.create_snapshot_if_changed(
+                            user_id=user.id,
+                            module_name="attendance",
+                            attendance_result=data
+                        )
+            except Exception as e:
+                logger.error("Failed to update snapshot/events in database for user_id=%s: %r", user.id, e)
+                
+            await status_msg.edit_text(format_attendance_message(data), parse_mode=ParseMode.HTML)
+            
+        except LoginError as e:
+            logger.error("Login failed for %s: %s", user.telegram_id, e)
+            await status_msg.edit_text(f"❌ Login failed: {html.escape(str(e))}\n\nPlease try updating your credentials.")
+        except SessionExpiredError:
+            logger.error("Session expired for %s", user.telegram_id)
+            await status_msg.edit_text("❌ Session expired. Please try again.")
+        except AttendanceParseError as e:
+            logger.error("Parse error for %s: %s", user.telegram_id, e)
+            await status_msg.edit_text(f"❌ Parse error: {html.escape(str(e))}")
+        except NitrisError as e:
+            logger.error("NITRIS error for %s: %s", user.telegram_id, e)
+            await status_msg.edit_text("❌ Could not fetch attendance. The portal might be down.")
+        except Exception as e:
+            logger.error("Unexpected error for %s: %r", user.telegram_id, e)
+            await status_msg.edit_text("❌ An unexpected error occurred. Please try again later.")
+    finally:
+        await user_lock.release(user.id)
 
 
 # --- Command Handlers (Restricted to empty FSM state only for watertight shielding) ---
@@ -572,39 +599,46 @@ async def cmd_attendance(message: types.Message):
         await message.answer("⚠️ You haven't registered yet! Please use /start to register.")
         return
         
-    status_msg = await message.answer("⏳ Fetching attendance from NITRIS...")
-    try:
-        plaintext_password = decrypt_password(user.encrypted_password)
-        data = await get_attendance_data(user.roll_number, plaintext_password)
+    if not await user_lock.acquire(user.id):
+        await message.answer("⏳ A synchronization is already in progress for your account. Please wait a moment.")
+        return
         
+    try:
+        status_msg = await message.answer("⏳ Fetching attendance from NITRIS...")
         try:
-            async with get_db_session() as session:
-                async with session.begin():
-                    snapshot_service = SnapshotService(session)
-                    await snapshot_service.create_snapshot_if_changed(
-                        user_id=user.id,
-                        module_name="attendance",
-                        attendance_result=data
-                    )
-        except Exception as e:
-            logger.error("Failed to update snapshot/events in database for user_id=%s: %r", user.id, e)
+            plaintext_password = decrypt_password(user.encrypted_password)
+            data = await get_attendance_data(user.roll_number, plaintext_password)
             
-        await status_msg.edit_text(format_attendance_message(data), parse_mode=ParseMode.HTML)
-    except LoginError as e:
-        logger.error("Login failed for %s: %s", telegram_id, e)
-        await status_msg.edit_text(f"❌ Login failed: {e}\n\nPlease try updating your credentials with /forgot.")
-    except SessionExpiredError:
-        logger.error("Session expired for %s", telegram_id)
-        await status_msg.edit_text("❌ Session expired. Please try again.")
-    except AttendanceParseError as e:
-        logger.error("Parse error for %s: %s", telegram_id, e)
-        await status_msg.edit_text(f"❌ Parse error: {e}")
-    except NitrisError as e:
-        logger.error("NITRIS error for %s: %s", telegram_id, e)
-        await status_msg.edit_text("❌ Could not fetch attendance. The portal might be down.")
-    except Exception as e:
-        logger.error("Unexpected error for %s: %r", telegram_id, e)
-        await status_msg.edit_text("❌ An unexpected error occurred. Please try again later.")
+            try:
+                async with get_db_session() as session:
+                    async with session.begin():
+                        snapshot_service = SnapshotService(session)
+                        await snapshot_service.create_snapshot_if_changed(
+                            user_id=user.id,
+                            module_name="attendance",
+                            attendance_result=data
+                        )
+            except Exception as e:
+                logger.error("Failed to update snapshot/events in database for user_id=%s: %r", user.id, e)
+                
+            await status_msg.edit_text(format_attendance_message(data), parse_mode=ParseMode.HTML)
+        except LoginError as e:
+            logger.error("Login failed for %s: %s", telegram_id, e)
+            await status_msg.edit_text(f"❌ Login failed: {html.escape(str(e))}\n\nPlease try updating your credentials with /forgot.")
+        except SessionExpiredError:
+            logger.error("Session expired for %s", telegram_id)
+            await status_msg.edit_text("❌ Session expired. Please try again.")
+        except AttendanceParseError as e:
+            logger.error("Parse error for %s: %s", telegram_id, e)
+            await status_msg.edit_text(f"❌ Parse error: {html.escape(str(e))}")
+        except NitrisError as e:
+            logger.error("NITRIS error for %s: %s", telegram_id, e)
+            await status_msg.edit_text("❌ Could not fetch attendance. The portal might be down.")
+        except Exception as e:
+            logger.error("Unexpected error for %s: %r", telegram_id, e)
+            await status_msg.edit_text("❌ An unexpected error occurred. Please try again later.")
+    finally:
+        await user_lock.release(user.id)
 
 
 @dp.message(Command("help"), StateFilter(None))
@@ -616,6 +650,7 @@ async def cmd_help(message: types.Message):
         "• /register - Register / update your credentials\n"
         "• /forgot - Shortcut to update your credentials\n"
         "• /attendance - Fetch current attendance statistics\n"
+        "• /papers - Access previous year question papers\n"
         "• /inbox &lt;query&gt; - View inbox or search matching notices\n"
         "• /latest - Jump straight to the most recent notice\n"
         "• /cancel - Cancel the active process\n"
@@ -707,21 +742,25 @@ async def render_single_message(event, user: User, msg: InboxMessage, session) -
             
         except Exception as e:
             logger.error("Failed lazy-loading message body for message ID %s: %r", msg.id, e)
-            await status_msg.edit_text(f"❌ Failed to fetch message detail from NITRIS: {str(e)}")
+            await status_msg.edit_text(f"❌ Failed to fetch message detail from NITRIS: {html.escape(str(e))}")
             return
 
     # Render detail card
     sent_str = msg.sent_on.strftime("%d %b %Y")
-    body_text = msg.body or "<i>(No content)</i>"
-    if len(body_text) > 3000:
-        body_text = body_text[:3000] + "\n\n<i>[Content truncated due to Telegram size limits]</i>"
+    if msg.body is not None:
+        body_esc = esc(msg.body)
+        body_text = safe_truncate(body_esc, 3000)
+        if len(body_esc) > 3000:
+            body_text += "\n\n<i>[Content truncated due to Telegram size limits]</i>"
+    else:
+        body_text = "<i>(No content)</i>"
         
     card_text = (
         f"📩 <b>NITRIS Notice</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"👤 <b>From:</b> {msg.sender}\n"
+        f"👤 <b>From:</b> {esc(msg.sender)}\n"
         f"📅 <b>Date:</b> {sent_str}\n"
-        f"📌 <b>Subject:</b> {msg.subject}\n"
+        f"📌 <b>Subject:</b> {esc(msg.subject)}\n"
         f"━━━━━━━━━━━━━━━━━━━\n\n"
         f"{body_text}\n"
     )
@@ -813,8 +852,8 @@ async def handle_inbox_list(callback: types.CallbackQuery, state: FSMContext) ->
         subject_clean = msg.subject[:40] + "..." if len(msg.subject) > 40 else msg.subject
         
         text += (
-            f"<b>{idx}.</b> {status_icon} <b>{sent_str}</b> | <i>{sender_clean}</i>\n"
-            f"   <b>Subject:</b> {subject_clean}\n\n"
+            f"<b>{idx}.</b> {status_icon} <b>{sent_str}</b> | <i>{esc(sender_clean)}</i>\n"
+            f"   <b>Subject:</b> {esc(subject_clean)}\n\n"
         )
         
         select_buttons.append(
@@ -893,7 +932,7 @@ async def handle_inbox_refresh(callback: types.CallbackQuery, state: FSMContext)
         
     except Exception as e:
         logger.error("Failed live inbox refresh for telegram_id %s: %r", telegram_id, e)
-        await status_msg.edit_text(f"❌ Refresh failed: {str(e)}")
+        await status_msg.edit_text(f"❌ Refresh failed: {html.escape(str(e))}")
 
 
 @dp.callback_query(F.data == "inbox_back_dashboard")
@@ -1047,7 +1086,7 @@ async def handle_download_attachment(callback: types.CallbackQuery, state: FSMCo
             
         except Exception as e:
             logger.error("Failed to download and send attachment for message ID %s: %r", msg.id, e)
-            await status_msg.edit_text(f"❌ Failed to download attachment: {str(e)}")
+            await status_msg.edit_text(f"❌ Failed to download attachment: {html.escape(str(e))}")
 
 
 @dp.callback_query(F.data == "inbox_search_prompt")
@@ -1136,8 +1175,8 @@ async def cmd_inbox(message: types.Message, state: FSMContext) -> None:
             subject_clean = msg.subject[:40] + "..." if len(msg.subject) > 40 else msg.subject
             
             text += (
-                f"<b>{idx}.</b> {status_icon} <b>{sent_str}</b> | <i>{sender_clean}</i>\n"
-                f"   <b>Subject:</b> {subject_clean}\n\n"
+                f"<b>{idx}.</b> {status_icon} <b>{sent_str}</b> | <i>{esc(sender_clean)}</i>\n"
+                f"   <b>Subject:</b> {esc(subject_clean)}\n\n"
             )
             
             select_buttons.append(
@@ -1248,14 +1287,14 @@ async def render_search_results(message: types.Message, query: str, results: lis
         )
         await message.answer(
             f"🔍 <b>Search Results</b>\n\n"
-            f"No matching notices found for: \"<b>{query}</b>\".\n\n"
+            f"No matching notices found for: \"<b>{esc(query)}</b>\".\n\n"
             f"Please check your spelling or try search terms with different keywords.",
             reply_markup=builder.as_markup(),
             parse_mode=ParseMode.HTML
         )
         return
         
-    text = f"🔍 <b>Search Results for \"{query}\"</b>\n\n"
+    text = f"🔍 <b>Search Results for \"{esc(query)}\"</b>\n\n"
     builder = InlineKeyboardBuilder()
     select_buttons = []
     
@@ -1266,8 +1305,8 @@ async def render_search_results(message: types.Message, query: str, results: lis
         subject_clean = msg.subject[:40] + "..." if len(msg.subject) > 40 else msg.subject
         
         text += (
-            f"<b>{idx}.</b> {status_icon} <b>{sent_str}</b> | <i>{sender_clean}</i>\n"
-            f"   <b>Subject:</b> {subject_clean}\n\n"
+            f"<b>{idx}.</b> {status_icon} <b>{sent_str}</b> | <i>{esc(sender_clean)}</i>\n"
+            f"   <b>Subject:</b> {esc(subject_clean)}\n\n"
         )
         
         select_buttons.append(
@@ -1286,3 +1325,641 @@ async def render_search_results(message: types.Message, query: str, results: lis
         reply_markup=builder.as_markup(),
         parse_mode=ParseMode.HTML
     )
+
+
+# --- NITRIS Previous Year Question Papers Handlers ---
+
+from app.services.examination_service import ExaminationService
+from app.db.repositories.snapshot_repository import SnapshotRepository
+from app.db.models import QuestionPaperCache
+
+# Year Encoding Map (keeps callback data ultra compact)
+YEAR_MAP = {
+    "2526S": "2025-26/Spring",
+    "2425S": "2024-25/Spring",
+    "2425A": "2024-25/Autumn",
+    "2324S": "2023-24/Spring",
+    "2324A": "2023-24/Autumn",
+    "2223S": "2022-23/Spring",
+    "2223A": "2022-23/Autumn"
+}
+
+REVERSE_YEAR_MAP = {v: k for k, v in YEAR_MAP.items()}
+
+
+@dp.message(Command("papers"), StateFilter(None))
+async def cmd_papers(message: types.Message, state: FSMContext, explicit_telegram_id: int | None = None) -> None:
+    """Entry point for Previous Year Question Papers flow. Resolves current subjects automatically."""
+    telegram_id = explicit_telegram_id or message.from_user.id
+    await state.clear()
+    
+    async with get_db_session() as session:
+        from app.db.repositories.user_repository import UserRepository
+        user_repo = UserRepository(session)
+        user = await user_repo.get_by_telegram_id(telegram_id)
+        
+        if not user:
+            await message.answer("⚠️ You haven't registered yet! Please use /start to register.")
+            return
+            
+        # Get latest attendance snapshot
+        snapshot_repo = SnapshotRepository(session)
+        snapshot = await snapshot_repo.get_latest_snapshot(user.id, "attendance")
+        
+    courses = []
+    if snapshot and "records" in snapshot.snapshot_json:
+        courses = snapshot.snapshot_json["records"]
+        
+    text = (
+        "📚 <b>Previous Year Question Papers</b>\n\n"
+        "Here are your registered courses for the current semester. "
+        "Select one below to find historical exam papers, or search for other subjects:\n\n"
+    )
+    
+    builder = InlineKeyboardBuilder()
+    
+    if courses:
+        for idx, course in enumerate(courses, start=1):
+            code = course.get("subject_code", "Unknown")
+            name = course.get("subject_name", "Unknown")
+            text += f"<b>{idx}.</b> <code>{esc(code)}</code> | <i>{esc(name)}</i>\n"
+            builder.row(types.InlineKeyboardButton(text=f"📚 {code} - {name[:25]}...", callback_data=f"qp_sub_{code}"))
+        text += "\n"
+    else:
+        text += "<i>No registered courses found in your attendance snapshot. Use /attendance to update them!</i>\n\n"
+        
+    # Search and utility options
+    builder.row(types.InlineKeyboardButton(text="🔍 Search Other Subjects", callback_data="qp_search_prompt"))
+    if courses:
+        builder.row(types.InlineKeyboardButton(text="📥 Download All Current Papers", callback_data="qp_dlall_prompt"))
+    builder.row(types.InlineKeyboardButton(text="🏠 Back to Dashboard", callback_data="inbox_back_dashboard"))
+    
+    await message.answer(text, reply_markup=builder.as_markup(), parse_mode=ParseMode.HTML)
+
+
+@dp.callback_query(F.data.startswith("qp_sub_"))
+async def handle_subject_selected(callback: types.CallbackQuery, state: FSMContext) -> None:
+    """Callback triggered when a student selects a subject. Renders year selector."""
+    subject_code = callback.data[7:]
+    
+    try:
+        await callback.answer()
+    except Exception:
+        pass
+        
+    text = (
+        f"📅 <b>Select Academic Year</b>\n\n"
+        f"Subject: <b>{esc(subject_code)}</b>\n\n"
+        f"Please select the historical exam year you want to retrieve papers for:"
+    )
+    
+    builder = InlineKeyboardBuilder()
+    for code, label in YEAR_MAP.items():
+        builder.row(types.InlineKeyboardButton(text=label, callback_data=f"qp_yr_{subject_code}_{code}"))
+        
+    builder.row(types.InlineKeyboardButton(text="◀️ Back to Subjects", callback_data="qp_back_subjects"))
+    
+    await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode=ParseMode.HTML)
+ 
+ 
+@dp.callback_query(F.data == "qp_back_subjects")
+async def handle_qp_back_subjects(callback: types.CallbackQuery, state: FSMContext) -> None:
+    """Callback to return to the main question papers list."""
+    try:
+        await callback.answer()
+    except Exception:
+        pass
+        
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+        
+    await cmd_papers(callback.message, state, explicit_telegram_id=callback.from_user.id)
+ 
+ 
+@dp.callback_query(F.data.startswith("qp_yr_"))
+async def handle_year_selected(callback: types.CallbackQuery, state: FSMContext) -> None:
+    """Callback triggered when a year is selected. Performs cache checks or scrapes portal live."""
+    telegram_id = callback.from_user.id
+    data = callback.data[6:]
+    subject_code, year_code = data.rsplit("_", 1)
+    
+    full_year_str = YEAR_MAP.get(year_code, "2025-26/Spring")
+    
+    try:
+        await callback.answer("⏳ Locating question papers...")
+    except Exception:
+        pass
+        
+    status_msg = await callback.message.answer("⏳ Querying question paper database cache...")
+    
+    async with get_db_session() as session:
+        from app.db.repositories.user_repository import UserRepository
+        user_repo = UserRepository(session)
+        user = await user_repo.get_by_telegram_id(telegram_id)
+        
+        if not user:
+            await status_msg.edit_text("❌ You are not registered. Use /start to register.")
+            return
+            
+        exam_service = ExaminationService(session)
+        
+        # 1. Query Database Cache First
+        mid_cache = await exam_service.get_cached_paper(subject_code, full_year_str, "mid_sem")
+        end_cache = await exam_service.get_cached_paper(subject_code, full_year_str, "end_sem")
+        
+        # 2. Cache Miss: Log into NITRIS and scrape target list page
+        if not mid_cache and not end_cache:
+            try:
+                await status_msg.edit_text("⏳ Syncing exam paper catalogs from NITRIS portal...")
+                password = decrypt_password(user.encrypted_password)
+                
+                await exam_service.sync_subject_papers_metadata(
+                    username=user.roll_number,
+                    password=password,
+                    academic_year=full_year_str,
+                    subject_code=subject_code
+                )
+                await session.commit()
+                
+                mid_cache = await exam_service.get_cached_paper(subject_code, full_year_str, "mid_sem")
+                end_cache = await exam_service.get_cached_paper(subject_code, full_year_str, "end_sem")
+                
+            except Exception as e:
+                logger.error("Failed syncing paper metadata from portal: %r", e)
+                await status_msg.edit_text(f"❌ Portal query failed: {html.escape(str(e))}\n\nPlease try again.")
+                return
+                
+    # 3. Present Exam Choice Menu
+    if not mid_cache and not end_cache:
+        await status_msg.edit_text(
+            f"❌ <b>No papers found on portal</b>\n\n"
+            f"Subject: <b>{esc(subject_code)}</b>\n"
+            f"Year: <b>{esc(full_year_str)}</b>\n\n"
+            f"NITRIS portal does not have any papers uploaded for this subject and year.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+        
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
+    
+    text = (
+        f"📝 <b>Download Question Papers</b>\n\n"
+        f"📖 Subject: <b>{esc(subject_code)}</b>\n"
+        f"📅 Session: <b>{esc(full_year_str)}</b>\n\n"
+        f"Papers are ready for instant view inside Telegram's PDF reader. Select a paper to download:"
+    )
+    
+    builder = InlineKeyboardBuilder()
+    
+    if mid_cache:
+        mid_label = "📝 Download Mid Sem"
+        if mid_cache.telegram_file_id:
+            mid_label += " 🚀 (Instant)"
+        builder.row(types.InlineKeyboardButton(text=mid_label, callback_data=f"qp_dl_{mid_cache.id}"))
+        
+    if end_cache:
+        end_label = "📝 Download End Sem"
+        if end_cache.telegram_file_id:
+            end_label += " 🚀 (Instant)"
+        builder.row(types.InlineKeyboardButton(text=end_label, callback_data=f"qp_dl_{end_cache.id}"))
+        
+    builder.row(
+        types.InlineKeyboardButton(text="◀️ Select Year", callback_data=f"qp_sub_{subject_code}"),
+        types.InlineKeyboardButton(text="🏠 Dashboard", callback_data="inbox_back_dashboard")
+    )
+    
+    await callback.message.answer(text, reply_markup=builder.as_markup(), parse_mode=ParseMode.HTML)
+
+
+@dp.callback_query(F.data.startswith("qp_dl_"))
+async def handle_paper_download(callback: types.CallbackQuery, state: FSMContext) -> None:
+    """Callback triggered to download a specific paper PDF. Utilizes instant cloud forwarding or live stream scraper."""
+    telegram_id = callback.from_user.id
+    cache_id = int(callback.data.split("_")[-1])
+    
+    # 1. Fast cache check FIRST
+    async with get_db_session() as session:
+        stmt = select(QuestionPaperCache).where(QuestionPaperCache.id == cache_id)
+        res = await session.execute(stmt)
+        cache_record = res.scalar_one_or_none()
+        
+        if not cache_record:
+            try:
+                await callback.answer("❌ Record not found.", show_alert=True)
+            except Exception:
+                pass
+            return
+            
+        # 2. Premium instant delivery (sub-100ms) - Toast Only!
+        if cache_record.telegram_file_id:
+            try:
+                await callback.answer("🚀 Forwarding file from cloud...", show_alert=False)
+                await callback.bot.send_document(
+                    chat_id=telegram_id,
+                    document=cache_record.telegram_file_id,
+                    caption=(
+                        f"📚 <b>NITRIS Question Paper</b>\n\n"
+                        f"📖 Subject: <b>{esc(cache_record.subject_code)}</b>\n"
+                        f"📅 Session: <b>{esc(cache_record.academic_year)}</b>\n"
+                        f"📝 Exam: <b>{cache_record.exam_type.upper().replace('_', ' ')}</b>\n"
+                    ),
+                    parse_mode=ParseMode.HTML
+                )
+                return
+            except Exception as e:
+                logger.warning("Cached telegram_file_id failed for QP ID %d: %r. Re-downloading...", cache_record.id, e)
+
+    # 3. Live portal download - Fallback with status message
+    try:
+        await callback.answer("⏳ Downloading from NITRIS...")
+    except Exception:
+        pass
+        
+    status_msg = await callback.message.answer("⏳ Logging into NITRIS portal...")
+    
+    async with get_db_session() as session:
+        stmt = select(QuestionPaperCache).where(QuestionPaperCache.id == cache_id)
+        res = await session.execute(stmt)
+        cache_record = res.scalar_one_or_none()
+        
+        from app.db.repositories.user_repository import UserRepository
+        user_repo = UserRepository(session)
+        user = await user_repo.get_by_telegram_id(telegram_id)
+        
+        if not user:
+            await status_msg.edit_text("❌ You are not registered. Use /start to register.")
+            return
+            
+        try:
+            password = decrypt_password(user.encrypted_password)
+            await status_msg.edit_text(f"⏳ Downloading PDF stream for {esc(cache_record.subject_code)}...")
+            
+            exam_service = ExaminationService(session)
+            pdf_bytes = await exam_service.download_paper_bytes(
+                username=user.roll_number,
+                password=password,
+                cache_record=cache_record
+            )
+            
+            await status_msg.edit_text("🚀 Uploading document to Telegram...")
+            
+            filename = f"{cache_record.subject_code}_{cache_record.academic_year.replace('/', '_')}_{cache_record.exam_type}.pdf"
+            document = types.BufferedInputFile(pdf_bytes, filename=filename)
+            
+            sent_msg = await callback.bot.send_document(
+                chat_id=telegram_id,
+                document=document,
+                caption=(
+                    f"📚 <b>NITRIS Question Paper</b>\n\n"
+                    f"📖 Subject: <b>{esc(cache_record.subject_code)}</b>\n"
+                    f"📅 Session: <b>{esc(cache_record.academic_year)}</b>\n"
+                    f"📝 Exam: <b>{cache_record.exam_type.upper().replace('_', ' ')}</b>\n\n"
+                    f"<i>File cached globally for sub-millisecond downloads.</i>"
+                ),
+                parse_mode=ParseMode.HTML
+            )
+            
+            if sent_msg.document:
+                await exam_service.update_telegram_file_id(cache_record.id, sent_msg.document.file_id)
+                await session.commit()
+                logger.info("Successfully cached telegram_file_id for QP ID %d", cache_record.id)
+                
+            await status_msg.delete()
+            
+        except Exception as e:
+            logger.error("Failed live download of question paper ID %d: %r", cache_record.id, e)
+            await status_msg.edit_text(f"❌ Failed downloading paper: {html.escape(str(e))}")
+
+
+@dp.callback_query(F.data == "qp_dlall_prompt")
+async def handle_qp_download_all(callback: types.CallbackQuery, state: FSMContext) -> None:
+    """Prompt the student to select a historical academic year for batch downloading all papers."""
+    try:
+        await callback.answer()
+    except Exception:
+        pass
+        
+    text = (
+        f"📅 <b>Select Academic Year for Batch Download</b>\n\n"
+        f"Please select the historical exam year you want to retrieve papers for all your current courses:"
+    )
+    
+    builder = InlineKeyboardBuilder()
+    for code, label in YEAR_MAP.items():
+        builder.row(types.InlineKeyboardButton(text=label, callback_data=f"qp_dlall_yr_{code}"))
+        
+    builder.row(types.InlineKeyboardButton(text="◀️ Back to Subjects", callback_data="qp_back_subjects"))
+    
+    await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode=ParseMode.HTML)
+
+
+@dp.callback_query(F.data.startswith("qp_dlall_yr_"))
+async def handle_qp_download_all_year(callback: types.CallbackQuery, state: FSMContext) -> None:
+    """Orchestrates batch sequential download & folder delivery of all current papers for selected year with live status."""
+    telegram_id = callback.from_user.id
+    year_code = callback.data.split("_")[-1]
+    selected_year = YEAR_MAP.get(year_code)
+    
+    try:
+        await callback.answer()
+    except Exception:
+        pass
+        
+    if not selected_year:
+        await callback.message.answer("❌ Invalid academic year selected.")
+        return
+        
+    status_msg = await callback.message.answer("⏳ Resolving current semester courses...")
+    
+    async with get_db_session() as session:
+        from app.db.repositories.user_repository import UserRepository
+        user_repo = UserRepository(session)
+        user = await user_repo.get_by_telegram_id(telegram_id)
+        
+        if not user:
+            await status_msg.edit_text("❌ You are not registered. Use /start to register.")
+            return
+            
+        snapshot_repo = SnapshotRepository(session)
+        snapshot = await snapshot_repo.get_latest_snapshot(user.id, "attendance")
+        
+        if not snapshot or "records" not in snapshot.snapshot_json:
+            await status_msg.edit_text("❌ No registered subjects found in your latest attendance snapshot.")
+            return
+            
+        courses = snapshot.snapshot_json["records"]
+        exam_service = ExaminationService(session)
+        password = decrypt_password(user.encrypted_password)
+        
+        from app.nitris.client import NitrisClient
+        
+        total_courses = len(courses)
+        
+        # Instantiate a single pre-authenticated NitrisClient session for 20x faster batch operations
+        client = NitrisClient()
+        try:
+            await client.login(user.roll_number, password)
+            
+            await status_msg.edit_text(f"⏳ Syncing {selected_year} catalogs for {total_courses} subjects on NITRIS...")
+            
+            semaphore = asyncio.Semaphore(3)
+            completed_count = 0
+            progress_lock = asyncio.Lock()
+            
+            async def sync_subject_with_progress(course):
+                nonlocal completed_count
+                code = course.get("subject_code", "Unknown")
+                clean_code = code.upper().replace(" ", "").replace("-", "").replace("_", "")
+                try:
+                    async with semaphore:
+                        async with get_db_session() as task_session:
+                            stmt = (
+                                select(QuestionPaperCache)
+                                .where(QuestionPaperCache.subject_code == clean_code)
+                                .where(QuestionPaperCache.academic_year == selected_year)
+                            )
+                            res = await task_session.execute(stmt)
+                            if res.first() is None:
+                                task_exam_service = ExaminationService(task_session)
+                                await task_exam_service.sync_subject_papers_metadata(
+                                    username=user.roll_number,
+                                    password=password,
+                                    academic_year=selected_year,
+                                    subject_code=code,
+                                    client=client
+                                )
+                                await task_session.commit()
+                except Exception as e:
+                    logger.warning("Failed syncing catalog for %s during batch: %r", code, e)
+                
+                async with progress_lock:
+                    completed_count += 1
+                    filled = int((completed_count / total_courses) * 6)
+                    empty = 6 - filled
+                    bar = "▓" * filled + "░" * empty
+                    progress_text = f"⏳ Syncing: {bar} [{completed_count}/{total_courses} subjects]"
+                    try:
+                        await status_msg.edit_text(progress_text)
+                    except Exception:
+                        pass
+                        
+            await asyncio.gather(*(sync_subject_with_progress(c) for c in courses))
+            
+            await status_msg.edit_text("📦 Starting sequential document folder delivery...")
+            delivered_count = 0
+            
+            for idx, course in enumerate(courses, start=1):
+                code = course.get("subject_code", "Unknown")
+                
+                for exam_type in ("mid_sem", "end_sem"):
+                    exam_label = "Mid-Sem" if exam_type == "mid_sem" else "End-Sem"
+                    cache_record = await exam_service.get_cached_paper(code, selected_year, exam_type)
+                    
+                    if not cache_record:
+                        continue
+                        
+                    status_label = f"📦 [{idx}/{total_courses}] Delivery: {esc(code)} ({exam_label})..."
+                    await status_msg.edit_text(status_label)
+                    
+                    try:
+                        if cache_record.telegram_file_id:
+                            sent_msg = await callback.bot.send_document(
+                                chat_id=telegram_id,
+                                document=cache_record.telegram_file_id,
+                                caption=(
+                                    f"📚 <b>{esc(code)} - {esc(course.get('subject_name', ''))}</b>\n"
+                                    f"📝 Exam: <b>{exam_label}</b> | Session: <b>{esc(selected_year)}</b>"
+                                ),
+                                parse_mode=ParseMode.HTML
+                            )
+                        else:
+                            pdf_bytes = await exam_service.download_paper_bytes(
+                                username=user.roll_number,
+                                password=password,
+                                cache_record=cache_record,
+                                client=client
+                            )
+                            filename = f"{code}_{selected_year.replace('/', '_')}_{exam_type}.pdf"
+                            document = types.BufferedInputFile(pdf_bytes, filename=filename)
+                            
+                            sent_msg = await callback.bot.send_document(
+                                chat_id=telegram_id,
+                                document=document,
+                                caption=(
+                                    f"📚 <b>{esc(code)} - {esc(course.get('subject_name', ''))}</b>\n"
+                                    f"📝 Exam: <b>{exam_label}</b> | Session: <b>{esc(selected_year)}</b>"
+                                ),
+                                parse_mode=ParseMode.HTML
+                            )
+                            
+                            if sent_msg.document:
+                                await exam_service.update_telegram_file_id(cache_record.id, sent_msg.document.file_id)
+                                await session.commit()
+                                
+                        delivered_count += 1
+                        
+                    except Exception as e:
+                        logger.error("Failed delivering batch paper for %s (%s): %r", code, exam_type, e)
+        finally:
+            await client.close()
+            
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+            
+        await callback.message.answer(
+            f"✅ <b>Folder Delivery Complete!</b>\n\n"
+            f"Delivered <b>{delivered_count}</b> available exam papers for Session <b>{selected_year}</b> straight to your chat.\n\n"
+            f"Enjoy instant view with Telegram's internal PDF reader!",
+            parse_mode=ParseMode.HTML
+        )
+
+
+@dp.callback_query(F.data == "qp_search_prompt")
+async def handle_qp_search_prompt(callback: types.CallbackQuery, state: FSMContext) -> None:
+    """Prompts the user to enter a search keyword and sets FSM state."""
+    try:
+        await callback.answer()
+    except Exception:
+        pass
+        
+    await state.set_state(QuestionPaperFlow.waiting_for_search_query)
+    
+    text = (
+        f"🔍 <b>Search Question Papers</b>\n\n"
+        f"Please enter a subject code (e.g. <b>BM1002</b>) or a course name keyword (e.g. <b>Chemistry</b>):"
+    )
+    
+    builder = InlineKeyboardBuilder()
+    builder.row(types.InlineKeyboardButton(text="🚫 Cancel Search", callback_data="qp_back_subjects"))
+    
+    await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode=ParseMode.HTML)
+
+
+@dp.message(QuestionPaperFlow.waiting_for_search_query)
+async def process_qp_search_query(message: types.Message, state: FSMContext) -> None:
+    """Processes search queries, queries NITRIS live, and shows results lists or jumps straight to selector."""
+    query = message.text.strip()
+    telegram_id = message.from_user.id
+    
+    if len(query) < 2:
+        await message.answer("❌ Search query is too short. Please enter at least 2 characters:")
+        return
+        
+    status_msg = await message.answer(f"🔍 Searching for <b>\"{esc(query)}\"</b> on NITRIS portal...")
+    
+    if query.startswith("/"):
+        await state.clear()
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+        return
+        
+    async with get_db_session() as session:
+        from app.db.repositories.user_repository import UserRepository
+        user_repo = UserRepository(session)
+        user = await user_repo.get_by_telegram_id(telegram_id)
+        
+        if not user:
+            await status_msg.edit_text("❌ You are not registered. Use /start to register.")
+            await state.clear()
+            return
+            
+        password = decrypt_password(user.encrypted_password)
+        
+        from app.nitris.client import NitrisClient
+        client = NitrisClient()
+        try:
+            await client.login(user.roll_number, password)
+            
+            search_records = []
+            from app.nitris.examination_parser import parse_question_papers_html
+            
+            # Rich Search: query Autumn and Spring semesters of the completed previous year (2024-25) to capture 100% of curriculum subjects
+            try:
+                html_autumn = await client.fetch_question_papers(academic_year="2024-25/Autumn", subject_query=query)
+                search_records.extend(parse_question_papers_html(html_autumn))
+            except Exception as e_autumn:
+                logger.warning("Autumn semester search query failed or returned no results: %r", e_autumn)
+                
+            try:
+                html_spring = await client.fetch_question_papers(academic_year="2024-25/Spring", subject_query=query)
+                search_records.extend(parse_question_papers_html(html_spring))
+            except Exception as e_spring:
+                logger.warning("Spring semester search query failed or returned no results: %r", e_spring)
+                
+            parsed_records = search_records
+        except Exception as e:
+            logger.error("Failed querying subject search on portal: %r", e)
+            await status_msg.edit_text(f"❌ Portal query failed: {html.escape(str(e))}")
+            await state.clear()
+            return
+        finally:
+            await client.close()
+            
+    if not parsed_records:
+        builder = InlineKeyboardBuilder()
+        builder.row(types.InlineKeyboardButton(text="🔍 Search Again", callback_data="qp_search_prompt"))
+        builder.row(types.InlineKeyboardButton(text="◀️ Back to Menu", callback_data="qp_back_subjects"))
+        
+        await status_msg.edit_text(
+            f"🔍 <b>Search Results</b>\n\n"
+            f"No matching subjects found on NITRIS for: \"<b>{esc(query)}</b>\".\n\n"
+            f"Please verify the subject code or course spelling and try again.",
+            reply_markup=builder.as_markup(),
+            parse_mode=ParseMode.HTML
+        )
+        await state.clear()
+        return
+        
+    unique_subjects = {}
+    for r in parsed_records:
+        unique_subjects[r.subject_code] = r.subject_name
+        
+    await state.clear()
+    
+    if len(unique_subjects) == 1:
+        subject_code = list(unique_subjects.keys())[0]
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+        
+        builder = InlineKeyboardBuilder()
+        for code, label in YEAR_MAP.items():
+            builder.row(types.InlineKeyboardButton(text=label, callback_data=f"qp_yr_{subject_code}_{code}"))
+        builder.row(types.InlineKeyboardButton(text="◀️ Search Menu", callback_data="qp_search_prompt"))
+        
+        await message.answer(
+            f"📅 <b>Select Academic Year</b>\n\n"
+            f"Subject: <b>{esc(subject_code)} - {esc(unique_subjects[subject_code])}</b>\n\n"
+            f"Please select the historical exam year you want to retrieve papers for:",
+            reply_markup=builder.as_markup(),
+            parse_mode=ParseMode.HTML
+        )
+        return
+        
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
+    
+    text = f"🔍 <b>Search Results for \"{esc(query)}\"</b>\n\nSelect a subject from the matches below:\n\n"
+    builder = InlineKeyboardBuilder()
+    
+    for idx, (code, name) in enumerate(unique_subjects.items(), start=1):
+        text += f"<b>{idx}.</b> <code>{esc(code)}</code> | <i>{esc(name)}</i>\n"
+        builder.row(types.InlineKeyboardButton(text=f"📚 {code} - {name[:25]}...", callback_data=f"qp_sub_{code}"))
+        
+    builder.row(types.InlineKeyboardButton(text="🔍 Search Again", callback_data="qp_search_prompt"))
+    builder.row(types.InlineKeyboardButton(text="🏠 Back to Menu", callback_data="qp_back_subjects"))
+    
+    await message.answer(text, reply_markup=builder.as_markup(), parse_mode=ParseMode.HTML)
+

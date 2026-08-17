@@ -9,4 +9,12 @@ venv/
 debug_html/
 error_page.html
 
+# Data samples & scratch artifacts
+questions_sample.html
+scratch/*.html
+scratch/*.txt
+
+# Agent memory
+memory/
+
 *.log

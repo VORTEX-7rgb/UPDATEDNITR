@@ -17,11 +17,17 @@ AJAX_HEADERS = {
 LOGIN_PAGE_URL = "/nitris/Login.aspx"
 GET_PASSWORD_ENDPOINT = "/nitris/Login.aspx/GetPassword"
 LOGIN_USER_ENDPOINT = "/nitris/Login.aspx/LoginUser"
-ATTENDANCE_PAGE_PATH = "/nitris/Student/Attendance/ClassAttendance.aspx"
+HOME_PAGE_URL = "/nitris/Student/Home/Home.aspx"
+ALLMESSAGES_PAGE_URL = "/nitris/Student/Home/AllMessages.aspx"
 
-# Raw query string for initial attendance page GET.
-# MUST stay raw — httpx URL-encodes Base64 '=' and '+' if passed as dict.
-ATTENDANCE_RAW_QUERY = "AppId=Mw==-yoe1zDBzzaE=&AppName=QXR0ZW5kYW5jZSBhbmQgTGVhdmU=-eDrmHVOfXZY=&SubModId=MTI=-XTugfjokJls=&ModId=MTA=-5a3+Nygtxr8="
+# Attendance module — paths and form control names
+ATTENDANCE_PAGE_PATH = "/nitris/Student/Attendance/ClassAttendance.aspx"
+# Sub-page link keyword used to find the dynamically-rotated attendance URL in the
+# Attendance module's sidebar HTML. NITRIS rotates the trailing -<random bytes>
+# security tokens on every AppId/AppName/SubModId/ModId parameter periodically;
+# hardcoding them guarantees breakage. We resolve them at runtime instead.
+ATTENDANCE_MODULE_NAME = "Attendance and Leave"
+ATTENDANCE_SIDEBAR_LINK_KEYWORD = "ClassAttendance.aspx"
 
 # ASP.NET form control names for attendance postbacks
 CTL_SEMESTER = "ctl00$ctl00$ctl00$ContentPlaceHolder2$ContentPlaceHolder1$mainContent$ddlSemesterType"
@@ -43,3 +49,22 @@ MSG_SENTON_LABEL_ID = "ContentPlaceHolder2_lblSenton"
 MSG_SUBJECT_LABEL_ID = "ContentPlaceHolder2_lblSubject"
 MSG_BODY_LABEL_ID = "ContentPlaceHolder2_lblBody"
 
+# Question Papers module — paths and form control names
+QUESTION_PAPERS_PATH = "/nitris/Student/Examination/QuestionPaperUpload/PreviousYear_Questions.aspx"
+# Sub-page link keyword for self-healing URL resolution (mirrors attendance).
+QP_MODULE_NAME = "Examination"
+QP_SIDEBAR_LINK_KEYWORD = "previousyear_questions.aspx"
+
+# Form Control Selectors
+CTL_QP_ACADEMIC_YEAR = "ctl00$ctl00$ctl00$ContentPlaceHolder2$ContentPlaceHolder1$mainContent$ddlAcYrSession"
+CTL_QP_DEPARTMENT = "ctl00$ctl00$ctl00$ContentPlaceHolder2$ContentPlaceHolder1$mainContent$ddldepartment"
+CTL_QP_SUBJECT_SEARCH = "ctl00$ctl00$ctl00$ContentPlaceHolder2$ContentPlaceHolder1$mainContent$txtsearch"
+CTL_QP_SEARCH_BTN = "ctl00$ctl00$ctl00$ContentPlaceHolder2$ContentPlaceHolder1$mainContent$btnSearch"
+
+# Grid ID
+QUESTION_TABLE_ID = "ContentPlaceHolder2_ContentPlaceHolder1_mainContent_gvSubjects"
+
+# NOTE: ATTENDANCE_RAW_QUERY and the hardcoded QP fallback query have been REMOVED.
+# Both were using stale navigation tokens that NITRIS rotates periodically, which
+# caused 503 errors and random failures. URLs are now resolved dynamically from
+# the module sidebar HTML at runtime — see NitrisClient._resolve_module_subpage_url().

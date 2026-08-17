@@ -40,8 +40,8 @@ class SnapshotService:
         # 2. Generate SHA-256 hash of the sorted JSON payload
         snapshot_hash = hashlib.sha256(deterministic_json.encode("utf-8")).hexdigest()
         
-        # 3. Retrieve the single latest snapshot for comparisons
-        latest_snapshot = await self.snapshot_repo.get_latest_snapshot(user_id, module_name)
+        # 3. Retrieve the single latest snapshot for comparisons, using a write lock
+        latest_snapshot = await self.snapshot_repo.get_latest_snapshot(user_id, module_name, for_update=True)
         
         if latest_snapshot:
             # 4. Compare hash signatures first

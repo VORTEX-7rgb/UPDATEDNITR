@@ -33,7 +33,9 @@ class SnapshotRepository:
         await self.session.flush()
         return snapshot
 
-    async def get_latest_snapshot(self, user_id: int, module_name: str) -> Optional[Snapshot]:
+    async def get_latest_snapshot(
+        self, user_id: int, module_name: str, for_update: bool = False
+    ) -> Optional[Snapshot]:
         """Fetch the single latest snapshot for a user and module by ID."""
         stmt = (
             select(Snapshot)
@@ -41,5 +43,10 @@ class SnapshotRepository:
             .order_by(Snapshot.id.desc())
             .limit(1)
         )
+        if for_update:
+            bind = self.session.get_bind()
+            if bind.dialect.name != "sqlite":
+                stmt = stmt.with_for_update()
+                
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()

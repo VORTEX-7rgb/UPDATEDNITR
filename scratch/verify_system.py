@@ -18,7 +18,7 @@ import json
 import logging
 import sys
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, patch, MagicMock
 
 from sqlalchemy import select, event, text
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
@@ -317,18 +317,30 @@ async def run_suite():
                 user_invalid_enc_pass = user_invalid.encrypted_password
                 
         # Mock get_attendance_data: raise LoginError for INVALID_ROLL, succeed for User A
-        async def mock_get_attendance_data_cred(username: str, password: str) -> AttendanceResult:
+        async def mock_get_attendance_data_cred(username: str, password: str, *args, **kwargs) -> AttendanceResult:
             if username == "INVALID_ROLL":
                 raise LoginError("Mock: Invalid credentials failure!")
             return parsed
             
         semaphore = asyncio.Semaphore(10)
         
+        # Mock NitrisClient for TEST 6
+        mock_client = MagicMock()
+        async def mock_login(username, password):
+            if username == "INVALID_ROLL":
+                from app.nitris.exceptions import LoginError
+                raise LoginError("Mock: Invalid credentials failure!")
+            return None
+        mock_client.login = mock_login
+        mock_client.fetch_messages_list = AsyncMock(return_value="")
+        mock_client.close = AsyncMock(return_value=None)
+        
         with patch("app.workers.sync_worker.get_attendance_data", mock_get_attendance_data_cred):
             with patch("app.workers.sync_worker.get_db_session", test_session_factory):
-                # Run sync_user_data for both users using real decrypted credentials
-                await sync_user_data(user_id, roll_number, user_a_enc_pass, semaphore)
-                await sync_user_data(invalid_user_id, "INVALID_ROLL", user_invalid_enc_pass, semaphore)
+                with patch("app.nitris.client.NitrisClient", return_value=mock_client):
+                    # Run sync_user_data for both users using real decrypted credentials
+                    await sync_user_data(user_id, roll_number, user_a_enc_pass, semaphore)
+                    await sync_user_data(invalid_user_id, "INVALID_ROLL", user_invalid_enc_pass, semaphore)
                 
         # Check SyncState for both users
         async with test_session_factory() as session:
@@ -451,7 +463,7 @@ async def run_suite():
         max_seen_concurrency = 0
         concurrency_lock = asyncio.Lock()
         
-        async def mock_slow_scraper(username: str, password: str) -> AttendanceResult:
+        async def mock_slow_scraper(username: str, password: str, *args, **kwargs) -> AttendanceResult:
             nonlocal active_sync_tasks, max_seen_concurrency
             async with concurrency_lock:
                 active_sync_tasks += 1
@@ -480,9 +492,16 @@ async def run_suite():
                 )
             )
             
+        # Mock NitrisClient for scale test
+        mock_client_scale = MagicMock()
+        mock_client_scale.login = AsyncMock(return_value=None)
+        mock_client_scale.fetch_messages_list = AsyncMock(return_value="")
+        mock_client_scale.close = AsyncMock(return_value=None)
+        
         with patch("app.workers.sync_worker.get_attendance_data", mock_slow_scraper):
             with patch("app.workers.sync_worker.get_db_session", test_session_factory):
-                await asyncio.gather(*tasks)
+                with patch("app.nitris.client.NitrisClient", return_value=mock_client_scale):
+                    await asyncio.gather(*tasks)
                 
         logger.info("Scale sync completed. Maximum concurrent tasks seen in scraper: %d", max_seen_concurrency)
         assert max_seen_concurrency <= 10, f"Concurrency limit exceeded! Found {max_seen_concurrency} active jobs"

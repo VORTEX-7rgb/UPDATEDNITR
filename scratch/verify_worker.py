@@ -31,7 +31,7 @@ logger = logging.getLogger("verify_worker")
 # Define mock response states
 current_mock_records = []
 
-async def mock_get_attendance_data(username: str, password: str) -> AttendanceResult:
+async def mock_get_attendance_data(username: str, password: str, *args, **kwargs) -> AttendanceResult:
     """Mock Nitris scraper returning controlled attendance data."""
     return AttendanceResult(
         student_info="TEST USER (987CS1234)",
@@ -44,6 +44,17 @@ app.workers.sync_worker.get_attendance_data = mock_get_attendance_data
 
 async def run_verification():
     global current_mock_records
+    
+    # Mock NitrisClient to run completely offline
+    from unittest.mock import MagicMock, patch
+    mock_client = MagicMock()
+    mock_client.login = AsyncMock(return_value=None)
+    mock_client.fetch_messages_list = AsyncMock(return_value="")
+    mock_client.close = AsyncMock(return_value=None)
+    
+    patcher = patch("app.nitris.client.NitrisClient", return_value=mock_client)
+    patcher.start()
+    
     logger.info("Initializing connection to live PostgreSQL database...")
     
     # 1. Clean up existing tables
@@ -247,6 +258,7 @@ async def run_verification():
     logger.info("🎉 SUCCESS: ALL WORKER AND DISPATCH TESTS PASSED! 🎉")
     logger.info("=======================================================")
     
+    patcher.stop()
     await engine.dispose()
 
 if __name__ == "__main__":

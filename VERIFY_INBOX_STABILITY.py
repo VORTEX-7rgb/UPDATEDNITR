@@ -18,7 +18,7 @@ from app.workers.sync_worker import (
 )
 from app.nitris.parser import extract_message_id, parse_attendance_html, AttendanceResult
 from app.db.repositories.inbox_repository import InboxRepository
-from app.db.models import InboxMessage
+from app.db.models import InboxMessage, EventType
 
 # Setup Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -127,9 +127,14 @@ async def test_single_login_path():
                             mock_db_sess = AsyncMock()
                             mock_db_sess.begin = MagicMock()
                             mock_db.return_value.__aenter__.return_value = mock_db_sess
-                            
-                            semaphore = asyncio.Semaphore(1)
-                            await sync_user_data(user_id=5, roll_number="725MN1011", encrypted_pass="enc", semaphore=semaphore)
+                            mock_snapshot = MagicMock()
+                            mock_snapshot.snapshot_json = {"records": []}
+                            mock_snapshot.id = 999
+                            with patch("app.db.repositories.snapshot_repository.SnapshotRepository.get_latest_snapshot", AsyncMock(return_value=None)):
+                                with patch("app.db.repositories.snapshot_repository.SnapshotRepository.create_snapshot", AsyncMock(return_value=mock_snapshot)) as mock_create_snap:
+                                    with patch("app.db.repositories.event_repository.EventRepository.create_event", AsyncMock()) as mock_create_event:
+                                        semaphore = asyncio.Semaphore(1)
+                                        await sync_user_data(user_id=5, roll_number="725MN1011", encrypted_pass="enc", semaphore=semaphore)
                             
     # Assert exactly 1 client login call and that both attendance & inbox reuse that client session
     assert mock_client.login.call_count == 1, f"Expected exactly 1 login call, got {mock_client.login.call_count}"
@@ -155,7 +160,7 @@ async def test_notification_generation():
         "message_id": 42
     }
     
-    msg_html = format_notification_message("new_message_received", payload_new)
+    msg_html = format_notification_message(EventType.NEW_MESSAGE_RECEIVED, payload_new)
     assert "<b>" in msg_html, "Notification does not contain bold HTML tag markup!"
     assert " एग्जामिनेशन" not in msg_html, "Non-premium formatting found!"
     assert "Academic Section" in msg_html, "Sender name missing!"
