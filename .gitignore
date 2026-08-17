@@ -1,20 +1,29 @@
+# Environment & Secrets
 .env
+*.env
+.env.*
 
+# Python Cache
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
 
+# Virtual Environments
 .venv/
 venv/
+ENV/
+env/
 
+# IDE & Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Debug & Temporary Files
 debug_html/
-error_page.html
-
-# Data samples & scratch artifacts
-questions_sample.html
-scratch/*.html
-scratch/*.txt
-
-# Agent memory
+*.log
+*.tmp
+*.bak
 memory/
-
-*.log
