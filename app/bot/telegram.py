@@ -3,6 +3,7 @@ import re
 import asyncio
 import html
 from datetime import datetime, timezone
+from typing import Optional, List, Dict, Any, Tuple
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -49,7 +50,54 @@ class QuestionPaperFlow(StatesGroup):
     waiting_for_year = State()          # Waiting for year selection
 
 
+from app.services.qpaper_service import QPaperService, QPResult
+
 dp = Dispatcher()
+
+qpaper_service: Optional[QPaperService] = None
+
+async def init_qpaper_service(bot: Bot) -> None:
+    """Initialize the singleton QPaperService on startup."""
+    global qpaper_service
+    from app.db.database import async_session_factory
+    from app.db.crypto import decrypt_password
+    from app.db.models import User, SyncState
+    from sqlalchemy import select
+
+    async def creds_provider():
+        """Pick the user with the most recent successful sync for NITRIS
+        acquisition. QP is global — any registered user's creds work.
+        Falls back to any registered user if no sync_state rows exist."""
+        async with async_session_factory() as s:
+            stmt = (
+                select(User)
+                .outerjoin(SyncState, User.id == SyncState.user_id)
+                .order_by(SyncState.last_success.desc().nulls_last(), User.id.desc())
+                .limit(1)
+            )
+            row = (await s.execute(stmt)).scalars().first()
+            if not row:
+                row = (await s.execute(select(User).limit(1))).scalars().first()
+            if not row:
+                raise RuntimeError(
+                    "No registered users — cannot acquire QP. "
+                    "Register at least one student before downloading papers."
+                )
+            return row.roll_number, decrypt_password(row.encrypted_password)
+
+    qpaper_service = QPaperService(
+        bot=bot,
+        session_factory=async_session_factory,
+        creds_provider=creds_provider,
+    )
+    qpaper_service.start_reaper()
+
+async def shutdown_qpaper_service() -> None:
+    """Cleanly stop the QPaperService reaper on shutdown."""
+    global qpaper_service
+    if qpaper_service is not None:
+        await qpaper_service.stop_reaper()
+
 
 
 @dp.errors()
@@ -1420,8 +1468,8 @@ async def handle_subject_selected(callback: types.CallbackQuery, state: FSMConte
     builder.row(types.InlineKeyboardButton(text="◀️ Back to Subjects", callback_data="qp_back_subjects"))
     
     await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode=ParseMode.HTML)
- 
- 
+
+
 @dp.callback_query(F.data == "qp_back_subjects")
 async def handle_qp_back_subjects(callback: types.CallbackQuery, state: FSMContext) -> None:
     """Callback to return to the main question papers list."""
@@ -1436,389 +1484,429 @@ async def handle_qp_back_subjects(callback: types.CallbackQuery, state: FSMConte
         pass
         
     await cmd_papers(callback.message, state, explicit_telegram_id=callback.from_user.id)
- 
- 
+
+
 @dp.callback_query(F.data.startswith("qp_yr_"))
 async def handle_year_selected(callback: types.CallbackQuery, state: FSMContext) -> None:
-    """Callback triggered when a year is selected. Performs cache checks or scrapes portal live."""
+    """Triggered when user picks an academic year for a subject.
+
+    Ensures the metadata cache (which papers EXIST on NITRIS for this subject/year)
+    is populated. Does NOT download actual paper bytes. Presents the user with
+    "Download Mid Sem" / "Download End Sem" buttons OR a clean "No paper available"
+    message when NITRIS confirms none exist.
+    """
     telegram_id = callback.from_user.id
-    data = callback.data[6:]
+    data = callback.data[6:]  # strip "qp_yr_"
     subject_code, year_code = data.rsplit("_", 1)
-    
+    from app.bot.telegram import YEAR_MAP
     full_year_str = YEAR_MAP.get(year_code, "2025-26/Spring")
-    
+
     try:
         await callback.answer("⏳ Locating question papers...")
     except Exception:
         pass
-        
+
     status_msg = await callback.message.answer("⏳ Querying question paper database cache...")
-    
+
+    # ── Phase 1: Short DB session — read user creds + check cache ──────────
     async with get_db_session() as session:
         from app.db.repositories.user_repository import UserRepository
         user_repo = UserRepository(session)
         user = await user_repo.get_by_telegram_id(telegram_id)
-        
+
         if not user:
             await status_msg.edit_text("❌ You are not registered. Use /start to register.")
             return
-            
+
         exam_service = ExaminationService(session)
-        
-        # 1. Query Database Cache First
         mid_cache = await exam_service.get_cached_paper(subject_code, full_year_str, "mid_sem")
         end_cache = await exam_service.get_cached_paper(subject_code, full_year_str, "end_sem")
-        
-        # 2. Cache Miss: Log into NITRIS and scrape target list page
-        if not mid_cache and not end_cache:
-            try:
-                await status_msg.edit_text("⏳ Syncing exam paper catalogs from NITRIS portal...")
-                password = decrypt_password(user.encrypted_password)
-                
-                await exam_service.sync_subject_papers_metadata(
-                    username=user.roll_number,
-                    password=password,
+        roll_number = user.roll_number
+        password = decrypt_password(user.encrypted_password)
+    # ── Session is now CLOSED — DB connection released to pool ────────────
+
+    # ── Phase 2: Cache miss → NITRIS HTTP work (NO DB session open) ────────
+    if not mid_cache and not end_cache:
+        try:
+            await status_msg.edit_text("⏳ Syncing exam paper catalogs from NITRIS portal...")
+            parsed_records = await ExaminationService.fetch_subject_metadata_from_portal(
+                username=roll_number,
+                password=password,
+                academic_year=full_year_str,
+                subject_code=subject_code,
+            )
+        except Exception as e:
+            logger.error("Failed fetching paper metadata from portal: %r", e)
+            await status_msg.edit_text(
+                f"❌ <b>Portal query failed</b>\n\n"
+                f"Couldn't reach NITRIS to check for papers.\n"
+                f"Error: <code>{html.escape(str(e)[:200])}</code>\n\n"
+                f"Please try again in a moment.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        # ── Phase 3: Short DB session — persist fetched metadata ───────────
+        try:
+            async with get_db_session() as session:
+                exam_service = ExaminationService(session)
+                await exam_service.persist_subject_metadata(
+                    parsed_records=parsed_records,
                     academic_year=full_year_str,
-                    subject_code=subject_code
+                    subject_code=subject_code,
                 )
                 await session.commit()
-                
                 mid_cache = await exam_service.get_cached_paper(subject_code, full_year_str, "mid_sem")
                 end_cache = await exam_service.get_cached_paper(subject_code, full_year_str, "end_sem")
-                
-            except Exception as e:
-                logger.error("Failed syncing paper metadata from portal: %r", e)
-                await status_msg.edit_text(f"❌ Portal query failed: {html.escape(str(e))}\n\nPlease try again.")
-                return
-                
-    # 3. Present Exam Choice Menu
-    if not mid_cache and not end_cache:
+        except Exception as e:
+            logger.error("Failed persisting paper metadata: %r", e)
+            await status_msg.edit_text(
+                f"❌ <b>Failed to cache paper metadata</b>\n\n"
+                f"Error: <code>{html.escape(str(e)[:200])}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        # ── Session is now CLOSED again ────────────────────────────────────
+
+    # 3. Present exam choice menu OR clean "no paper available" message
+    has_available = (
+        (mid_cache and mid_cache.status != "paper_not_available") or
+        (end_cache and end_cache.status != "paper_not_available")
+    )
+    if not has_available:
         await status_msg.edit_text(
-            f"❌ <b>No papers found on portal</b>\n\n"
-            f"Subject: <b>{esc(subject_code)}</b>\n"
-            f"Year: <b>{esc(full_year_str)}</b>\n\n"
-            f"NITRIS portal does not have any papers uploaded for this subject and year.",
-            parse_mode=ParseMode.HTML
+            f"ℹ️ <b>No paper available</b>\n\n"
+            f"📖 Subject: <b>{esc(subject_code)}</b>\n"
+            f"📅 Year: <b>{esc(full_year_str)}</b>\n\n"
+            f"NITRIS portal confirmed no question papers are uploaded for this "
+            f"subject and year. This is normal for lab / 1-credit subjects.",
+            parse_mode=ParseMode.HTML,
         )
         return
-        
+
     try:
         await status_msg.delete()
     except Exception:
         pass
-    
+
     text = (
         f"📝 <b>Download Question Papers</b>\n\n"
         f"📖 Subject: <b>{esc(subject_code)}</b>\n"
         f"📅 Session: <b>{esc(full_year_str)}</b>\n\n"
-        f"Papers are ready for instant view inside Telegram's PDF reader. Select a paper to download:"
+        f"Tap a paper to download. Already-cached papers deliver instantly."
     )
-    
+
     builder = InlineKeyboardBuilder()
-    
-    if mid_cache:
+    if mid_cache and mid_cache.status != "paper_not_available":
         mid_label = "📝 Download Mid Sem"
-        if mid_cache.telegram_file_id:
-            mid_label += " 🚀 (Instant)"
+        if mid_cache.status == "paper_available" and mid_cache.telegram_file_id:
+            mid_label += " 🚀"
         builder.row(types.InlineKeyboardButton(text=mid_label, callback_data=f"qp_dl_{mid_cache.id}"))
-        
-    if end_cache:
+    if end_cache and end_cache.status != "paper_not_available":
         end_label = "📝 Download End Sem"
-        if end_cache.telegram_file_id:
-            end_label += " 🚀 (Instant)"
+        if end_cache.status == "paper_available" and end_cache.telegram_file_id:
+            end_label += " 🚀"
         builder.row(types.InlineKeyboardButton(text=end_label, callback_data=f"qp_dl_{end_cache.id}"))
-        
     builder.row(
         types.InlineKeyboardButton(text="◀️ Select Year", callback_data=f"qp_sub_{subject_code}"),
-        types.InlineKeyboardButton(text="🏠 Dashboard", callback_data="inbox_back_dashboard")
+        types.InlineKeyboardButton(text="🏠 Dashboard", callback_data="inbox_back_dashboard"),
     )
-    
+
     await callback.message.answer(text, reply_markup=builder.as_markup(), parse_mode=ParseMode.HTML)
 
 
+# ── qp_dl_* — download/deliver a specific paper ─────────────────────────────
+
 @dp.callback_query(F.data.startswith("qp_dl_"))
 async def handle_paper_download(callback: types.CallbackQuery, state: FSMContext) -> None:
-    """Callback triggered to download a specific paper PDF. Utilizes instant cloud forwarding or live stream scraper."""
+    """Triggered when user taps "Download Mid Sem" or "Download End Sem".
+
+    Delegates to QPaperService.deliver() which handles:
+      - cache hit → instant forward of cached telegram_file_id (zero NITRIS traffic)
+      - cache miss + claim won → NITRIS download → Telegram storage upload → cache
+      - cache miss + claim lost (concurrent) → wait for the winner, then deliver
+      - paper_not_available → clean "no paper available" result
+      - permanent_failure → error result (needs human attention)
+      - retryable_failure → tries to re-claim
+      - FloodWait → bounded retry with retry_after sleep
+      - process crash recovery → stale-lock reaper
+    """
+    if qpaper_service is None:
+        try:
+            await callback.answer("❌ Service not initialized. Restart bot.", show_alert=True)
+        except Exception:
+            pass
+        return
+
     telegram_id = callback.from_user.id
     cache_id = int(callback.data.split("_")[-1])
-    
-    # 1. Fast cache check FIRST
-    async with get_db_session() as session:
-        stmt = select(QuestionPaperCache).where(QuestionPaperCache.id == cache_id)
-        res = await session.execute(stmt)
-        cache_record = res.scalar_one_or_none()
-        
-        if not cache_record:
-            try:
-                await callback.answer("❌ Record not found.", show_alert=True)
-            except Exception:
-                pass
-            return
-            
-        # 2. Premium instant delivery (sub-100ms) - Toast Only!
-        if cache_record.telegram_file_id:
-            try:
-                await callback.answer("🚀 Forwarding file from cloud...", show_alert=False)
-                await callback.bot.send_document(
-                    chat_id=telegram_id,
-                    document=cache_record.telegram_file_id,
-                    caption=(
-                        f"📚 <b>NITRIS Question Paper</b>\n\n"
-                        f"📖 Subject: <b>{esc(cache_record.subject_code)}</b>\n"
-                        f"📅 Session: <b>{esc(cache_record.academic_year)}</b>\n"
-                        f"📝 Exam: <b>{cache_record.exam_type.upper().replace('_', ' ')}</b>\n"
-                    ),
-                    parse_mode=ParseMode.HTML
-                )
-                return
-            except Exception as e:
-                logger.warning("Cached telegram_file_id failed for QP ID %d: %r. Re-downloading...", cache_record.id, e)
 
-    # 3. Live portal download - Fallback with status message
+    # 1. Loading toast — fast feedback that the tap registered
     try:
-        await callback.answer("⏳ Downloading from NITRIS...")
+        await callback.answer("⏳ Fetching paper...")
     except Exception:
         pass
-        
-    status_msg = await callback.message.answer("⏳ Logging into NITRIS portal...")
-    
-    async with get_db_session() as session:
-        stmt = select(QuestionPaperCache).where(QuestionPaperCache.id == cache_id)
-        res = await session.execute(stmt)
-        cache_record = res.scalar_one_or_none()
-        
-        from app.db.repositories.user_repository import UserRepository
-        user_repo = UserRepository(session)
-        user = await user_repo.get_by_telegram_id(telegram_id)
-        
-        if not user:
-            await status_msg.edit_text("❌ You are not registered. Use /start to register.")
-            return
-            
-        try:
-            password = decrypt_password(user.encrypted_password)
-            await status_msg.edit_text(f"⏳ Downloading PDF stream for {esc(cache_record.subject_code)}...")
-            
-            exam_service = ExaminationService(session)
-            pdf_bytes = await exam_service.download_paper_bytes(
-                username=user.roll_number,
-                password=password,
-                cache_record=cache_record
-            )
-            
-            await status_msg.edit_text("🚀 Uploading document to Telegram...")
-            
-            filename = f"{cache_record.subject_code}_{cache_record.academic_year.replace('/', '_')}_{cache_record.exam_type}.pdf"
-            document = types.BufferedInputFile(pdf_bytes, filename=filename)
-            
-            sent_msg = await callback.bot.send_document(
-                chat_id=telegram_id,
-                document=document,
-                caption=(
-                    f"📚 <b>NITRIS Question Paper</b>\n\n"
-                    f"📖 Subject: <b>{esc(cache_record.subject_code)}</b>\n"
-                    f"📅 Session: <b>{esc(cache_record.academic_year)}</b>\n"
-                    f"📝 Exam: <b>{cache_record.exam_type.upper().replace('_', ' ')}</b>\n\n"
-                    f"<i>File cached globally for sub-millisecond downloads.</i>"
-                ),
-                parse_mode=ParseMode.HTML
-            )
-            
-            if sent_msg.document:
-                await exam_service.update_telegram_file_id(cache_record.id, sent_msg.document.file_id)
-                await session.commit()
-                logger.info("Successfully cached telegram_file_id for QP ID %d", cache_record.id)
-                
-            await status_msg.delete()
-            
-        except Exception as e:
-            logger.error("Failed live download of question paper ID %d: %r", cache_record.id, e)
-            await status_msg.edit_text(f"❌ Failed downloading paper: {html.escape(str(e))}")
+
+    # 2. Status message — updated as the request progresses
+    status_msg = await callback.message.answer("⏳ Resolving paper...")
+
+    # 3. Delegate to QPaperService — it manages DB sessions, locking, NITRIS, Telegram
+    result: QPResult = await qpaper_service.deliver(cache_id, telegram_id)
+
+    # 4. Translate QPResult → user-facing message
+    await _present_qp_result(status_msg, result)
 
 
 @dp.callback_query(F.data == "qp_dlall_prompt")
-async def handle_qp_download_all(callback: types.CallbackQuery, state: FSMContext) -> None:
+async def handle_qp_download_all_prompt(callback: types.CallbackQuery, state: FSMContext) -> None:
     """Prompt the student to select a historical academic year for batch downloading all papers."""
     try:
         await callback.answer()
     except Exception:
         pass
-        
+
     text = (
         f"📅 <b>Select Academic Year for Batch Download</b>\n\n"
         f"Please select the historical exam year you want to retrieve papers for all your current courses:"
     )
-    
+
     builder = InlineKeyboardBuilder()
     for code, label in YEAR_MAP.items():
         builder.row(types.InlineKeyboardButton(text=label, callback_data=f"qp_dlall_yr_{code}"))
-        
+
     builder.row(types.InlineKeyboardButton(text="◀️ Back to Subjects", callback_data="qp_back_subjects"))
-    
+
     await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode=ParseMode.HTML)
 
 
+# ── qp_dlall_yr_* — batch download all papers for a year ────────────────────
+
 @dp.callback_query(F.data.startswith("qp_dlall_yr_"))
 async def handle_qp_download_all_year(callback: types.CallbackQuery, state: FSMContext) -> None:
-    """Orchestrates batch sequential download & folder delivery of all current papers for selected year with live status."""
+    """Triggered when user picks a year for batch download of all current subjects.
+
+    Uses QPaperService for each paper:
+      - Reads the user's latest attendance snapshot to get their current subjects
+      - Ensures metadata cache for each (subject, year)
+      - For each paper, calls qpaper_service.deliver(cache_id, telegram_id)
+      - Sends a final summary message with success/skip/fail counts
+    """
+    from app.db.repositories.snapshot_repository import SnapshotRepository
+
+    if qpaper_service is None:
+        try:
+            await callback.answer("❌ Service not initialized. Restart bot.", show_alert=True)
+        except Exception:
+            pass
+        return
+
     telegram_id = callback.from_user.id
     year_code = callback.data.split("_")[-1]
     selected_year = YEAR_MAP.get(year_code)
-    
+
     try:
         await callback.answer()
     except Exception:
         pass
-        
+
     if not selected_year:
         await callback.message.answer("❌ Invalid academic year selected.")
         return
-        
+
     status_msg = await callback.message.answer("⏳ Resolving current semester courses...")
-    
+
+    # 1. Load user + their current subjects (short DB session)
     async with get_db_session() as session:
-        from app.db.repositories.user_repository import UserRepository
         user_repo = UserRepository(session)
         user = await user_repo.get_by_telegram_id(telegram_id)
-        
         if not user:
             await status_msg.edit_text("❌ You are not registered. Use /start to register.")
             return
-            
         snapshot_repo = SnapshotRepository(session)
         snapshot = await snapshot_repo.get_latest_snapshot(user.id, "attendance")
-        
         if not snapshot or "records" not in snapshot.snapshot_json:
-            await status_msg.edit_text("❌ No registered subjects found in your latest attendance snapshot.")
+            await status_msg.edit_text(
+                "❌ No registered subjects found in your latest attendance snapshot. "
+                "Run /attendance first."
+            )
             return
-            
-        courses = snapshot.snapshot_json["records"]
-        exam_service = ExaminationService(session)
+        courses = list(snapshot.snapshot_json["records"])
+        user_id = user.id
+        roll_number = user.roll_number
         password = decrypt_password(user.encrypted_password)
-        
+
+    total_courses = len(courses)
+    await status_msg.edit_text(
+        f"⏳ Checking paper catalog for {total_courses} subjects..."
+    )
+
+    # 2. Check which subjects already have metadata cached in DB
+    cache_ids_to_deliver: list[int] = []
+    uncached_courses: list[dict] = []
+
+    async with get_db_session() as session:
+        exam_service = ExaminationService(session)
+        for course in courses:
+            sub_code = course.get("subject_code") or ""
+            if not sub_code:
+                continue
+            mid_cache = await exam_service.get_cached_paper(sub_code, selected_year, "mid_sem")
+            end_cache = await exam_service.get_cached_paper(sub_code, selected_year, "end_sem")
+            if mid_cache and mid_cache.status != "paper_not_available":
+                cache_ids_to_deliver.append(mid_cache.id)
+            if end_cache and end_cache.status != "paper_not_available":
+                cache_ids_to_deliver.append(end_cache.id)
+            if not mid_cache and not end_cache:
+                uncached_courses.append(course)
+
+    # If any courses need NITRIS catalog query, use a SINGLE authenticated client
+    if uncached_courses:
+        await status_msg.edit_text(
+            f"⏳ Syncing catalogs for {len(uncached_courses)} uncached subjects from NITRIS..."
+        )
+        all_parsed: list[tuple[str, list]] = []
         from app.nitris.client import NitrisClient
-        
-        total_courses = len(courses)
-        
-        # Instantiate a single pre-authenticated NitrisClient session for 20x faster batch operations
         client = NitrisClient()
         try:
-            await client.login(user.roll_number, password)
-            
-            await status_msg.edit_text(f"⏳ Syncing {selected_year} catalogs for {total_courses} subjects on NITRIS...")
-            
-            semaphore = asyncio.Semaphore(3)
-            completed_count = 0
-            progress_lock = asyncio.Lock()
-            
-            async def sync_subject_with_progress(course):
-                nonlocal completed_count
-                code = course.get("subject_code", "Unknown")
-                clean_code = code.upper().replace(" ", "").replace("-", "").replace("_", "")
+            await client.login(roll_number, password)
+            for course in uncached_courses:
+                sub_code = course.get("subject_code") or ""
+                if not sub_code:
+                    continue
                 try:
-                    async with semaphore:
-                        async with get_db_session() as task_session:
-                            stmt = (
-                                select(QuestionPaperCache)
-                                .where(QuestionPaperCache.subject_code == clean_code)
-                                .where(QuestionPaperCache.academic_year == selected_year)
-                            )
-                            res = await task_session.execute(stmt)
-                            if res.first() is None:
-                                task_exam_service = ExaminationService(task_session)
-                                await task_exam_service.sync_subject_papers_metadata(
-                                    username=user.roll_number,
-                                    password=password,
-                                    academic_year=selected_year,
-                                    subject_code=code,
-                                    client=client
-                                )
-                                await task_session.commit()
+                    records = await ExaminationService.fetch_subject_metadata_from_portal(
+                        username=roll_number,
+                        password=password,
+                        academic_year=selected_year,
+                        subject_code=sub_code,
+                        client=client,
+                    )
+                    all_parsed.append((sub_code, records))
                 except Exception as e:
-                    logger.warning("Failed syncing catalog for %s during batch: %r", code, e)
-                
-                async with progress_lock:
-                    completed_count += 1
-                    filled = int((completed_count / total_courses) * 6)
-                    empty = 6 - filled
-                    bar = "▓" * filled + "░" * empty
-                    progress_text = f"⏳ Syncing: {bar} [{completed_count}/{total_courses} subjects]"
-                    try:
-                        await status_msg.edit_text(progress_text)
-                    except Exception:
-                        pass
-                        
-            await asyncio.gather(*(sync_subject_with_progress(c) for c in courses))
-            
-            await status_msg.edit_text("📦 Starting sequential document folder delivery...")
-            delivered_count = 0
-            
-            for idx, course in enumerate(courses, start=1):
-                code = course.get("subject_code", "Unknown")
-                
-                for exam_type in ("mid_sem", "end_sem"):
-                    exam_label = "Mid-Sem" if exam_type == "mid_sem" else "End-Sem"
-                    cache_record = await exam_service.get_cached_paper(code, selected_year, exam_type)
-                    
-                    if not cache_record:
-                        continue
-                        
-                    status_label = f"📦 [{idx}/{total_courses}] Delivery: {esc(code)} ({exam_label})..."
-                    await status_msg.edit_text(status_label)
-                    
-                    try:
-                        if cache_record.telegram_file_id:
-                            sent_msg = await callback.bot.send_document(
-                                chat_id=telegram_id,
-                                document=cache_record.telegram_file_id,
-                                caption=(
-                                    f"📚 <b>{esc(code)} - {esc(course.get('subject_name', ''))}</b>\n"
-                                    f"📝 Exam: <b>{exam_label}</b> | Session: <b>{esc(selected_year)}</b>"
-                                ),
-                                parse_mode=ParseMode.HTML
-                            )
-                        else:
-                            pdf_bytes = await exam_service.download_paper_bytes(
-                                username=user.roll_number,
-                                password=password,
-                                cache_record=cache_record,
-                                client=client
-                            )
-                            filename = f"{code}_{selected_year.replace('/', '_')}_{exam_type}.pdf"
-                            document = types.BufferedInputFile(pdf_bytes, filename=filename)
-                            
-                            sent_msg = await callback.bot.send_document(
-                                chat_id=telegram_id,
-                                document=document,
-                                caption=(
-                                    f"📚 <b>{esc(code)} - {esc(course.get('subject_name', ''))}</b>\n"
-                                    f"📝 Exam: <b>{exam_label}</b> | Session: <b>{esc(selected_year)}</b>"
-                                ),
-                                parse_mode=ParseMode.HTML
-                            )
-                            
-                            if sent_msg.document:
-                                await exam_service.update_telegram_file_id(cache_record.id, sent_msg.document.file_id)
-                                await session.commit()
-                                
-                        delivered_count += 1
-                        
-                    except Exception as e:
-                        logger.error("Failed delivering batch paper for %s (%s): %r", code, exam_type, e)
+                    logger.warning("Batch metadata fetch failed for %s %s: %r", sub_code, selected_year, e)
         finally:
             await client.close()
-            
+
+        # Short DB session: persist all fetched records
+        async with get_db_session() as session:
+            exam_service = ExaminationService(session)
+            for sub_code, records in all_parsed:
+                persisted = await exam_service.persist_subject_metadata(
+                    parsed_records=records,
+                    academic_year=selected_year,
+                    subject_code=sub_code,
+                )
+                for rec in persisted:
+                    if rec.status != "paper_not_available" and rec.id not in cache_ids_to_deliver:
+                        cache_ids_to_deliver.append(rec.id)
+            await session.commit()
+
+    if not cache_ids_to_deliver:
+        await status_msg.edit_text(
+            "ℹ️ <b>No papers available</b> for any of your current subjects "
+            f"in <b>{esc(selected_year)}</b>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # 3. Deliver each paper via QPaperService
+    total = len(cache_ids_to_deliver)
+    await status_msg.edit_text(f"⏳ Delivering {total} papers — cache hits are instant...")
+
+    succeeded = 0
+    not_available = 0
+    failed = 0
+    errors: list[str] = []
+
+    for i, cache_id in enumerate(cache_ids_to_deliver, start=1):
+        result: QPResult = await qpaper_service.deliver(cache_id, telegram_id)
+        if result.delivered:
+            succeeded += 1
+        elif result.not_available:
+            not_available += 1
+        else:
+            failed += 1
+            if result.error:
+                errors.append(f"Paper #{cache_id}: {result.error[:80]}")
+        if i % 3 == 0 or i == total:
+            try:
+                await status_msg.edit_text(
+                    f"⏳ Delivering papers — {i}/{total} done "
+                    f"({succeeded}✓ {not_available}ℹ️ {failed}✗)"
+                )
+            except Exception:
+                pass
+        await asyncio.sleep(0.05)
+
+    # 4. Final summary
+    summary = (
+        f"📋 <b>Batch download complete</b>\n\n"
+        f"📅 Year: <b>{esc(selected_year)}</b>\n"
+        f"✅ Delivered: <b>{succeeded}</b>\n"
+        f"ℹ️ No paper available: <b>{not_available}</b>\n"
+        f"❌ Failed: <b>{failed}</b>\n"
+    )
+    if errors:
+        summary += "\n<b>Errors:</b>\n" + "\n".join(f"• {html.escape(e)}" for e in errors[:5])
+        if len(errors) > 5:
+            summary += f"\n... and {len(errors) - 5} more"
+    await status_msg.edit_text(summary, parse_mode=ParseMode.HTML)
+
+
+# ── Helper: translate QPResult → user-facing message ────────────────────────
+
+async def _present_qp_result(status_msg: types.Message, result: QPResult) -> None:
+    """Translate a QPResult into the user-facing message."""
+    try:
+        if result.delivered:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+            return
+
+        if result.not_available:
+            await status_msg.edit_text(
+                "ℹ️ <b>No paper available</b>\n\n"
+                "NITRIS confirmed this subject has no question paper for this exam type.\n"
+                "This is normal for lab / 1-credit subjects.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        if result.in_progress:
+            await status_msg.edit_text(
+                "⏳ <b>Acquisition in progress</b>\n\n"
+                "Another student is currently fetching this paper from NITRIS. "
+                "Tap the button again in ~30 seconds — it will deliver instantly "
+                "once cached.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        if result.permanent:
+            await status_msg.edit_text(
+                f"❌ <b>Paper unavailable</b>\n\n"
+                f"This paper could not be acquired after multiple attempts.\n"
+                f"Reason: <code>{html.escape(result.error or 'unknown')[:300]}</code>\n\n"
+                f"Contact support if this persists.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        # Technical error
+        await status_msg.edit_text(
+            f"⚠️ <b>Temporary error fetching paper</b>\n\n"
+            f"The system failed to fetch this paper right now. Please try again.\n"
+            f"Error: <code>{html.escape(result.error or 'unknown')[:300]}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        logger.error("Failed to present QP result to user: %r", e)
         try:
-            await status_msg.delete()
+            await status_msg.edit_text("❌ Internal error. Please try again.")
         except Exception:
             pass
-            
-        await callback.message.answer(
-            f"✅ <b>Folder Delivery Complete!</b>\n\n"
-            f"Delivered <b>{delivered_count}</b> available exam papers for Session <b>{selected_year}</b> straight to your chat.\n\n"
-            f"Enjoy instant view with Telegram's internal PDF reader!",
-            parse_mode=ParseMode.HTML
-        )
 
 
 @dp.callback_query(F.data == "qp_search_prompt")

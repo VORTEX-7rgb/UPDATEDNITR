@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Optional, Any
 from enum import Enum
-from sqlalchemy import BigInteger, String, ForeignKey, DateTime, Boolean, Index, JSON
+from sqlalchemy import BigInteger, String, ForeignKey, DateTime, Boolean, Index, JSON, Integer, Text
 
 class EventType(str, Enum):
     NEW_SUBJECT_ADDED = "new_subject_added"
@@ -11,6 +11,24 @@ class EventType(str, Enum):
     NEW_ABSENCE_DETECTED = "new_absence_detected"
     NEW_MESSAGE_RECEIVED = "new_message_received"
     MESSAGE_UPDATED = "message_updated"
+
+class QPStatus(str, Enum):
+    """Lifecycle states for a question_paper_caches row.
+
+    State transitions (all atomic via UPDATE...WHERE status=...):
+      [none]                       → fetch_in_progress    (first claim)
+      fetch_in_progress            → paper_available       (download+upload succeeded)
+      fetch_in_progress            → paper_not_available   (NITRIS confirmed no paper)
+      fetch_in_progress            → retryable_failure     (transient error)
+      fetch_in_progress            → permanent_failure    (exhausted retries or hard error)
+      retryable_failure            → fetch_in_progress    (re-claim on next request)
+      fetch_in_progress(stale)     → fetch_in_progress    (stale-lock reaper, >5 min)
+    """
+    PAPER_AVAILABLE = "paper_available"
+    PAPER_NOT_AVAILABLE = "paper_not_available"
+    FETCH_IN_PROGRESS = "fetch_in_progress"
+    RETRYABLE_FAILURE = "retryable_failure"
+    PERMANENT_FAILURE = "permanent_failure"
 
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import JSONB
@@ -52,7 +70,6 @@ class User(Base):
         "InboxMessage", back_populates="user", cascade="all, delete-orphan"
     )
 
-
     def __repr__(self) -> str:
         # Secure representation: Never print password field
         return f"<User id={self.id} telegram_id={self.telegram_id} roll_number='{self.roll_number}'>"
@@ -82,7 +99,18 @@ class Snapshot(Base):
 
 
 class Event(Base):
-    """Persistence store for delta changes detected in snapshots."""
+    """Persistence store for delta changes detected in snapshots.
+
+    State machine (mirrors QPaperService pattern):
+      sent=False, claimed_at=NULL                  → ready to be claimed by dispatcher
+      sent=False, claimed_at=NOW()                 → in-flight, being sent
+      sent=True, sent_at=NOW(), permanent_failure=False  → delivered successfully
+      sent=True, permanent_failure=True            → terminal failure (user blocked, exhausted retries, orphaned)
+
+    Atomic claim prevents duplicate sends across processes. Per-event mark_sent
+    eliminates the bulk-update vulnerability. Stale-claim reaper reclaims
+    crashed dispatcher's claims.
+    """
     
     __tablename__ = "events"
 
@@ -92,7 +120,20 @@ class Event(Base):
     )
     event_type: Mapped[str] = mapped_column(String(100), nullable=False)
     payload_json: Mapped[dict[str, Any]] = mapped_column(JSON().with_variant(JSONB, "postgresql"), nullable=False)
+
+    # Delivery state (state machine)
     sent: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+    sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    permanent_failure: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    # Claim tracking (atomic multi-process-safe claim)
+    claimed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    claimed_by: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
+    # Retry policy
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -101,7 +142,11 @@ class Event(Base):
     user: Mapped["User"] = relationship("User", back_populates="events")
 
     def __repr__(self) -> str:
-        return f"<Event id={self.id} user_id={self.user_id} type='{self.event_type}' sent={self.sent}>"
+        return (
+            f"<Event id={self.id} user_id={self.user_id} type='{self.event_type}' "
+            f"sent={self.sent} attempts={self.attempt_count}"
+            f"{' PERM' if self.permanent_failure else ''}>"
+        )
 
 
 class SyncState(Base):
@@ -172,8 +217,22 @@ Index("idx_inbox_user_token", InboxMessage.user_id, InboxMessage.token, unique=T
 
 
 class QuestionPaperCache(Base):
-    """Caches Telegram file IDs and portal download postback targets for exam papers."""
-    
+    """Global multi-tenant cache for NITRIS question papers.
+
+    A single row per (subject_code, academic_year, exam_type) tuple. Shared across
+    ALL students — never duplicated per user. The telegram_file_id stored here is the
+    durable Telegram file reference for the bot's private QP storage channel; forwarding
+    it to any user costs zero NITRIS traffic.
+
+    Lifecycle state machine (see QPStatus enum):
+      fetch_in_progress  → paper_available | paper_not_available | retryable_failure | permanent_failure
+      retryable_failure  → fetch_in_progress (re-claim)
+      fetch_in_progress stale (>5min) → re-claimed by next request
+
+    Atomic state transitions are enforced by the QPaperService via UPDATE...WHERE status=...
+    Compare-And-Swap pattern, never by read-modify-write.
+    """
+
     __tablename__ = "question_paper_caches"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
@@ -183,17 +242,67 @@ class QuestionPaperCache(Base):
     
     portal_postback_target: Mapped[str] = mapped_column(String(500), nullable=False)
     telegram_file_id: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+
+    # State machine
+    status: Mapped[str] = mapped_column(
+        String(30), nullable=False, default=QPStatus.FETCH_IN_PROGRESS.value, index=True
+    )
+    acquired_by: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    acquired_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    file_kind: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)  # pdf | zip
+    file_size_bytes: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    last_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
 
     def __repr__(self) -> str:
-        return f"<QuestionPaperCache id={self.id} code='{self.subject_code}' year='{self.academic_year}' type='{self.exam_type}' cached={bool(self.telegram_file_id)}>"
+        return (
+            f"<QuestionPaperCache id={self.id} code='{self.subject_code}' "
+            f"year='{self.academic_year}' type='{self.exam_type}' "
+            f"status={self.status} cached={bool(self.telegram_file_id)}>"
+        )
 
 
-# Composite lookup index for high-speed cache queries
-Index("idx_qp_cache_lookup", QuestionPaperCache.subject_code, QuestionPaperCache.academic_year, QuestionPaperCache.exam_type, unique=True)
+# Composite lookup index for high-speed cache queries (unique per paper)
+Index("idx_qp_cache_lookup",
+      QuestionPaperCache.subject_code,
+      QuestionPaperCache.academic_year,
+      QuestionPaperCache.exam_type,
+      unique=True)
 Index("idx_inbox_portal_msg_id", InboxMessage.portal_message_id)
 
+# Partial index for stale-lock reaper: only rows currently being acquired
+Index(
+    "idx_qp_cache_acquisition",
+    QuestionPaperCache.status,
+    QuestionPaperCache.acquired_at,
+    postgresql_where=QuestionPaperCache.status == QPStatus.FETCH_IN_PROGRESS.value,
+)
+# Retry-policy lookup
+Index(
+    "idx_qp_cache_status_attempts",
+    QuestionPaperCache.status,
+    QuestionPaperCache.attempt_count,
+    QuestionPaperCache.last_attempt_at,
+)
 
+# Event dispatcher atomic-claim partial index
+Index(
+    "idx_events_claim",
+    Event.id,
+    Event.claimed_at,
+    postgresql_where=(Event.sent == False) & (Event.permanent_failure == False),
+)
+Index(
+    "idx_events_permanent",
+    Event.id,
+    postgresql_where=Event.permanent_failure == True,
+)
 

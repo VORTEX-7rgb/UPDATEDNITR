@@ -1,0 +1,585 @@
+"""Question-paper service — global multi-tenant cache with DB-safe locking,
+bounded NITRIS acquisition, bounded Telegram delivery, FloodWait retry,
+crash-safe recovery, and explicit state machine.
+
+Design:
+  * Cache is global (one row per (subject_code, academic_year, exam_type)).
+    All students share the same telegram_file_id. Zero NITRIS traffic on hit.
+  * State machine on question_paper_caches.status:
+        paper_available | paper_not_available | fetch_in_progress |
+        retryable_failure | permanent_failure
+  * Concurrent same-paper requests collapse into ONE acquisition job via
+    atomic UPDATE...WHERE status IN ('retryable_failure', 'fetch_in_progress'+stale).
+    Losers poll DB every 2s until terminal state or 60s timeout.
+  * Concurrent different-paper requests are bounded by asyncio.Semaphore(8)
+    for NITRIS acquisition and asyncio.Semaphore(25) for Telegram delivery
+    (under Telegram's ~30/sec rate limit).
+  * Slow operations (NITRIS download, Telegram upload, sleeps) NEVER hold an
+    open DB session. All DB work is short transactions around atomic updates.
+  * Crash recovery: stale locks (acquired_at < NOW() - 5min) are reclaimable
+    by the next request. A periodic reaper converts very stale locks to
+    retryable_failure.
+  * Telegram failures NEVER corrupt cache — a failed send_document to the user
+    leaves the cache row untouched. Only failed NITRIS acquisition or failed
+    upload-to-storage-channel updates the cache row to retryable_failure.
+  * ZIP and PDF both supported (signature sniffed from response bytes).
+
+NEVER call this service from inside an open DB session — it manages its own
+short-lived sessions internally.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import time
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Optional, Callable, Awaitable, Tuple
+
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from aiogram import Bot
+from aiogram.types import BufferedInputFile
+from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramAPIError
+
+from app.config import config
+from app.db.models import QuestionPaperCache, QPStatus
+from app.nitris.client import NitrisClient
+from app.nitris.exceptions import (
+    AttendanceWorkflowError, SessionExpiredError, LoginError, InvalidContextError,
+)
+from app.utils import esc
+
+logger = logging.getLogger(__name__)
+
+# Tunables — exposed as module-level for tests + ops tuning.
+MAX_CONCURRENT_ACQUISITIONS = 8       # caps NITRIS load + memory (8 × ~5MB PDFs = 40MB)
+MAX_CONCURRENT_DELIVERIES = 25        # under Telegram's ~30/sec bot rate limit
+ACQUIRE_STALE_SECONDS = 300            # 5 min — stale locks become reclaimable
+ACQUIRE_PERMANENT_AFTER = 5           # retryable_failure becomes permanent_failure after N attempts
+WAIT_POLL_INTERVAL_SEC = 2.0
+WAIT_TIMEOUT_SEC = 60.0
+FLOODWAIT_MAX_RETRIES = 3
+DELIVERY_MAX_RETRIES = 3
+DELIVERY_RETRY_BASE_DELAY = 1.0
+
+
+@dataclass
+class QPResult:
+    """Result of a deliver() call. Carries terminal state for the bot handler."""
+    delivered: bool = False             # file was successfully sent to user
+    not_available: bool = False         # NITRIS confirmed no paper exists
+    in_progress: bool = False           # another worker is acquiring, user should retry shortly
+    error: Optional[str] = None         # technical error message (only when system actually failed)
+    permanent: bool = False             # permanent_failure — needs human attention
+    file_kind: Optional[str] = None     # 'pdf' or 'zip' when delivered
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _is_zip(bytes_: bytes) -> bool:
+    return bytes_[:4] == b"PK\x03\x04"
+
+
+def _is_pdf(bytes_: bytes) -> bool:
+    return bytes_[:4] == b"%PDF"
+
+
+def _sniff_kind(b: bytes) -> str:
+    if _is_zip(b):
+        return "zip"
+    if _is_pdf(b):
+        return "pdf"
+    # Default to pdf — NITRIS sometimes returns wrong Content-Type for PDFs
+    return "pdf"
+
+
+def _is_permanent_error(exc: Exception) -> bool:
+    """Heuristic: only permanent failures are 'NITRIS confirmed paper doesn't exist'
+    or 5xx-class portal errors that don't resolve with retries."""
+    if isinstance(exc, InvalidContextError):
+        # NITRIS 503 on the actual download postback = permanent for this paper
+        # (the postback target itself is invalid/revoked — retrying won't help)
+        return True
+    msg = str(exc).lower()
+    if "no paper" in msg or "paper not available" in msg or "not found on portal" in msg:
+        return True
+    return False
+
+
+class QPaperService:
+    """Global QP cache orchestrator. One instance per bot process (singleton)."""
+
+    def __init__(
+        self,
+        bot: Bot,
+        session_factory: async_sessionmaker[AsyncSession],
+        creds_provider: Callable[[], Awaitable[Tuple[str, str]]],
+        storage_chat_id: Optional[int] = None,
+    ):
+        """
+        Args:
+            bot: aiogram Bot instance (used for send_document + storage uploads).
+            session_factory: async_sessionmaker bound to async engine.
+            creds_provider: async callable returning (roll_number, plaintext_password)
+                for a NITRIS account that can fetch papers. Used ONLY for acquisition
+                on cache miss — never for delivery.
+            storage_chat_id: Telegram chat ID for the private QP storage channel.
+                Defaults to config.QP_STORAGE_CHAT_ID.
+        """
+        self.bot = bot
+        self.session_factory = session_factory
+        self.creds_provider = creds_provider
+        self.storage_chat_id = storage_chat_id if storage_chat_id is not None else config.QP_STORAGE_CHAT_ID
+        if not self.storage_chat_id:
+            logger.info(
+                "QP_STORAGE_CHAT_ID is not set in .env — paper acquisitions will use "
+                "direct user chat fallback for storage and caching."
+            )
+        # Bounded queues — single per-process
+        self._acquire_sem = asyncio.Semaphore(MAX_CONCURRENT_ACQUISITIONS)
+        self._deliver_sem = asyncio.Semaphore(MAX_CONCURRENT_DELIVERIES)
+        # Background reaper task handle (started lazily)
+        self._reaper_task: Optional[asyncio.Task] = None
+
+    # ── Public entry point ──────────────────────────────────────────
+
+    async def deliver(self, cache_id: int, telegram_id: int) -> QPResult:
+        """Deliver a paper to a Telegram user. Called by the bot QP handler.
+
+        Flow:
+          1. Read cache row (short DB session).
+          2. Dispatch on status:
+             - paper_available → cached delivery (bounded by delivery semaphore)
+             - paper_not_available → clean "no paper" result
+             - permanent_failure → error result
+             - fetch_in_progress → wait + deliver
+             - retryable_failure → try to acquire (claim)
+          3. Acquisition (if claimed): NITRIS download → Telegram upload →
+             atomic state update → wake any waiters via DB poll.
+        """
+        # Short DB read — never held during slow ops.
+        snapshot = await self._read_cache(cache_id)
+        if snapshot is None:
+            return QPResult(error="Question paper record not found.")
+        status, file_id, file_kind, sub_code, ac_year, ex_type, postback, err_msg = snapshot
+
+        if status == QPStatus.PAPER_AVAILABLE.value and file_id:
+            return await self._deliver_cached(
+                cache_id, file_id, file_kind, telegram_id, sub_code, ac_year, ex_type
+            )
+        if status == QPStatus.PAPER_NOT_AVAILABLE.value:
+            return QPResult(not_available=True)
+        if status == QPStatus.PERMANENT_FAILURE.value:
+            return QPResult(permanent=True, error=err_msg or "permanent_failure")
+        # fetch_in_progress OR retryable_failure → try to claim
+        return await self._claim_or_wait_and_deliver(
+            cache_id, telegram_id, sub_code, ac_year, ex_type, postback
+        )
+
+    # ── Cache read (short transaction) ──────────────────────────────
+
+    async def _read_cache(self, cache_id: int) -> Optional[Tuple]:
+        async with self.session_factory() as session:
+            rec = await session.get(QuestionPaperCache, cache_id)
+            if rec is None:
+                return None
+            return (
+                rec.status, rec.telegram_file_id, rec.file_kind,
+                rec.subject_code, rec.academic_year, rec.exam_type,
+                rec.portal_postback_target, rec.error_message,
+            )
+
+    # ── Cached delivery — bounded, FloodWait-aware ───────────────────
+
+    async def _deliver_cached(
+        self, cache_id: int, file_id: str, file_kind: Optional[str],
+        telegram_id: int, sub_code: str, ac_year: str, ex_type: str,
+    ) -> QPResult:
+        """Forward cached telegram_file_id to user. Bounded by delivery semaphore.
+        Never touches NITRIS. Never modifies cache."""
+        async with self._deliver_sem:
+            caption = _make_caption(sub_code, ac_year, ex_type)
+            for attempt in range(DELIVERY_MAX_RETRIES):
+                try:
+                    await self.bot.send_document(
+                        chat_id=telegram_id,
+                        document=file_id,
+                        caption=caption,
+                        parse_mode="HTML",
+                    )
+                    return QPResult(delivered=True, file_kind=file_kind)
+                except TelegramRetryAfter as e:
+                    if attempt + 1 >= DELIVERY_MAX_RETRIES:
+                        return QPResult(error=f"Telegram rate-limited (retry_after={e.retry_after}s). Try again in a moment.")
+                    logger.warning(
+                        "FloodWait on QP delivery to %d (cache_id=%d): %ds — retrying",
+                        telegram_id, cache_id, e.retry_after,
+                    )
+                    await asyncio.sleep(e.retry_after + 0.5)
+                    continue
+                except TelegramForbiddenError:
+                    return QPResult(error="Bot blocked by user — cannot deliver.")
+                except TelegramAPIError as e:
+                    msg = str(e).lower()
+                    if "chat not found" in msg or "deactivated" in msg:
+                        return QPResult(error="User account unavailable.")
+                    if attempt + 1 >= DELIVERY_MAX_RETRIES:
+                        return QPResult(error=f"Telegram error: {e}")
+                    await asyncio.sleep(DELIVERY_RETRY_BASE_DELAY * (attempt + 1))
+                    continue
+            return QPResult(error="Delivery exhausted retries.")
+
+    # ── Claim-or-wait — atomic DB CAS ────────────────────────────────
+
+    async def _claim_or_wait_and_deliver(
+        self, cache_id: int, telegram_id: int,
+        sub_code: str, ac_year: str, ex_type: str, postback: str,
+    ) -> QPResult:
+        """Attempt to atomically claim the row for acquisition. If someone else
+        has it, wait + deliver when their acquisition completes."""
+        job_id = uuid.uuid4().hex
+        # Atomic CAS: claim if retryable_failure OR fetch_in_progress that's stale
+        claimed = await self._claim_for_acquisition(cache_id, job_id)
+        if claimed:
+            return await self._acquire_and_deliver(
+                cache_id, telegram_id, job_id, sub_code, ac_year, ex_type, postback
+            )
+        # Lost the race — wait for the other worker
+        return await self._wait_and_deliver(cache_id, telegram_id)
+
+    async def _claim_for_acquisition(self, cache_id: int, job_id: str) -> bool:
+        """Atomic compare-and-swap: claim the row for acquisition.
+
+        Returns True if this caller won the claim, False otherwise.
+        Pattern: UPDATE ... WHERE status='retryable_failure' OR
+                                  (status='fetch_in_progress' AND acquired_at < stale threshold)
+                 RETURNING id
+        If 0 rows returned, someone else has a fresh claim.
+        """
+        async with self.session_factory() as session:
+            async with session.begin():
+                stmt = text("""
+                    UPDATE question_paper_caches
+                    SET status = :in_progress,
+                        acquired_by = :job_id,
+                        acquired_at = NOW(),
+                        last_attempt_at = NOW(),
+                        attempt_count = attempt_count + 1,
+                        error_message = NULL,
+                        updated_at = NOW()
+                    WHERE id = :cache_id
+                      AND (
+                        status = :retryable
+                        OR (status = :in_progress
+                            AND (acquired_at IS NULL
+                                 OR acquired_at < NOW() - make_interval(secs => :stale_secs)))
+                      )
+                    RETURNING id, subject_code, academic_year, exam_type, portal_postback_target
+                """)
+                result = await session.execute(stmt, {
+                    "in_progress": QPStatus.FETCH_IN_PROGRESS.value,
+                    "retryable": QPStatus.RETRYABLE_FAILURE.value,
+                    "job_id": job_id,
+                    "cache_id": cache_id,
+                    "stale_secs": ACQUIRE_STALE_SECONDS,
+                })
+                row = result.first()
+                if row is None:
+                    return False
+                logger.info(
+                    "Claimed cache_id=%d for acquisition (job=%s, attempt will be #%d)",
+                    cache_id, job_id[:8], 0,  # attempt_count already incremented
+                )
+                return True
+
+    async def _acquire_and_deliver(
+        self, cache_id: int, telegram_id: int, job_id: str,
+        sub_code: str, ac_year: str, ex_type: str, postback: str,
+    ) -> QPResult:
+        """Slow path — NITRIS download + Telegram upload. NO DB session held."""
+        async with self._acquire_sem:
+            try:
+                # 1. Download from NITRIS (slow — no DB session open)
+                file_bytes, kind = await self._nitris_download(
+                    sub_code, ac_year, ex_type, postback
+                )
+                # 2. Upload to storage channel OR (fallback) to the user's chat.
+                #    When falling back to user's chat, the upload ALSO serves as
+                #    the first delivery — no separate send_document needed.
+                file_id, uploaded_to_user = await self._telegram_upload(
+                    file_bytes, kind, sub_code, ac_year, ex_type,
+                    fallback_chat_id=telegram_id,
+                )
+                # 3. Atomic state update → paper_available
+                await self._mark_available(cache_id, file_id, kind, len(file_bytes))
+                logger.info(
+                    "Acquired QP cache_id=%d (%s %s %s) — file_id=%s size=%d kind=%s uploaded_to_user=%s",
+                    cache_id, sub_code, ac_year, ex_type, file_id[:24], len(file_bytes), kind, uploaded_to_user,
+                )
+                # 4. If the upload already went to the user's chat (fallback mode),
+                #    skip the separate delivery — the file is already in their chat.
+                if uploaded_to_user:
+                    return QPResult(delivered=True, file_kind=kind)
+                # 5. Otherwise (uploaded to storage channel), forward the cached
+                #    file_id to the user.
+                return await self._deliver_cached(
+                    cache_id, file_id, kind, telegram_id, sub_code, ac_year, ex_type
+                )
+            except Exception as exc:
+                # Classify and update cache atomically. NEVER corrupt: the row's
+                # status transitions to retryable_failure or permanent_failure —
+                # the cache row itself remains valid and queryable.
+                permanent = _is_permanent_error(exc)
+                # Check attempt_count to escalate to permanent after threshold
+                attempts = await self._get_attempt_count(cache_id)
+                if attempts >= ACQUIRE_PERMANENT_AFTER:
+                    permanent = True
+                new_status = (
+                    QPStatus.PERMANENT_FAILURE.value if permanent
+                    else QPStatus.RETRYABLE_FAILURE.value
+                )
+                await self._mark_failure(cache_id, new_status, exc)
+                logger.error(
+                    "QP acquisition failed cache_id=%d job=%s: %r (status=%s attempts=%d)",
+                    cache_id, job_id[:8], exc, new_status, attempts,
+                )
+                if permanent:
+                    return QPResult(permanent=True, error=str(exc))
+                return QPResult(error=f"Acquisition failed (will retry): {exc}")
+
+    async def _wait_and_deliver(self, cache_id: int, telegram_id: int) -> QPResult:
+        """Poll cache status until terminal or timeout. Used when another worker
+        has the row in fetch_in_progress state."""
+        start = time.monotonic()
+        last_status = None
+        while time.monotonic() - start < WAIT_TIMEOUT_SEC:
+            await asyncio.sleep(WAIT_POLL_INTERVAL_SEC)
+            snap = await self._read_cache(cache_id)
+            if snap is None:
+                return QPResult(error="Record disappeared during wait.")
+            status, file_id, file_kind, sub_code, ac_year, ex_type, _, err_msg = snap
+            if status != last_status:
+                logger.info(
+                    "Wait poll cache_id=%d status=%s elapsed=%.1fs",
+                    cache_id, status, time.monotonic() - start,
+                )
+                last_status = status
+            if status == QPStatus.PAPER_AVAILABLE.value and file_id:
+                return await self._deliver_cached(
+                    cache_id, file_id, file_kind, telegram_id,
+                    sub_code, ac_year, ex_type,
+                )
+            if status == QPStatus.PAPER_NOT_AVAILABLE.value:
+                return QPResult(not_available=True)
+            if status == QPStatus.PERMANENT_FAILURE.value:
+                return QPResult(permanent=True, error=err_msg)
+            if status == QPStatus.RETRYABLE_FAILURE.value:
+                # The acquiring worker failed — try to re-claim
+                return await self._claim_or_wait_and_deliver(
+                    cache_id, telegram_id, sub_code, ac_year, ex_type, snap[6]
+                )
+            # fetch_in_progress — keep polling
+        return QPResult(
+            in_progress=True,
+            error="Acquisition is taking longer than expected — please tap the button again in a moment.",
+        )
+
+    # ── NITRIS + Telegram slow operations (no DB session) ───────────
+
+    async def _nitris_download(
+        self, sub_code: str, ac_year: str, ex_type: str, postback_target: str,
+    ) -> Tuple[bytes, str]:
+        """Login to NITRIS, submit the postback target, fetch raw paper bytes.
+        Returns (bytes, kind) where kind is 'pdf' or 'zip'."""
+        roll, password = await self.creds_provider()
+        client = NitrisClient()
+        try:
+            await client.login(roll, password)
+            file_bytes = await client.download_question_paper_bytes(
+                academic_year=ac_year,
+                subject_query=sub_code,
+                event_target=postback_target,
+            )
+            kind = _sniff_kind(file_bytes)
+            return file_bytes, kind
+        finally:
+            await client.close()
+
+    async def _telegram_upload(
+        self, file_bytes: bytes, kind: str,
+        sub_code: str, ac_year: str, ex_type: str,
+        fallback_chat_id: Optional[int] = None,
+    ) -> Tuple[str, bool]:
+        """Upload the paper ONCE to the bot's private QP storage channel.
+
+        If QP_STORAGE_CHAT_ID is 0/unset, falls back to uploading to
+        fallback_chat_id (the requesting user's chat). Telegram file_ids are
+        bot-scoped and reusable across all chats, so a file_id obtained from
+        any chat is forwardable to any other chat.
+
+        Returns (file_id, uploaded_to_user_chat). When uploaded_to_user_chat is
+        True, the upload ALSO served as the first user's delivery — caller
+        should skip the separate deliver step.
+        """
+        target_chat = self.storage_chat_id or fallback_chat_id
+        if not target_chat:
+            raise RuntimeError(
+                "Cannot upload paper — neither QP_STORAGE_CHAT_ID nor a "
+                "fallback chat_id was provided. Configure QP_STORAGE_CHAT_ID "
+                "in .env (a private Telegram channel where the bot is admin)."
+            )
+        uploaded_to_user = (
+            fallback_chat_id is not None
+            and target_chat == fallback_chat_id
+            and not self.storage_chat_id
+        )
+        if uploaded_to_user:
+            logger.info(
+                "QP_STORAGE_CHAT_ID not set — uploading paper to user chat %d "
+                "as fallback storage (file_id will be reused for all users).",
+                fallback_chat_id,
+            )
+        ext = "pdf" if kind == "pdf" else "zip"
+        safe_year = ac_year.replace("/", "_").replace("\\", "_")
+        filename = f"{sub_code}_{safe_year}_{ex_type}.{ext}"
+        document = BufferedInputFile(file_bytes, filename=filename)
+        # Retry on FloodWait — Telegram may rate-limit uploads to a channel
+        for attempt in range(FLOODWAIT_MAX_RETRIES):
+            try:
+                msg = await self.bot.send_document(
+                    chat_id=target_chat,
+                    document=document,
+                    caption=f"📚 {sub_code} | {ac_year} | {ex_type}",
+                )
+                if not msg.document or not msg.document.file_id:
+                    raise RuntimeError("Telegram upload returned no document file_id.")
+                return msg.document.file_id, uploaded_to_user
+            except TelegramRetryAfter as e:
+                if attempt + 1 >= FLOODWAIT_MAX_RETRIES:
+                    raise
+                logger.warning(
+                    "FloodWait on QP upload: %ds — retrying", e.retry_after
+                )
+                await asyncio.sleep(e.retry_after + 0.5)
+                # re-create BufferedInputFile (consumed stream)
+                document = BufferedInputFile(file_bytes, filename=filename)
+        raise RuntimeError("Telegram upload exhausted retries.")
+
+    # ── Atomic state transitions ─────────────────────────────────────
+
+    async def _mark_available(
+        self, cache_id: int, file_id: str, kind: str, size: int,
+    ) -> None:
+        async with self.session_factory() as session:
+            async with session.begin():
+                await session.execute(text("""
+                    UPDATE question_paper_caches
+                    SET status = :status,
+                        telegram_file_id = :file_id,
+                        file_kind = :kind,
+                        file_size_bytes = :size,
+                        acquired_by = NULL,
+                        acquired_at = NULL,
+                        error_message = NULL,
+                        updated_at = NOW()
+                    WHERE id = :cache_id AND status = :in_progress
+                """), {
+                    "status": QPStatus.PAPER_AVAILABLE.value,
+                    "file_id": file_id,
+                    "kind": kind,
+                    "size": size,
+                    "cache_id": cache_id,
+                    "in_progress": QPStatus.FETCH_IN_PROGRESS.value,
+                })
+
+    async def _mark_failure(
+        self, cache_id: int, new_status: str, exc: Exception,
+    ) -> None:
+        async with self.session_factory() as session:
+            async with session.begin():
+                await session.execute(text("""
+                    UPDATE question_paper_caches
+                    SET status = :status,
+                        acquired_by = NULL,
+                        acquired_at = NULL,
+                        error_message = :err,
+                        updated_at = NOW()
+                    WHERE id = :cache_id AND status = :in_progress
+                """), {
+                    "status": new_status,
+                    "err": str(exc)[:1000],
+                    "cache_id": cache_id,
+                    "in_progress": QPStatus.FETCH_IN_PROGRESS.value,
+                })
+
+    async def _get_attempt_count(self, cache_id: int) -> int:
+        async with self.session_factory() as session:
+            row = (await session.execute(
+                text("SELECT attempt_count FROM question_paper_caches WHERE id = :id"),
+                {"id": cache_id},
+            )).first()
+            return int(row[0]) if row else 0
+
+    # ── Stale-lock reaper (background safety net) ────────────────────
+
+    async def _reap_stale_locks(self) -> int:
+        """Convert locks held > ACQUIRE_STALE_SECONDS*2 to retryable_failure.
+        Returns number of rows reclaimed."""
+        async with self.session_factory() as session:
+            async with session.begin():
+                result = await session.execute(text("""
+                    UPDATE question_paper_caches
+                    SET status = :retryable,
+                        acquired_by = NULL,
+                        error_message = COALESCE(error_message, '') || ' [stale-lock-reaped]',
+                        updated_at = NOW()
+                    WHERE status = :in_progress
+                      AND acquired_at IS NOT NULL
+                      AND acquired_at < NOW() - make_interval(secs => :stale_secs * 2)
+                """), {
+                    "retryable": QPStatus.RETRYABLE_FAILURE.value,
+                    "in_progress": QPStatus.FETCH_IN_PROGRESS.value,
+                    "stale_secs": ACQUIRE_STALE_SECONDS,
+                })
+                return result.rowcount or 0
+
+    async def _reaper_loop(self) -> None:
+        """Background task — runs every 60s, reclaims crashed acquisitions."""
+        while True:
+            try:
+                reclaimed = await self._reap_stale_locks()
+                if reclaimed:
+                    logger.info("Stale-lock reaper reclaimed %d QP acquisition(s)", reclaimed)
+            except Exception as e:
+                logger.error("Stale-lock reaper failed: %r", e)
+            await asyncio.sleep(60.0)
+
+    def start_reaper(self) -> None:
+        """Idempotent — starts the background reaper if not already running."""
+        if self._reaper_task is None or self._reaper_task.done():
+            self._reaper_task = asyncio.create_task(self._reaper_loop())
+
+    async def stop_reaper(self) -> None:
+        if self._reaper_task and not self._reaper_task.done():
+            self._reaper_task.cancel()
+            try:
+                await self._reaper_task
+            except asyncio.CancelledError:
+                pass
+
+
+# ── Helpers ────────────────────────────────────────────────────────
+
+
+def _make_caption(sub_code: str, ac_year: str, ex_type: str) -> str:
+    return (
+        f"📚 <b>NITRIS Question Paper</b>\n\n"
+        f"📖 Subject: <b>{esc(sub_code)}</b>\n"
+        f"📅 Session: <b>{esc(ac_year)}</b>\n"
+        f"📝 Exam: <b>{ex_type.upper().replace('_', ' ')}</b>\n"
+    )

@@ -902,11 +902,20 @@ class NitrisClient:
 
         return html
 
-    async def download_question_paper_pdf(
+    async def download_question_paper_bytes(
         self, academic_year: str, subject_query: str, event_target: str
     ) -> bytes:
-        """Submit postback for the GridView download button and download the PDF file bytes
-        directly from response stream."""
+        """Submit postback for the GridView download button and download the paper
+        bytes directly from response stream.
+
+        Handles BOTH PDF and ZIP — NITRIS returns ZIP archives for some lab /
+        multi-paper subjects. The format is detected by signature bytes (magic
+        numbers), not by Content-Type, because NITRIS sometimes serves a PDF
+        with Content-Type: application/octet-stream or application/zip.
+
+        Returns: raw bytes (PDF or ZIP). The caller sniffs the format from the
+        first 4 bytes (b"%PDF" for PDF, b"PK\\x03\\x04" for ZIP).
+        """
         # 1. Fetch current search page to get fresh __VIEWSTATE and form fields
         search_html = await self.fetch_question_papers(
             academic_year=academic_year, subject_query=subject_query
@@ -927,14 +936,14 @@ class NitrisClient:
         url = await self.fetch_question_papers_page_url()
         headers = {"Referer": str(url)}
 
-        logger.info("[QP-Download] Submitting postback for PDF target: %s", event_target)
+        logger.info("[QP-Download] Submitting postback for paper target: %s", event_target)
         resp = await self.client.post(
             url, data=payload, headers=headers, follow_redirects=False
         )
 
         if resp.status_code != 200:
             raise AttendanceWorkflowError(
-                f"Question Paper PDF postback returned status {resp.status_code}"
+                f"Question Paper postback returned status {resp.status_code}"
             )
 
         content_type = resp.headers.get("Content-Type", "").lower()
@@ -944,43 +953,54 @@ class NitrisClient:
             content_type,
         )
 
-        # 3. Check if it returned a direct PDF binary or a window.open redirection HTML
-        if "application/pdf" in content_type:
+        # 3. Direct binary: PDF or ZIP — sniff from signature bytes, not Content-Type.
+        #    NITRIS often misreports Content-Type; trust the magic numbers.
+        head = resp.content[:4]
+        if head == b"%PDF" or head == b"PK\x03\x04":
             return resp.content
 
+        # 4. window.open(...) redirect — NITRIS sometimes returns an HTML page with
+        #    a JavaScript window.open() call pointing to the actual file URL.
         html = resp.text
         match = re.search(r'window\.open\("([^"]*)"', html)
         if not match:
             match = re.search(r"window\.open\(\'([^\']*)\'", html)
 
         if match:
-            pdf_relative_path = match.group(1)
-            pdf_absolute_url = urllib.parse.urljoin(str(url), pdf_relative_path)
-            logger.info("[QP-Download] Resolved window.open PDF URL: %s", pdf_absolute_url)
+            file_relative_path = match.group(1)
+            file_absolute_url = urllib.parse.urljoin(str(url), file_relative_path)
+            logger.info("[QP-Download] Resolved window.open file URL: %s", file_absolute_url)
 
-            pdf_resp = await self.client.get(
-                pdf_absolute_url, headers={"Referer": str(url)}
+            file_resp = await self.client.get(
+                file_absolute_url, headers={"Referer": str(url)}
             )
-            if pdf_resp.status_code != 200:
+            if file_resp.status_code != 200:
                 raise AttendanceWorkflowError(
-                    f"Failed to fetch PDF file from resolved URL (status {pdf_resp.status_code})"
+                    f"Failed to fetch paper from resolved URL (status {file_resp.status_code})"
                 )
 
-            pdf_content_type = pdf_resp.headers.get("Content-Type", "").lower()
-            if "application/pdf" not in pdf_content_type and b"%PDF" not in pdf_resp.content[:10]:
-                raise AttendanceWorkflowError(
-                    "Resolved URL did not return PDF binary bytes."
-                )
+            # Sniff from bytes — accept PDF or ZIP
+            head2 = file_resp.content[:4]
+            if head2 == b"%PDF" or head2 == b"PK\x03\x04":
+                return file_resp.content
 
-            return pdf_resp.content
+            raise AttendanceWorkflowError(
+                f"Resolved URL did not return PDF or ZIP binary bytes (got signature {head2!r})."
+            )
 
-        # Ensure response is actually a PDF file or binary stream, not an HTML error
+        # 5. Server returned form HTML instead of binary — postback failed.
+        #    This typically means the postback target is invalid or expired.
         if "text/html" in content_type and b"__VIEWSTATE" in resp.content:
             raise AttendanceWorkflowError(
-                "Server returned form HTML instead of PDF binary bytes. Postback failed."
+                "Server returned form HTML instead of paper bytes. Postback failed."
             )
 
+        # 6. Last-resort: return whatever bytes we got (could be octet-stream with
+        #    valid PDF/ZIP signature deeper in the content). Caller sniffs again.
         return resp.content
+
+    # Backward-compat alias
+    download_question_paper_pdf = download_question_paper_bytes
 
     async def close(self) -> None:
         await self.client.aclose()

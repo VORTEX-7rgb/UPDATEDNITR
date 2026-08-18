@@ -269,48 +269,8 @@ async def sync_user_data(user_id: int, roll_number: str, encrypted_pass: str, se
                     except Exception as e:
                         logger.error("Inbox sync failed for Roll %s: %r", roll_number, e)
 
-                    # 4. Proactive Background Pre-Caching for Question Papers
-                    is_mock = (
-                        "Mock" in client.__class__.__name__ or
-                        (hasattr(client, "fetch_question_papers") and "Mock" in client.fetch_question_papers.__class__.__name__)
-                    )
-                    if data and data.records and not is_mock:
-                        try:
-                            logger.info("Proactively pre-caching question papers for Roll %s...", roll_number)
-                            from app.bot.telegram import YEAR_MAP
-                            from app.services.examination_service import ExaminationService
-                            from app.db.models import QuestionPaperCache
-                            
-                            async with get_db_session() as session:
-                                for record in data.records:
-                                    subject_code = record.subject_code
-                                    clean_code = subject_code.upper().replace(" ", "").replace("-", "").replace("_", "")
-                                    if not clean_code:
-                                        continue
-                                    
-                                    for year_code, full_year_str in YEAR_MAP.items():
-                                        stmt = (
-                                            select(QuestionPaperCache)
-                                            .where(QuestionPaperCache.subject_code == clean_code)
-                                            .where(QuestionPaperCache.academic_year == full_year_str)
-                                        )
-                                        res = await session.execute(stmt)
-                                        if res.first() is not None:
-                                            continue
-                                        
-                                        logger.info("Pre-cache miss for Subject: %s, Year: %s. Syncing...", clean_code, full_year_str)
-                                        exam_service = ExaminationService(session)
-                                        await exam_service.sync_subject_papers_metadata(
-                                            username=roll_number,
-                                            password=password,
-                                            academic_year=full_year_str,
-                                            subject_code=clean_code,
-                                            client=client
-                                        )
-                                        await session.commit()
-                                        await asyncio.sleep(0.5)
-                        except Exception as e:
-                            logger.error("Proactive pre-caching failed for Roll %s: %r", roll_number, e)
+                    # QP pre-cache loop REMOVED — acquisition is now lazy via QPaperService
+                    # when a student taps "Download". See app/services/qpaper_service.py.
             finally:
                 await client.close()
                 logger.info("Closed NitrisClient session for Roll %s (User ID: %d)", roll_number, user_id)
@@ -442,153 +402,58 @@ async def run_sync_worker(bot: Bot) -> None:
             
         if sync_completed_successfully:
             await asyncio.sleep(SYNC_INTERVAL_SECONDS)
+# Singleton — set by init_event_dispatcher(bot) from main.py
+_event_dispatcher = None
 
 
-def format_notification_message(event_type: EventType | str, payload: dict) -> str:
-    """Build highly aesthetic HTML messages for different event types."""
-    sub_name = esc(payload.get("subject_name") or payload.get("subject_code", "Unknown"))
-    sub_code = esc(payload.get("subject_code", ""))
-    
-    if event_type == EventType.NEW_SUBJECT_ADDED:
-        return (
-            f"📚 <b>New Subject Registered</b>\n\n"
-            f"🎓 Course: <b>{sub_name}</b> ({sub_code})\n"
-            f"👨‍🏫 Faculty: <b>{esc(payload.get('faculty', 'N/A'))}</b>\n"
-            f"📊 Initial Stats: TC: {esc(payload.get('tc', '0'))} | UA: {esc(payload.get('ua', '0'))} | OA: 0\n"
-        )
-        
-    elif event_type == EventType.ATTENDANCE_UPDATED:
-        msg = f"📊 <b>Attendance Update Detected</b>\n\n🔸 Subject: <b>{sub_name}</b> ({sub_code})\n📈 Class Stats changed:\n"
-        changes = payload.get("changes", {})
-        for field, delta in changes.items():
-            name = field.upper()
-            msg += f"  • {name}: <b>{esc(delta.get('old'))} ➡️ {esc(delta.get('new'))}</b>\n"
-        return msg
-        
-    elif event_type == EventType.NEW_ABSENCE_DETECTED:
-        return (
-            f"🚨 <b>New Absence Logged!</b>\n\n"
-            f"🔸 Subject: <b>{sub_name}</b> ({sub_code})\n"
-            f"⚠️ You were marked <b>ABSENT</b>!\n"
-            f"📉 Unauthorized Absences: <b>{esc(payload.get('old_ua', '0'))} ➡️ {esc(payload.get('new_ua', '0'))}</b>\n"
-            f"📊 Current Stats: TC: {esc(payload.get('total_classes', '0'))} | UA: {esc(payload.get('new_ua', '0'))}\n\n"
-            f"<i>Keep an eye on your attendance to avoid debarment!</i>"
-        )
-        
-    elif event_type == EventType.NEW_MESSAGE_RECEIVED:
-        attach_str = "📎 Attachment included" if payload.get("has_attachment") else "No attachments"
-        body_snippet = safe_truncate(esc(payload.get('body_snippet')), 150)
-        return (
-            f"📩 <b>New Message Received!</b>\n\n"
-            f"👤 From: <b>{esc(payload.get('sender'))}</b>\n"
-            f"📌 Subject: <b>{esc(payload.get('subject'))}</b>\n\n"
-            f"<i>\"{body_snippet}\"</i>\n\n"
-            f"💡 {attach_str}\n"
-            f"👉 Use /latest or open your Inbox to read the full notice!"
-        )
-        
-    elif event_type == EventType.MESSAGE_UPDATED:
-        return (
-            f"🔄 <b>Notice Updated!</b>\n\n"
-            f"👤 From: <b>{esc(payload.get('sender'))}</b>\n"
-            f"📌 Subject: <b>{esc(payload.get('subject'))}</b>\n\n"
-            f"⚠️ The university has updated this notice. Open your Inbox to read the revised version."
-        )
-        
-    return f"ℹ️ <b>System Alert</b>\n\nSubject <b>{sub_name}</b> ({sub_code}) changed: {esc(payload)}"
+async def init_event_dispatcher(bot: Bot) -> None:
+    """Initialize the EventDispatcherService singleton.
+    Call from main.py AFTER bot is created, BEFORE polling starts.
+    Also starts the stale-claim reaper background task."""
+    global _event_dispatcher
+    from app.db.database import async_session_factory
+    from app.services.event_dispatcher_service import EventDispatcherService
+    _event_dispatcher = EventDispatcherService(
+        bot=bot,
+        session_factory=async_session_factory,
+    )
+    _event_dispatcher.start_reaper()
+    logger.info("EventDispatcherService initialized (worker_id=%s)", _event_dispatcher.worker_id)
+
+
+async def shutdown_event_dispatcher() -> None:
+    """Graceful shutdown — call from main.py finally block."""
+    global _event_dispatcher
+    if _event_dispatcher is not None:
+        await _event_dispatcher.stop()
+
+
+def format_notification_message(event_type: str | EventType, payload: dict) -> str:
+    """Backward-compatible helper delegating to event_dispatcher_service._format_notification."""
+    from app.services.event_dispatcher_service import _format_notification
+    text_content, _ = _format_notification(event_type, payload)
+    return text_content
 
 
 async def run_dispatch_worker(bot: Bot) -> None:
-    """Periodically queries unsent events and dispatches beautiful Telegram alerts in batches."""
-    logger.info("Notification Dispatcher Worker initialized.")
+    """REWRITTEN — delegates to EventDispatcherService.
 
-    while True:
-        dispatch_completed_successfully = False
-        try:
-            # 1. Wait until DB is healthy
-            await wait_for_db_recovery("Dispatcher")
-            
-            # 2. Query for unsent events including user relationship
-            async with get_db_session() as session:
-                stmt = (
-                    select(Event)
-                    .options(selectinload(Event.user))
-                    .where(Event.sent == False)
-                    .order_by(Event.id.asc())
-                    .limit(50)
-                )
-                res = await session.execute(stmt)
-                unsent_events = res.scalars().all()
+    The old implementation had the duplicate-notification bug:
+      1. Fetch 50 unsent events
+      2. Send each via bot.send_message()
+      3. After ALL 50 sent, ONE bulk mark_sent
+    Crash between 2 and 3 → all 50 stay sent=False → re-sent on restart →
+    DUPLICATE NOTIFICATIONS.
 
-            if unsent_events:
-                logger.info("Found %d unsent events to dispatch.", len(unsent_events))
-                
-                successful_ids = []
-                for event in unsent_events:
-                    user = event.user
-                    if not user:
-                        logger.error("Orphaned Event found: ID %d has no associated user.", event.id)
-                        successful_ids.append(event.id)  # Mark as sent so we clear it
-                        continue
-
-                    # Construct message
-                    msg = format_notification_message(event.event_type, event.payload_json)
-                    
-                    # Custom Keyboard for message notifications
-                    reply_markup = None
-                    if event.event_type in (EventType.NEW_MESSAGE_RECEIVED, EventType.MESSAGE_UPDATED):
-                        from aiogram.utils.keyboard import InlineKeyboardBuilder
-                        from aiogram import types
-                        builder = InlineKeyboardBuilder()
-                        msg_id = event.payload_json.get("message_id")
-                        builder.row(types.InlineKeyboardButton(text="📖 Read Full Notice", callback_data=f"msg_{msg_id}"))
-                        reply_markup = builder.as_markup()
-                        
-                    # Dispatch to Telegram Bot
-                    success = False
-                    try:
-                        await bot.send_message(
-                            chat_id=user.telegram_id,
-                            text=msg,
-                            parse_mode=ParseMode.HTML,
-                            reply_markup=reply_markup
-                        )
-                        success = True
-                    except TelegramForbiddenError:
-                        logger.warning("User %d has blocked the bot. Marking event as sent to clear queue.", user.telegram_id)
-                        success = True  # Treat as success so we don't block queue
-                    except TelegramAPIError as e:
-                        logger.error("Telegram API error sending to %d: %r", user.telegram_id, e)
-                        # We don't mark as success if it is a transient API failure (e.g. rate limits)
-                        if "chat not found" in str(e).lower() or "user is deactivated" in str(e).lower():
-                            success = True  # Clean up dead queues
-                    except Exception as e:
-                        logger.error("Unexpected error sending message to telegram_id %d: %r", user.telegram_id, e)
-                    
-                    if success:
-                        successful_ids.append(event.id)
-                        logger.info("Successfully dispatched event ID %d to telegram_id=%d", event.id, user.telegram_id)
-                
-                # Bulk update status in DB
-                if successful_ids:
-                    await wait_for_db_recovery("Dispatcher")
-                    try:
-                        async with get_db_session() as session:
-                            async with session.begin():
-                                event_repo = EventRepository(session)
-                                await event_repo.mark_sent(successful_ids)
-                        logger.info("Successfully marked %d events as sent in database", len(successful_ids))
-                    except Exception as e:
-                        logger.error("Failed to mark events as sent in database: %r", e)
-            
-            dispatch_completed_successfully = True
-
-        except Exception as e:
-            if is_db_connection_error(e):
-                logger.error("Database connection lost during dispatcher worker execution. Retrying immediately...", exc_info=True)
-            else:
-                logger.error("Unexpected error in background notification dispatcher: %r", e, exc_info=True)
-                await asyncio.sleep(10)
-            
-        if dispatch_completed_successfully:
-            await asyncio.sleep(DISPATCH_INTERVAL_SECONDS)
+    The new implementation (EventDispatcherService) uses:
+      - Atomic claim via UPDATE...WHERE id IN (SELECT...) RETURNING
+      - Per-event immediate mark_sent (crash window ~10ms, not ~30s)
+      - Stale-claim reaper for crashed dispatcher recovery
+      - FloodWait retry with retry_after sleep
+      - Retry exhaustion → permanent_failure (terminal state)
+      - Orphaned events (user deleted) → permanent_failure (not silent drop)
+    """
+    global _event_dispatcher
+    while _event_dispatcher is None:
+        await asyncio.sleep(0.5)
+    await _event_dispatcher.run_forever()
