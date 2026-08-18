@@ -736,8 +736,30 @@ class NitrisClient:
         return token, resp.text
 
     async def download_attachment(self, attachment_path: str) -> bytes:
-        """Download binary attachment files with active session cookies."""
+        """Download binary attachment files with active session cookies and SSRF protection."""
+        import urllib.parse
+        import ipaddress
+
         logger.info("Downloading attachment path: %s", attachment_path)
+
+        # SSRF Validation: Only allow valid relative paths or matching NITRIS portal hosts
+        parsed = urllib.parse.urlparse(attachment_path)
+        if parsed.scheme and parsed.scheme not in ("http", "https"):
+            raise AttendanceWorkflowError(f"Disallowed URL scheme in attachment path: {parsed.scheme}")
+
+        if parsed.netloc:
+            base_parsed = urllib.parse.urlparse(self.base_url)
+            if parsed.hostname != base_parsed.hostname:
+                raise AttendanceWorkflowError(
+                    f"SSRF violation: attachment host '{parsed.hostname}' does not match '{base_parsed.hostname}'"
+                )
+            try:
+                ip = ipaddress.ip_address(parsed.hostname)
+                if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+                    raise AttendanceWorkflowError(f"SSRF violation: attachment IP '{ip}' is private/restricted")
+            except ValueError:
+                pass  # Domain name, which matched base_url host
+
         headers = {"Referer": f"{self.base_url}/nitris/Student/Home/AllMessages.aspx"}
         resp = await self.client.get(attachment_path, headers=headers)
 

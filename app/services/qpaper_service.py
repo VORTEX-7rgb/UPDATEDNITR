@@ -170,7 +170,7 @@ class QPaperService:
 
         if status == QPStatus.PAPER_AVAILABLE.value and file_id:
             return await self._deliver_cached(
-                cache_id, file_id, file_kind, telegram_id, sub_code, ac_year, ex_type
+                cache_id, file_id, file_kind, telegram_id, sub_code, ac_year, ex_type, postback
             )
         if status == QPStatus.PAPER_NOT_AVAILABLE.value:
             return QPResult(not_available=True)
@@ -199,9 +199,10 @@ class QPaperService:
     async def _deliver_cached(
         self, cache_id: int, file_id: str, file_kind: Optional[str],
         telegram_id: int, sub_code: str, ac_year: str, ex_type: str,
+        postback: Optional[str] = None,
     ) -> QPResult:
         """Forward cached telegram_file_id to user. Bounded by delivery semaphore.
-        Never touches NITRIS. Never modifies cache."""
+        If file_id is invalid (e.g. from an old bot token), auto-recovers by re-acquiring."""
         async with self._deliver_sem:
             caption = _make_caption(sub_code, ac_year, ex_type)
             for attempt in range(DELIVERY_MAX_RETRIES):
@@ -226,6 +227,32 @@ class QPaperService:
                     return QPResult(error="Bot blocked by user — cannot deliver.")
                 except TelegramAPIError as e:
                     msg = str(e).lower()
+                    if "wrong file identifier" in msg or "file_id" in msg or "wrong persistent file_id" in msg:
+                        logger.warning(
+                            "Invalid telegram_file_id for cache_id=%d: %r — auto-recovering via fresh acquisition",
+                            cache_id, e,
+                        )
+                        async with self.session_factory() as session:
+                            async with session.begin():
+                                await session.execute(text("""
+                                    UPDATE question_paper_caches
+                                    SET status = :retryable,
+                                        telegram_file_id = NULL,
+                                        attempt_count = 0,
+                                        error_message = :err,
+                                        updated_at = NOW()
+                                    WHERE id = :id
+                                """), {
+                                    "retryable": QPStatus.RETRYABLE_FAILURE.value,
+                                    "id": cache_id,
+                                    "err": f"Stale file_id: {e}",
+                                })
+                        if postback is None:
+                            snap = await self._read_cache(cache_id)
+                            postback = snap[6] if snap else ""
+                        return await self._claim_or_wait_and_deliver(
+                            cache_id, telegram_id, sub_code, ac_year, ex_type, postback
+                        )
                     if "chat not found" in msg or "deactivated" in msg:
                         return QPResult(error="User account unavailable.")
                     if attempt + 1 >= DELIVERY_MAX_RETRIES:
@@ -396,19 +423,41 @@ class QPaperService:
     ) -> Tuple[bytes, str]:
         """Login to NITRIS, submit the postback target, fetch raw paper bytes.
         Returns (bytes, kind) where kind is 'pdf' or 'zip'."""
-        roll, password = await self.creds_provider()
-        client = NitrisClient()
-        try:
-            await client.login(roll, password)
-            file_bytes = await client.download_question_paper_bytes(
-                academic_year=ac_year,
-                subject_query=sub_code,
-                event_target=postback_target,
-            )
-            kind = _sniff_kind(file_bytes)
-            return file_bytes, kind
-        finally:
-            await client.close()
+        raw_creds = await self.creds_provider()
+        if isinstance(raw_creds, list):
+            candidates = raw_creds
+        else:
+            candidates = [raw_creds]
+
+        if not candidates:
+            raise RuntimeError("No candidate credentials available to download paper")
+
+        last_err = None
+        for candidate in candidates:
+            if isinstance(candidate, (list, tuple)) and len(candidate) >= 2:
+                roll = candidate[0]
+                password = candidate[1]
+            else:
+                continue
+
+            client = NitrisClient()
+            try:
+                from app.nitris.gateway import nitris_gateway
+                await nitris_gateway.login_through_gateway(client, roll, password)
+                file_bytes = await client.download_question_paper_bytes(
+                    academic_year=ac_year,
+                    subject_query=sub_code,
+                    event_target=postback_target,
+                )
+                kind = _sniff_kind(file_bytes)
+                return file_bytes, kind
+            except Exception as e:
+                last_err = e
+                logger.warning("QP download attempt failed for roll=%s: %r", roll, e)
+            finally:
+                await client.close()
+
+        raise last_err or RuntimeError("All candidate credentials failed to download paper")
 
     async def _telegram_upload(
         self, file_bytes: bytes, kind: str,
@@ -417,58 +466,53 @@ class QPaperService:
     ) -> Tuple[str, bool]:
         """Upload the paper ONCE to the bot's private QP storage channel.
 
-        If QP_STORAGE_CHAT_ID is 0/unset, falls back to uploading to
-        fallback_chat_id (the requesting user's chat). Telegram file_ids are
-        bot-scoped and reusable across all chats, so a file_id obtained from
-        any chat is forwardable to any other chat.
-
-        Returns (file_id, uploaded_to_user_chat). When uploaded_to_user_chat is
-        True, the upload ALSO served as the first user's delivery — caller
-        should skip the separate deliver step.
+        If QP_STORAGE_CHAT_ID is 0/unset or if the channel upload fails (e.g.
+        chat not found / bot not admin), gracefully falls back to uploading
+        directly to fallback_chat_id (the requesting user's chat).
+        Telegram file_ids are reusable across all chats, so the cached file_id
+        is forwardable to any other student instantly.
         """
-        target_chat = self.storage_chat_id or fallback_chat_id
-        if not target_chat:
-            raise RuntimeError(
-                "Cannot upload paper — neither QP_STORAGE_CHAT_ID nor a "
-                "fallback chat_id was provided. Configure QP_STORAGE_CHAT_ID "
-                "in .env (a private Telegram channel where the bot is admin)."
-            )
-        uploaded_to_user = (
-            fallback_chat_id is not None
-            and target_chat == fallback_chat_id
-            and not self.storage_chat_id
-        )
-        if uploaded_to_user:
-            logger.info(
-                "QP_STORAGE_CHAT_ID not set — uploading paper to user chat %d "
-                "as fallback storage (file_id will be reused for all users).",
-                fallback_chat_id,
-            )
         ext = "pdf" if kind == "pdf" else "zip"
         safe_year = ac_year.replace("/", "_").replace("\\", "_")
         filename = f"{sub_code}_{safe_year}_{ex_type}.{ext}"
-        document = BufferedInputFile(file_bytes, filename=filename)
-        # Retry on FloodWait — Telegram may rate-limit uploads to a channel
-        for attempt in range(FLOODWAIT_MAX_RETRIES):
+
+        # 1. Try storage channel first if configured
+        if self.storage_chat_id:
             try:
+                document = BufferedInputFile(file_bytes, filename=filename)
                 msg = await self.bot.send_document(
-                    chat_id=target_chat,
+                    chat_id=self.storage_chat_id,
                     document=document,
                     caption=f"📚 {sub_code} | {ac_year} | {ex_type}",
                 )
-                if not msg.document or not msg.document.file_id:
-                    raise RuntimeError("Telegram upload returned no document file_id.")
-                return msg.document.file_id, uploaded_to_user
-            except TelegramRetryAfter as e:
-                if attempt + 1 >= FLOODWAIT_MAX_RETRIES:
-                    raise
+                if msg.document and msg.document.file_id:
+                    return msg.document.file_id, False
+            except Exception as e:
                 logger.warning(
-                    "FloodWait on QP upload: %ds — retrying", e.retry_after
+                    "Upload to QP_STORAGE_CHAT_ID (%s) failed (%r) — falling back to direct user chat",
+                    self.storage_chat_id, e,
                 )
-                await asyncio.sleep(e.retry_after + 0.5)
-                # re-create BufferedInputFile (consumed stream)
-                document = BufferedInputFile(file_bytes, filename=filename)
-        raise RuntimeError("Telegram upload exhausted retries.")
+
+        # 2. Fallback to direct user chat
+        if not fallback_chat_id:
+            raise RuntimeError(
+                "Cannot upload paper — neither valid QP_STORAGE_CHAT_ID nor fallback user chat provided."
+            )
+
+        logger.info(
+            "Uploading paper %s (%s %s) directly to user chat %d (file_id will be cached for all students)",
+            sub_code, ac_year, ex_type, fallback_chat_id,
+        )
+        document = BufferedInputFile(file_bytes, filename=filename)
+        msg = await self.bot.send_document(
+            chat_id=fallback_chat_id,
+            document=document,
+            caption=_make_caption(sub_code, ac_year, ex_type),
+            parse_mode="HTML",
+        )
+        if not msg.document or not msg.document.file_id:
+            raise RuntimeError("Telegram upload returned no document file_id.")
+        return msg.document.file_id, True
 
     # ── Atomic state transitions ─────────────────────────────────────
 

@@ -29,7 +29,6 @@ logger = logging.getLogger(__name__)
 from app.utils import esc, safe_truncate
 
 
-
 class Registration(StatesGroup):
     waiting_for_roll = State()      # Waiting for 9-char NITRIS Roll Number
     waiting_for_password = State()  # Waiting for NITRIS Password
@@ -62,28 +61,80 @@ async def init_qpaper_service(bot: Bot) -> None:
     from app.db.database import async_session_factory
     from app.db.crypto import decrypt_password
     from app.db.models import User, SyncState
-    from sqlalchemy import select
+    from sqlalchemy import select, or_, func
 
     async def creds_provider():
-        """Pick the user with the most recent successful sync for NITRIS
-        acquisition. QP is global — any registered user's creds work.
-        Falls back to any registered user if no sync_state rows exist."""
+        """Return a list of (roll, password, user_id) candidates for QP acquisition."""
         async with async_session_factory() as s:
             stmt = (
-                select(User)
+                select(User.id, User.roll_number, User.encrypted_password)
                 .outerjoin(SyncState, User.id == SyncState.user_id)
+                .where(User.credentials_valid == True)
+                .where(
+                    or_(
+                        User.qp_cooldown_until.is_(None),
+                        User.qp_cooldown_until < func.now()
+                    )
+                )
                 .order_by(SyncState.last_success.desc().nulls_last(), User.id.desc())
-                .limit(1)
+                .limit(5)
             )
-            row = (await s.execute(stmt)).scalars().first()
-            if not row:
-                row = (await s.execute(select(User).limit(1))).scalars().first()
-            if not row:
+            rows = (await s.execute(stmt)).all()
+            
+            if not rows:
+                logger.warning(
+                    "No healthy QP credential candidates with sync history — "
+                    "falling back to any user with credentials_valid=TRUE"
+                )
+                stmt = (
+                    select(User.id, User.roll_number, User.encrypted_password)
+                    .where(User.credentials_valid == True)
+                    .order_by(User.id.desc())
+                    .limit(5)
+                )
+                rows = (await s.execute(stmt)).all()
+            
+            if not rows:
+                logger.warning(
+                    "No users with credentials_valid=TRUE — falling back to "
+                    "any registered user as last resort"
+                )
+                stmt = (
+                    select(User.id, User.roll_number, User.encrypted_password)
+                    .order_by(User.id.desc())
+                    .limit(5)
+                )
+                rows = (await s.execute(stmt)).all()
+            
+            if not rows:
                 raise RuntimeError(
                     "No registered users — cannot acquire QP. "
                     "Register at least one student before downloading papers."
                 )
-            return row.roll_number, decrypt_password(row.encrypted_password)
+            
+            candidates = []
+            for r in rows:
+                try:
+                    password = decrypt_password(r.encrypted_password)
+                    candidates.append((r.roll_number, password, r.id))
+                except Exception as e:
+                    logger.error(
+                        "Failed to decrypt password for user_id=%d roll=%s: %r — skipping",
+                        r.id, r.roll_number, e,
+                    )
+                    continue
+            
+            if not candidates:
+                raise RuntimeError(
+                    "All candidate passwords failed to decrypt — "
+                    "check ENCRYPTION_KEY configuration."
+                )
+            
+            logger.info(
+                "creds_provider: returning %d candidate(s) for QP acquisition",
+                len(candidates),
+            )
+            return candidates
 
     qpaper_service = QPaperService(
         bot=bot,
@@ -97,7 +148,6 @@ async def shutdown_qpaper_service() -> None:
     global qpaper_service
     if qpaper_service is not None:
         await qpaper_service.stop_reaper()
-
 
 
 @dp.errors()
@@ -129,18 +179,42 @@ async def db_error_handler(event: ErrorEvent):
                     )
         except Exception as send_err:
             logger.error("Failed to notify user of DB offline status: %r", send_err)
-        return True  # Suppress the error from crashing the dispatcher or printing raw tracebacks
+        return True
     return False
-
 
 
 def format_attendance_message(data) -> str:
     d = data.to_dict()
-    msg = f"🧑‍🎓 <b>{esc(d['student_info'])}</b>\n\n<b>📊 Attendance Summary:</b>\n"
+    msg = f"🧑🎓 <b>{esc(d['student_info'])}</b>\n\n<b>📊 Attendance Summary:</b>\n"
     for rec in d["records"]:
         name = rec.get("subject_name") or rec.get("subject_code", "Unknown")
         msg += f"🔸 <b>{esc(name)}</b>\n"
         msg += f"   TC: {esc(rec['tc'])} | OA: {esc(rec['oa'])} | UA: {esc(rec['ua'])} | LE: {esc(rec['le'])}\n\n"
+    return msg
+
+
+def format_attendance_message_from_snapshot(snapshot) -> str:
+    """Format attendance message from a cached Snapshot DB row.
+    
+    This is the cache-first path — we render the stored snapshot_json
+    directly without touching NITRIS.
+    """
+    if not snapshot or not getattr(snapshot, "snapshot_json", None):
+        return "<i>No cached attendance data available.</i>"
+    
+    data = snapshot.snapshot_json
+    student_info = data.get("student_info", "Unknown Student")
+    records = data.get("records", [])
+    
+    cached_time = ""
+    if getattr(snapshot, "created_at", None):
+        cached_time = f" <i>(cached {snapshot.created_at.strftime('%d %b %H:%M')})</i>"
+    
+    msg = f"🧑🎓 <b>{esc(student_info)}</b>{cached_time}\n\n<b>📊 Attendance Summary:</b>\n"
+    for rec in records:
+        name = rec.get("subject_name") or rec.get("subject_code", "Unknown")
+        msg += f"🔸 <b>{esc(name)}</b>\n"
+        msg += f"   TC: {esc(rec.get('tc', '0'))} | OA: {esc(rec.get('oa', '0'))} | UA: {esc(rec.get('ua', '0'))} | LE: {esc(rec.get('le', '0'))}\n\n"
     return msg
 
 
@@ -173,14 +247,13 @@ def format_dashboard_text(user: User, unread_count: int = 0) -> str:
     unread_label = f"🔴 {esc(unread_count)} New Messages" if unread_count > 0 else "0"
     msg = (
         f"👋 <b>Welcome back to NitrClaw!</b>\n\n"
-        f"🧑‍🎓 <b>Student:</b> <code>{esc(roll)}</code>\n"
+        f"🧑🎓 <b>Student:</b> <code>{esc(roll)}</code>\n"
         f"📅 <b>Last Synced:</b> {last_synced_str}\n"
         f"📊 <b>Status:</b> {status_icon} {status_text}\n"
         f"📩 <b>Unread:</b> {unread_label}\n\n"
         f"Choose an action from the options below:"
     )
     return msg
-
 
 
 def get_dashboard_keyboard(unread_count: int = 0) -> types.InlineKeyboardMarkup:
@@ -199,8 +272,7 @@ def get_dashboard_keyboard(unread_count: int = 0) -> types.InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-
-# --- Global Command Overrides with high priority (StateFilter("*")) ---
+# --- Global Command Overrides ---
 
 @dp.message(Command("cancel"), StateFilter("*"))
 async def cmd_cancel(message: types.Message, state: FSMContext):
@@ -272,7 +344,6 @@ async def verification_shield(message: types.Message):
     )
 
 
-
 # --- FSM State Input Handlers ---
 
 @dp.message(Registration.waiting_for_roll)
@@ -316,7 +387,6 @@ async def process_password(message: types.Message, state: FSMContext):
     except Exception:
         pass
         
-    # Transition to verifying state to block multiple concurrent requests
     await state.set_state(Registration.verifying)
     
     try:
@@ -370,6 +440,12 @@ async def process_password(message: types.Message, state: FSMContext):
                 sync_state.last_success = datetime.now(timezone.utc)
                 sync_state.last_error = None
                 sync_state.failure_count = 0
+            
+            # Phase 5: Create module_sync_schedule rows for the user
+            from app.services.scheduler_service import ensure_schedule_exists
+            from app.db.database import async_session_factory
+            for module_name in ("attendance", "inbox"):
+                await ensure_schedule_exists(async_session_factory, user_id, module_name)
                 
         await status_msg.edit_text(
             "✅ <b>Registration complete!</b>\n\n"
@@ -442,7 +518,7 @@ async def process_delete_confirm(message: types.Message, state: FSMContext):
             await message.answer("⚠️ You are not registered. Please use /start to register.")
 
 
-# --- Dashboard Inline Callbacks ---
+# --- Dashboard Callbacks ---
 
 @dp.callback_query(F.data.in_({"db_attendance", "db_update", "db_deregister", "db_papers"}))
 async def handle_dashboard_callbacks(callback: types.CallbackQuery, state: FSMContext):
@@ -550,8 +626,6 @@ async def handle_confirm_deregister(callback: types.CallbackQuery, state: FSMCon
         await callback.message.answer("❌ A database error occurred during deregistration. Please try again.")
 
 
-# --- Inline Helpers ---
-
 async def start_credential_update_from_cb(message: types.Message, state: FSMContext):
     await state.clear()
     await state.set_state(Registration.waiting_for_roll)
@@ -582,111 +656,163 @@ async def start_deregistration_flow(message: types.Message, state: FSMContext):
 
 
 async def fetch_attendance_for_callback(callback: types.CallbackQuery, user: User):
-    if not await user_lock.acquire(user.id):
-        await callback.message.answer("⏳ A synchronization is already in progress for your account. Please wait a moment.")
+    """Cache-first attendance fetch."""
+    from app.nitris.rate_limiter import operation_cooldown, COOLDOWN_ATTENDANCE_REFRESH
+    allowed, wait = await operation_cooldown.check(
+        user.id, "attendance_refresh", cooldown_seconds=COOLDOWN_ATTENDANCE_REFRESH
+    )
+    if not allowed:
+        try:
+            await callback.answer(
+                f"⏳ Please wait {wait}s before refreshing again.", show_alert=True
+            )
+        except Exception:
+            pass
         return
-        
+    
+    from app.db.repositories.snapshot_repository import SnapshotRepository
+    async with get_db_session() as session:
+        snapshot_repo = SnapshotRepository(session)
+        cached_snapshot = await snapshot_repo.get_latest_snapshot(user.id, "attendance")
+    
+    if cached_snapshot and getattr(cached_snapshot, "snapshot_json", None) and "records" in cached_snapshot.snapshot_json:
+        status_msg = await callback.message.answer(
+            format_attendance_message_from_snapshot(cached_snapshot)
+            + "\n\n<i>🔄 Refreshing from NITRIS in background...</i>",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        status_msg = await callback.message.answer(
+            "⏳ <b>No cached data yet.</b>\n\nFetching attendance from NITRIS...",
+            parse_mode=ParseMode.HTML,
+        )
+    
+    from app.nitris.job_queue import nitris_job_queue, Priority
+    from app.nitris.gateway import NitrisCircuitOpenError
+    
     try:
-        try:
-            plaintext_password = decrypt_password(user.encrypted_password)
-        except Exception as e:
-            logger.error("Failed to decrypt password for telegram_id=%s: %r", user.telegram_id, e)
-            await callback.message.answer("❌ Error decrypting credentials. Please update them using /forgot.")
-            return
-            
-        status_msg = await callback.message.answer("⏳ Fetching attendance from NITRIS...")
+        future = await nitris_job_queue.enqueue(
+            job_type="attendance_refresh",
+            user_id=user.id,
+            priority=Priority.HIGH,
+            payload={
+                "callback_chat_id": status_msg.chat.id,
+                "callback_message_id": status_msg.message_id,
+            },
+        )
         
         try:
-            data = await get_attendance_data(user.roll_number, plaintext_password)
-            
-            try:
-                async with get_db_session() as session:
-                    async with session.begin():
-                        snapshot_service = SnapshotService(session)
-                        await snapshot_service.create_snapshot_if_changed(
-                            user_id=user.id,
-                            module_name="attendance",
-                            attendance_result=data
-                        )
-            except Exception as e:
-                logger.error("Failed to update snapshot/events in database for user_id=%s: %r", user.id, e)
-                
-            await status_msg.edit_text(format_attendance_message(data), parse_mode=ParseMode.HTML)
-            
-        except LoginError as e:
-            logger.error("Login failed for %s: %s", user.telegram_id, e)
-            await status_msg.edit_text(f"❌ Login failed: {html.escape(str(e))}\n\nPlease try updating your credentials.")
-        except SessionExpiredError:
-            logger.error("Session expired for %s", user.telegram_id)
-            await status_msg.edit_text("❌ Session expired. Please try again.")
-        except AttendanceParseError as e:
-            logger.error("Parse error for %s: %s", user.telegram_id, e)
-            await status_msg.edit_text(f"❌ Parse error: {html.escape(str(e))}")
-        except NitrisError as e:
-            logger.error("NITRIS error for %s: %s", user.telegram_id, e)
-            await status_msg.edit_text("❌ Could not fetch attendance. The portal might be down.")
-        except Exception as e:
-            logger.error("Unexpected error for %s: %r", user.telegram_id, e)
-            await status_msg.edit_text("❌ An unexpected error occurred. Please try again later.")
-    finally:
-        await user_lock.release(user.id)
+            result = await asyncio.wait_for(future, timeout=120.0)
+            if result.get("success") and result.get("data"):
+                data = result["data"]
+                await status_msg.edit_text(
+                    format_attendance_message(data),
+                    parse_mode=ParseMode.HTML,
+                )
+        except asyncio.TimeoutError:
+            await status_msg.edit_text(
+                "⏳ <b>Refresh is taking longer than expected.</b>\n\n"
+                "NITRIS may be slow right now. Your attendance will update automatically "
+                "when the refresh completes.",
+                parse_mode=ParseMode.HTML,
+            )
+    
+    except NitrisCircuitOpenError:
+        await status_msg.edit_text(
+            "⚠️ <b>NITRIS is temporarily unavailable.</b>\n\n"
+            "The system is protecting the portal from overload. "
+            "Please try again in ~60 seconds.\n\n"
+            f"<i>Showing cached data from your last sync:</i>\n\n"
+            + (format_attendance_message_from_snapshot(cached_snapshot)
+               if cached_snapshot and getattr(cached_snapshot, "snapshot_json", None) and "records" in cached_snapshot.snapshot_json
+               else "<i>No cached data available.</i>"),
+            parse_mode=ParseMode.HTML,
+        )
 
-
-# --- Command Handlers (Restricted to empty FSM state only for watertight shielding) ---
 
 @dp.message(Command("attendance"), StateFilter(None))
 async def cmd_attendance(message: types.Message):
+    """Cache-first /attendance command."""
     telegram_id = message.from_user.id
     
     async with get_db_session() as session:
         stmt = select(User).options(selectinload(User.sync_state)).where(User.telegram_id == telegram_id)
         res = await session.execute(stmt)
         user = res.scalar_one_or_none()
-        
+    
     if not user:
         await message.answer("⚠️ You haven't registered yet! Please use /start to register.")
         return
-        
-    if not await user_lock.acquire(user.id):
-        await message.answer("⏳ A synchronization is already in progress for your account. Please wait a moment.")
+    
+    from app.nitris.rate_limiter import operation_cooldown, COOLDOWN_ATTENDANCE_REFRESH
+    allowed, wait = await operation_cooldown.check(
+        user.id, "attendance_refresh", cooldown_seconds=COOLDOWN_ATTENDANCE_REFRESH
+    )
+    if not allowed:
+        await message.answer(
+            f"⏳ You just refreshed attendance. Please wait {wait}s before trying again.",
+            parse_mode=ParseMode.HTML,
+        )
         return
-        
+    
+    from app.db.repositories.snapshot_repository import SnapshotRepository
+    async with get_db_session() as session:
+        snapshot_repo = SnapshotRepository(session)
+        cached_snapshot = await snapshot_repo.get_latest_snapshot(user.id, "attendance")
+    
+    if cached_snapshot and getattr(cached_snapshot, "snapshot_json", None) and "records" in cached_snapshot.snapshot_json:
+        status_msg = await message.answer(
+            format_attendance_message_from_snapshot(cached_snapshot)
+            + "\n\n<i>🔄 Refreshing from NITRIS in background...</i>",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        status_msg = await message.answer(
+            "⏳ <b>No cached data yet.</b>\n\nFetching attendance from NITRIS...",
+            parse_mode=ParseMode.HTML,
+        )
+    
+    from app.nitris.job_queue import nitris_job_queue, Priority
+    from app.nitris.gateway import NitrisCircuitOpenError
+    
     try:
-        status_msg = await message.answer("⏳ Fetching attendance from NITRIS...")
+        future = await nitris_job_queue.enqueue(
+            job_type="attendance_refresh",
+            user_id=user.id,
+            priority=Priority.HIGH,
+            payload={
+                "callback_chat_id": status_msg.chat.id,
+                "callback_message_id": status_msg.message_id,
+            },
+        )
+        
         try:
-            plaintext_password = decrypt_password(user.encrypted_password)
-            data = await get_attendance_data(user.roll_number, plaintext_password)
-            
-            try:
-                async with get_db_session() as session:
-                    async with session.begin():
-                        snapshot_service = SnapshotService(session)
-                        await snapshot_service.create_snapshot_if_changed(
-                            user_id=user.id,
-                            module_name="attendance",
-                            attendance_result=data
-                        )
-            except Exception as e:
-                logger.error("Failed to update snapshot/events in database for user_id=%s: %r", user.id, e)
-                
-            await status_msg.edit_text(format_attendance_message(data), parse_mode=ParseMode.HTML)
-        except LoginError as e:
-            logger.error("Login failed for %s: %s", telegram_id, e)
-            await status_msg.edit_text(f"❌ Login failed: {html.escape(str(e))}\n\nPlease try updating your credentials with /forgot.")
-        except SessionExpiredError:
-            logger.error("Session expired for %s", telegram_id)
-            await status_msg.edit_text("❌ Session expired. Please try again.")
-        except AttendanceParseError as e:
-            logger.error("Parse error for %s: %s", telegram_id, e)
-            await status_msg.edit_text(f"❌ Parse error: {html.escape(str(e))}")
-        except NitrisError as e:
-            logger.error("NITRIS error for %s: %s", telegram_id, e)
-            await status_msg.edit_text("❌ Could not fetch attendance. The portal might be down.")
-        except Exception as e:
-            logger.error("Unexpected error for %s: %r", telegram_id, e)
-            await status_msg.edit_text("❌ An unexpected error occurred. Please try again later.")
-    finally:
-        await user_lock.release(user.id)
+            result = await asyncio.wait_for(future, timeout=120.0)
+            if result.get("success") and result.get("data"):
+                data = result["data"]
+                await status_msg.edit_text(
+                    format_attendance_message(data),
+                    parse_mode=ParseMode.HTML,
+                )
+        except asyncio.TimeoutError:
+            await status_msg.edit_text(
+                "⏳ <b>Refresh is taking longer than expected.</b>\n\n"
+                "NITRIS may be slow right now. Your attendance will update automatically "
+                "when the refresh completes.",
+                parse_mode=ParseMode.HTML,
+            )
+    
+    except NitrisCircuitOpenError:
+        await status_msg.edit_text(
+            "⚠️ <b>NITRIS is temporarily unavailable.</b>\n\n"
+            "The system is protecting the portal from overload. "
+            "Please try again in ~60 seconds.\n\n"
+            f"<i>Showing cached data from your last sync:</i>\n\n"
+            + (format_attendance_message_from_snapshot(cached_snapshot)
+               if cached_snapshot and getattr(cached_snapshot, "snapshot_json", None) and "records" in cached_snapshot.snapshot_json
+               else "<i>No cached data available.</i>"),
+            parse_mode=ParseMode.HTML,
+        )
 
 
 @dp.message(Command("help"), StateFilter(None))
@@ -711,89 +837,64 @@ async def cmd_help(message: types.Message):
 
 async def render_single_message(event, user: User, msg: InboxMessage, session) -> None:
     """Helper to load notice body (with lazy fetching if needed) and render single notice detail card."""
-    # 1. Mark as read in DB if it was unread
     if not msg.is_read:
         from app.db.repositories.inbox_repository import InboxRepository
         inbox_repo = InboxRepository(session)
         await inbox_repo.mark_as_read(msg.id)
         await session.commit()
         
-    # 2. Check if body is empty (needs lazy loading)
     if msg.body is None:
-        # Show a temporary loading alert or message in the chat
         if isinstance(event, types.CallbackQuery):
             status_msg = await event.message.answer("⏳ Fetching notice body from NITRIS portal...")
         else:
             status_msg = await event.answer("⏳ Fetching notice body from NITRIS portal...")
         
+        from app.nitris.job_queue import nitris_job_queue, Priority
+        from app.nitris.gateway import NitrisCircuitOpenError
+        
         try:
-            password = decrypt_password(user.encrypted_password)
+            future = await nitris_job_queue.enqueue(
+                job_type="inbox_detail_fetch",
+                user_id=user.id,
+                priority=Priority.MEDIUM,
+                payload={"message_id": msg.id},
+            )
             
-            from app.nitris.client import NitrisClient
-            from app.nitris.parser import parse_message_detail_html
-            
-            client = NitrisClient()
-            await client.login(user.roll_number, password)
-            
-            if msg.token.startswith("postback:"):
-                # Submit postback to resolve redirects to direct Message.aspx?i=TOKEN URL
-                event_target = msg.token.split("postback:")[1]
-                real_token, detail_html = await client.submit_message_postback(event_target)
-                detail_data = parse_message_detail_html(detail_html)
-                
-                from app.nitris.parser import extract_message_id
-                portal_id = extract_message_id(real_token)
-                
-                # Update token, portal_message_id (healing), and body/attachments in DB
-                async with get_db_session() as update_session:
-                    async with update_session.begin():
-                        from sqlalchemy import update as sqlalchemy_update
-                        update_values = {
-                            "token": real_token, 
-                            "body": detail_data["body"], 
-                            "attachment_url": detail_data["attachment_url"]
-                        }
-                        if portal_id:
-                            update_values["portal_message_id"] = portal_id
-                            
-                        stmt = (
-                            sqlalchemy_update(InboxMessage)
-                            .where(InboxMessage.id == msg.id)
-                            .values(**update_values)
-                        )
-                        await update_session.execute(stmt)
-            else:
-                detail_html = await client.fetch_message_detail(msg.token)
-                detail_data = parse_message_detail_html(detail_html)
-                
-                # Update the message in DB
-                async with get_db_session() as update_session:
-                    async with update_session.begin():
-                        from app.db.repositories.inbox_repository import InboxRepository
-                        up_inbox_repo = InboxRepository(update_session)
-                        await up_inbox_repo.update_message_body(
-                            message_id=msg.id,
-                            body=detail_data["body"],
-                            attachment_url=detail_data["attachment_url"]
-                        )
-            
-            # Reload message inside the current active session
-            stmt = select(InboxMessage).where(InboxMessage.id == msg.id)
-            res = await session.execute(stmt)
-            msg = res.scalar_one_or_none()
-            
-            await client.close()
             try:
-                await status_msg.delete()
-            except Exception:
-                pass
-            
-        except Exception as e:
-            logger.error("Failed lazy-loading message body for message ID %s: %r", msg.id, e)
-            await status_msg.edit_text(f"❌ Failed to fetch message detail from NITRIS: {html.escape(str(e))}")
+                result = await asyncio.wait_for(future, timeout=120.0)
+                if not result.get("success"):
+                    error = result.get("error", "Unknown error")
+                    await status_msg.edit_text(
+                        f"❌ Failed to fetch message detail from NITRIS: {html.escape(str(error)[:200])}"
+                    )
+                    return
+                
+                stmt = select(InboxMessage).where(InboxMessage.id == msg.id)
+                res = await session.execute(stmt)
+                msg = res.scalar_one_or_none()
+                
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+                
+            except asyncio.TimeoutError:
+                await status_msg.edit_text(
+                    "⏳ <b>Fetch is taking longer than expected.</b>\n\n"
+                    "NITRIS may be slow. Please try again in a moment.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+        
+        except NitrisCircuitOpenError:
+            await status_msg.edit_text(
+                "⚠️ <b>NITRIS is temporarily unavailable.</b>\n\n"
+                "The system is protecting the portal from overload. "
+                "Please try again in ~60 seconds.",
+                parse_mode=ParseMode.HTML,
+            )
             return
 
-    # Render detail card
     sent_str = msg.sent_on.strftime("%d %b %Y")
     if msg.body is not None:
         body_esc = esc(msg.body)
@@ -814,12 +915,9 @@ async def render_single_message(event, user: User, msg: InboxMessage, session) -
     )
     
     builder = InlineKeyboardBuilder()
-    
-    # Attachment download button
     if msg.attachment_url:
         builder.row(types.InlineKeyboardButton(text="📎 Download PDF Attachment", callback_data=f"dl_{msg.id}"))
         
-    # Navigation utilities
     builder.row(
         types.InlineKeyboardButton(text="📬 Inbox Menu", callback_data="db_inbox"),
         types.InlineKeyboardButton(text="🏠 Dashboard", callback_data="inbox_back_dashboard")
@@ -908,13 +1006,9 @@ async def handle_inbox_list(callback: types.CallbackQuery, state: FSMContext) ->
             types.InlineKeyboardButton(text=str(idx), callback_data=f"msg_{msg.id}")
         )
         
-    # Selection row
     builder.row(*select_buttons)
-    
-    # Read Latest shortcut row
     builder.row(types.InlineKeyboardButton(text="📬 Read Latest Message", callback_data="inbox_latest"))
     
-    # Navigation row
     nav_buttons = []
     if page > 1:
         nav_buttons.append(types.InlineKeyboardButton(text="◀️ Prev", callback_data=f"inbox_page_{page - 1}"))
@@ -924,7 +1018,6 @@ async def handle_inbox_list(callback: types.CallbackQuery, state: FSMContext) ->
     if nav_buttons:
         builder.row(*nav_buttons)
         
-    # Utility rows
     builder.row(
         types.InlineKeyboardButton(text="🔄 Refresh Now", callback_data="inbox_refresh"),
         types.InlineKeyboardButton(text="🔍 Search Inbox", callback_data="inbox_search_prompt")
@@ -942,7 +1035,19 @@ async def handle_inbox_list(callback: types.CallbackQuery, state: FSMContext) ->
 
 @dp.callback_query(F.data == "inbox_refresh")
 async def handle_inbox_refresh(callback: types.CallbackQuery, state: FSMContext) -> None:
+    """Route inbox refresh through the gateway + job queue."""
     telegram_id = callback.from_user.id
+    
+    from app.nitris.rate_limiter import operation_cooldown, COOLDOWN_INBOX_REFRESH
+    allowed, wait = await operation_cooldown.check(
+        callback.from_user.id, "inbox_refresh", cooldown_seconds=COOLDOWN_INBOX_REFRESH
+    )
+    if not allowed:
+        try:
+            await callback.answer(f"⏳ Please wait {wait}s before refreshing again.", show_alert=True)
+        except Exception:
+            pass
+        return
     
     try:
         await callback.answer("⏳ Connecting to NITRIS and refreshing inbox...", show_alert=False)
@@ -960,23 +1065,54 @@ async def handle_inbox_refresh(callback: types.CallbackQuery, state: FSMContext)
         if not user:
             await status_msg.edit_text("❌ You are not registered. Use /start to register.")
             return
-            
-        password = decrypt_password(user.encrypted_password)
         
-        # Live sync
-        from app.workers.sync_worker import sync_messages_for_user
-        await sync_messages_for_user(user.id, user.roll_number, password, callback.bot)
+        from app.nitris.job_queue import nitris_job_queue, Priority
+        from app.nitris.gateway import NitrisCircuitOpenError
         
-        await status_msg.edit_text("✅ Inbox sync completed successfully!")
-        await asyncio.sleep(1)
         try:
-            await status_msg.delete()
-        except Exception:
-            pass
+            future = await nitris_job_queue.enqueue(
+                job_type="inbox_refresh",
+                user_id=user.id,
+                priority=Priority.HIGH,
+                payload={
+                    "callback_chat_id": status_msg.chat.id,
+                    "callback_message_id": status_msg.message_id,
+                },
+            )
             
-        # Trigger page 1 list view
-        callback.data = "inbox_page_1"
-        await handle_inbox_list(callback, state)
+            try:
+                result = await asyncio.wait_for(future, timeout=120.0)
+                if result.get("success"):
+                    await status_msg.edit_text("✅ Inbox sync completed successfully!")
+                    await asyncio.sleep(1)
+                    try:
+                        await status_msg.delete()
+                    except Exception:
+                        pass
+                    
+                    callback.data = "inbox_page_1"
+                    await handle_inbox_list(callback, state)
+                else:
+                    error = result.get("error", "Unknown error")
+                    await status_msg.edit_text(
+                        f"❌ <b>Inbox sync failed.</b>\n\n"
+                        f"<i>Error: {html.escape(str(error)[:200])}</i>",
+                        parse_mode=ParseMode.HTML,
+                    )
+            except asyncio.TimeoutError:
+                await status_msg.edit_text(
+                    "⏳ <b>Inbox sync is taking longer than expected.</b>\n\n"
+                    "NITRIS may be slow. Your inbox will update automatically when complete.",
+                    parse_mode=ParseMode.HTML,
+                )
+        
+        except NitrisCircuitOpenError:
+            await status_msg.edit_text(
+                "⚠️ <b>NITRIS is temporarily unavailable.</b>\n\n"
+                "The system is protecting the portal from overload. "
+                "Please try again in ~60 seconds.",
+                parse_mode=ParseMode.HTML,
+            )
         
     except Exception as e:
         logger.error("Failed live inbox refresh for telegram_id %s: %r", telegram_id, e)
@@ -1046,6 +1182,7 @@ async def handle_message_detail(callback: types.CallbackQuery, state: FSMContext
 
 @dp.callback_query(F.data.startswith("dl_"))
 async def handle_download_attachment(callback: types.CallbackQuery, state: FSMContext) -> None:
+    """Route attachment download through the gateway + job queue."""
     telegram_id = callback.from_user.id
     msg_id = int(callback.data.split("_")[1])
     
@@ -1070,71 +1207,90 @@ async def handle_download_attachment(callback: types.CallbackQuery, state: FSMCo
         if not msg or not msg.attachment_url:
             await callback.message.answer("❌ Attachment not found.")
             return
+        
+        if msg.user_id != user.id:
+            await callback.message.answer("❌ Attachment not found.")
+            logger.warning(
+                "Cross-user access attempt: telegram_id=%d tried to access message_id=%d owned by user_id=%d",
+                telegram_id, msg_id, msg.user_id,
+            )
+            return
             
-        # 1. Check if telegram_file_id is cached
         if msg.telegram_file_id:
             try:
                 await callback.bot.send_document(chat_id=telegram_id, document=msg.telegram_file_id)
                 return
             except Exception as e:
                 logger.warning("Cached telegram_file_id failed for message ID %s: %r. Re-downloading...", msg.id, e)
-                
-        # 2. Live download from portal
-        status_msg = await callback.message.answer("⏳ Fetching attachment from NITRIS portal...")
+        
+        attachment_url = msg.attachment_url
+    
+    from app.nitris.rate_limiter import operation_cooldown, COOLDOWN_ATTACHMENT_DOWNLOAD
+    allowed, wait = await operation_cooldown.check(
+        user.id, "attachment_download", key=str(msg_id),
+        cooldown_seconds=COOLDOWN_ATTACHMENT_DOWNLOAD,
+    )
+    if not allowed:
+        try:
+            await callback.answer(f"⏳ Please wait {wait}s before retrying.", show_alert=True)
+        except Exception:
+            pass
+        return
+    
+    status_msg = await callback.message.answer("⏳ Fetching attachment from NITRIS portal...")
+    
+    from app.nitris.job_queue import nitris_job_queue, Priority
+    from app.nitris.gateway import NitrisCircuitOpenError
+    
+    try:
+        future = await nitris_job_queue.enqueue(
+            job_type="attachment_download",
+            user_id=user.id,
+            priority=Priority.MEDIUM,
+            payload={
+                "message_id": msg_id,
+                "callback_chat_id": telegram_id,
+            },
+        )
         
         try:
-            password = decrypt_password(user.encrypted_password)
-            
-            from app.nitris.client import NitrisClient
-            client = NitrisClient()
-            await client.login(user.roll_number, password)
-            
-            file_bytes = await client.download_attachment(msg.attachment_url)
-            await client.close()
-            
-            # Check 50MB limit
-            MAX_FILE_SIZE = 50 * 1024 * 1024
-            if len(file_bytes) > MAX_FILE_SIZE:
-                from app.config import config
-                direct_url = f"{config.NITRIS_BASE_URL}{msg.attachment_url}"
-                await status_msg.edit_text(
-                    f"⚠️ <b>Attachment is too large (&gt;50MB) for Telegram upload.</b>\n\n"
-                    f"You can download it directly from the secure portal link below:\n"
-                    f"🔗 <a href='{direct_url}'>Direct Download Link</a>",
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True
-                )
-                return
-                
-            # Sanitize filename
-            import re
-            sanitized_subject = re.sub(r'[^a-zA-Z0-9_\- ]', '', msg.subject)
-            sanitized_subject = re.sub(r'\s+', ' ', sanitized_subject).strip()
-            if not sanitized_subject:
-                sanitized_subject = f"notice_attachment_{msg.id}"
-            filename = f"{sanitized_subject[:50]}.pdf"
-            
-            from aiogram.types import BufferedInputFile
-            input_file = BufferedInputFile(file_bytes, filename=filename)
-            
-            sent_message = await callback.bot.send_document(chat_id=telegram_id, document=input_file)
-            
-            if sent_message.document:
-                file_id = sent_message.document.file_id
-                async with get_db_session() as update_session:
-                    async with update_session.begin():
-                        from app.db.repositories.inbox_repository import InboxRepository
-                        up_inbox_repo = InboxRepository(update_session)
-                        await up_inbox_repo.update_telegram_file_id(msg.id, file_id)
-                        
-            try:
-                await status_msg.delete()
-            except Exception:
-                pass
-            
-        except Exception as e:
-            logger.error("Failed to download and send attachment for message ID %s: %r", msg.id, e)
-            await status_msg.edit_text(f"❌ Failed to download attachment: {html.escape(str(e))}")
+            result = await asyncio.wait_for(future, timeout=120.0)
+            if result.get("success"):
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+            else:
+                error = result.get("error", "Unknown error")
+                if "too large" in error.lower():
+                    from app.config import config
+                    direct_url = f"{config.NITRIS_BASE_URL}{attachment_url}"
+                    await status_msg.edit_text(
+                        f"⚠️ <b>Attachment is too large (&gt;50MB) for Telegram upload.</b>\n\n"
+                        f"You can download it directly from the secure portal link below:\n"
+                        f"🔗 <a href='{direct_url}'>Direct Download Link</a>",
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                    )
+                else:
+                    await status_msg.edit_text(
+                        f"❌ Failed to download attachment: {html.escape(str(error)[:200])}",
+                        parse_mode=ParseMode.HTML,
+                    )
+        except asyncio.TimeoutError:
+            await status_msg.edit_text(
+                "⏳ <b>Download is taking longer than expected.</b>\n\n"
+                "NITRIS may be slow. Please try again in a moment.",
+                parse_mode=ParseMode.HTML,
+            )
+    
+    except NitrisCircuitOpenError:
+        await status_msg.edit_text(
+            "⚠️ <b>NITRIS is temporarily unavailable.</b>\n\n"
+            "The system is protecting the portal from overload. "
+            "Please try again in ~60 seconds.",
+            parse_mode=ParseMode.HTML,
+        )
 
 
 @dp.callback_query(F.data == "inbox_search_prompt")
@@ -1157,8 +1313,6 @@ async def handle_search_prompt(callback: types.CallbackQuery, state: FSMContext)
 async def process_search_query(message: types.Message, state: FSMContext) -> None:
     query = message.text.strip()
     telegram_id = message.from_user.id
-    
-    # Instantly clear state to avoid FSM trapping!
     await state.clear()
     
     async with get_db_session() as session:
@@ -1180,7 +1334,6 @@ async def process_search_query(message: types.Message, state: FSMContext) -> Non
 @dp.message(Command("inbox"), StateFilter(None))
 async def cmd_inbox(message: types.Message, state: FSMContext) -> None:
     telegram_id = message.from_user.id
-    
     args = message.text.strip().split(maxsplit=1)
     
     if len(args) < 2:
@@ -1381,7 +1534,6 @@ from app.services.examination_service import ExaminationService
 from app.db.repositories.snapshot_repository import SnapshotRepository
 from app.db.models import QuestionPaperCache
 
-# Year Encoding Map (keeps callback data ultra compact)
 YEAR_MAP = {
     "2526S": "2025-26/Spring",
     "2425S": "2024-25/Spring",
@@ -1410,12 +1562,11 @@ async def cmd_papers(message: types.Message, state: FSMContext, explicit_telegra
             await message.answer("⚠️ You haven't registered yet! Please use /start to register.")
             return
             
-        # Get latest attendance snapshot
         snapshot_repo = SnapshotRepository(session)
         snapshot = await snapshot_repo.get_latest_snapshot(user.id, "attendance")
         
     courses = []
-    if snapshot and "records" in snapshot.snapshot_json:
+    if snapshot and getattr(snapshot, "snapshot_json", None) and "records" in snapshot.snapshot_json:
         courses = snapshot.snapshot_json["records"]
         
     text = (
@@ -1436,7 +1587,6 @@ async def cmd_papers(message: types.Message, state: FSMContext, explicit_telegra
     else:
         text += "<i>No registered courses found in your attendance snapshot. Use /attendance to update them!</i>\n\n"
         
-    # Search and utility options
     builder.row(types.InlineKeyboardButton(text="🔍 Search Other Subjects", callback_data="qp_search_prompt"))
     if courses:
         builder.row(types.InlineKeyboardButton(text="📥 Download All Current Papers", callback_data="qp_dlall_prompt"))
@@ -1472,7 +1622,6 @@ async def handle_subject_selected(callback: types.CallbackQuery, state: FSMConte
 
 @dp.callback_query(F.data == "qp_back_subjects")
 async def handle_qp_back_subjects(callback: types.CallbackQuery, state: FSMContext) -> None:
-    """Callback to return to the main question papers list."""
     try:
         await callback.answer()
     except Exception:
@@ -1488,17 +1637,10 @@ async def handle_qp_back_subjects(callback: types.CallbackQuery, state: FSMConte
 
 @dp.callback_query(F.data.startswith("qp_yr_"))
 async def handle_year_selected(callback: types.CallbackQuery, state: FSMContext) -> None:
-    """Triggered when user picks an academic year for a subject.
-
-    Ensures the metadata cache (which papers EXIST on NITRIS for this subject/year)
-    is populated. Does NOT download actual paper bytes. Presents the user with
-    "Download Mid Sem" / "Download End Sem" buttons OR a clean "No paper available"
-    message when NITRIS confirms none exist.
-    """
+    """Triggered when user picks an academic year for a subject. Single-flight dedup enabled."""
     telegram_id = callback.from_user.id
-    data = callback.data[6:]  # strip "qp_yr_"
+    data = callback.data[6:]
     subject_code, year_code = data.rsplit("_", 1)
-    from app.bot.telegram import YEAR_MAP
     full_year_str = YEAR_MAP.get(year_code, "2025-26/Spring")
 
     try:
@@ -1508,7 +1650,6 @@ async def handle_year_selected(callback: types.CallbackQuery, state: FSMContext)
 
     status_msg = await callback.message.answer("⏳ Querying question paper database cache...")
 
-    # ── Phase 1: Short DB session — read user creds + check cache ──────────
     async with get_db_session() as session:
         from app.db.repositories.user_repository import UserRepository
         user_repo = UserRepository(session)
@@ -1521,32 +1662,69 @@ async def handle_year_selected(callback: types.CallbackQuery, state: FSMContext)
         exam_service = ExaminationService(session)
         mid_cache = await exam_service.get_cached_paper(subject_code, full_year_str, "mid_sem")
         end_cache = await exam_service.get_cached_paper(subject_code, full_year_str, "end_sem")
-        roll_number = user.roll_number
-        password = decrypt_password(user.encrypted_password)
-    # ── Session is now CLOSED — DB connection released to pool ────────────
 
-    # ── Phase 2: Cache miss → NITRIS HTTP work (NO DB session open) ────────
     if not mid_cache and not end_cache:
+        from app.nitris.job_queue import nitris_job_queue, Priority
+        from app.nitris.gateway import NitrisCircuitOpenError
+        from app.services.examination_service import _clean_code
+        
+        clean_subj = _clean_code(subject_code)
+        dedup_key = f"qp_metadata:{clean_subj}:{full_year_str}"
+        
+        await status_msg.edit_text(
+            "⏳ <b>Fetching paper metadata from NITRIS...</b>\n\n"
+            "<i>If other students are requesting the same paper, this request "
+            "is being shared with them to avoid hammering the portal.</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        
         try:
-            await status_msg.edit_text("⏳ Syncing exam paper catalogs from NITRIS portal...")
-            parsed_records = await ExaminationService.fetch_subject_metadata_from_portal(
-                username=roll_number,
-                password=password,
-                academic_year=full_year_str,
-                subject_code=subject_code,
+            future = await nitris_job_queue.enqueue(
+                job_type="qp_metadata_fetch",
+                user_id=user.id,
+                priority=Priority.MEDIUM,
+                dedup_key=dedup_key,
+                payload={
+                    "academic_year": full_year_str,
+                    "subject_code": subject_code,
+                    "roll_number": user.roll_number,
+                },
+                timeout=90.0,
             )
-        except Exception as e:
-            logger.error("Failed fetching paper metadata from portal: %r", e)
+            
+            try:
+                result = await asyncio.wait_for(future, timeout=90.0)
+            except asyncio.TimeoutError:
+                await status_msg.edit_text(
+                    "⏳ <b>Metadata fetch is taking longer than expected.</b>\n\n"
+                    "NITRIS may be slow. Please try again in a moment — your request "
+                    "is queued and will complete shortly.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            
+            if not result.get("success"):
+                error = result.get("error", "Unknown error")
+                await status_msg.edit_text(
+                    f"❌ <b>Portal query failed</b>\n\n"
+                    f"Couldn't reach NITRIS to check for papers.\n"
+                    f"Error: <code>{html.escape(str(error)[:200])}</code>\n\n"
+                    f"Please try again in a moment.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            
+            parsed_records = result.get("parsed_records", [])
+            
+        except NitrisCircuitOpenError:
             await status_msg.edit_text(
-                f"❌ <b>Portal query failed</b>\n\n"
-                f"Couldn't reach NITRIS to check for papers.\n"
-                f"Error: <code>{html.escape(str(e)[:200])}</code>\n\n"
-                f"Please try again in a moment.",
+                "⚠️ <b>NITRIS is temporarily unavailable.</b>\n\n"
+                "The system is protecting the portal from overload. "
+                "Please try again in ~60 seconds.",
                 parse_mode=ParseMode.HTML,
             )
             return
 
-        # ── Phase 3: Short DB session — persist fetched metadata ───────────
         try:
             async with get_db_session() as session:
                 exam_service = ExaminationService(session)
@@ -1566,9 +1744,7 @@ async def handle_year_selected(callback: types.CallbackQuery, state: FSMContext)
                 parse_mode=ParseMode.HTML,
             )
             return
-        # ── Session is now CLOSED again ────────────────────────────────────
 
-    # 3. Present exam choice menu OR clean "no paper available" message
     has_available = (
         (mid_cache and mid_cache.status != "paper_not_available") or
         (end_cache and end_cache.status != "paper_not_available")
@@ -1615,22 +1791,8 @@ async def handle_year_selected(callback: types.CallbackQuery, state: FSMContext)
     await callback.message.answer(text, reply_markup=builder.as_markup(), parse_mode=ParseMode.HTML)
 
 
-# ── qp_dl_* — download/deliver a specific paper ─────────────────────────────
-
 @dp.callback_query(F.data.startswith("qp_dl_"))
 async def handle_paper_download(callback: types.CallbackQuery, state: FSMContext) -> None:
-    """Triggered when user taps "Download Mid Sem" or "Download End Sem".
-
-    Delegates to QPaperService.deliver() which handles:
-      - cache hit → instant forward of cached telegram_file_id (zero NITRIS traffic)
-      - cache miss + claim won → NITRIS download → Telegram storage upload → cache
-      - cache miss + claim lost (concurrent) → wait for the winner, then deliver
-      - paper_not_available → clean "no paper available" result
-      - permanent_failure → error result (needs human attention)
-      - retryable_failure → tries to re-claim
-      - FloodWait → bounded retry with retry_after sleep
-      - process crash recovery → stale-lock reaper
-    """
     if qpaper_service is None:
         try:
             await callback.answer("❌ Service not initialized. Restart bot.", show_alert=True)
@@ -1641,25 +1803,18 @@ async def handle_paper_download(callback: types.CallbackQuery, state: FSMContext
     telegram_id = callback.from_user.id
     cache_id = int(callback.data.split("_")[-1])
 
-    # 1. Loading toast — fast feedback that the tap registered
     try:
         await callback.answer("⏳ Fetching paper...")
     except Exception:
         pass
 
-    # 2. Status message — updated as the request progresses
     status_msg = await callback.message.answer("⏳ Resolving paper...")
-
-    # 3. Delegate to QPaperService — it manages DB sessions, locking, NITRIS, Telegram
     result: QPResult = await qpaper_service.deliver(cache_id, telegram_id)
-
-    # 4. Translate QPResult → user-facing message
     await _present_qp_result(status_msg, result)
 
 
 @dp.callback_query(F.data == "qp_dlall_prompt")
 async def handle_qp_download_all_prompt(callback: types.CallbackQuery, state: FSMContext) -> None:
-    """Prompt the student to select a historical academic year for batch downloading all papers."""
     try:
         await callback.answer()
     except Exception:
@@ -1675,22 +1830,11 @@ async def handle_qp_download_all_prompt(callback: types.CallbackQuery, state: FS
         builder.row(types.InlineKeyboardButton(text=label, callback_data=f"qp_dlall_yr_{code}"))
 
     builder.row(types.InlineKeyboardButton(text="◀️ Back to Subjects", callback_data="qp_back_subjects"))
-
     await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode=ParseMode.HTML)
 
 
-# ── qp_dlall_yr_* — batch download all papers for a year ────────────────────
-
 @dp.callback_query(F.data.startswith("qp_dlall_yr_"))
 async def handle_qp_download_all_year(callback: types.CallbackQuery, state: FSMContext) -> None:
-    """Triggered when user picks a year for batch download of all current subjects.
-
-    Uses QPaperService for each paper:
-      - Reads the user's latest attendance snapshot to get their current subjects
-      - Ensures metadata cache for each (subject, year)
-      - For each paper, calls qpaper_service.deliver(cache_id, telegram_id)
-      - Sends a final summary message with success/skip/fail counts
-    """
     from app.db.repositories.snapshot_repository import SnapshotRepository
 
     if qpaper_service is None:
@@ -1715,7 +1859,6 @@ async def handle_qp_download_all_year(callback: types.CallbackQuery, state: FSMC
 
     status_msg = await callback.message.answer("⏳ Resolving current semester courses...")
 
-    # 1. Load user + their current subjects (short DB session)
     async with get_db_session() as session:
         user_repo = UserRepository(session)
         user = await user_repo.get_by_telegram_id(telegram_id)
@@ -1724,7 +1867,7 @@ async def handle_qp_download_all_year(callback: types.CallbackQuery, state: FSMC
             return
         snapshot_repo = SnapshotRepository(session)
         snapshot = await snapshot_repo.get_latest_snapshot(user.id, "attendance")
-        if not snapshot or "records" not in snapshot.snapshot_json:
+        if not snapshot or not getattr(snapshot, "snapshot_json", None) or "records" not in snapshot.snapshot_json:
             await status_msg.edit_text(
                 "❌ No registered subjects found in your latest attendance snapshot. "
                 "Run /attendance first."
@@ -1740,7 +1883,6 @@ async def handle_qp_download_all_year(callback: types.CallbackQuery, state: FSMC
         f"⏳ Checking paper catalog for {total_courses} subjects..."
     )
 
-    # 2. Check which subjects already have metadata cached in DB
     cache_ids_to_deliver: list[int] = []
     uncached_courses: list[dict] = []
 
@@ -1759,47 +1901,69 @@ async def handle_qp_download_all_year(callback: types.CallbackQuery, state: FSMC
             if not mid_cache and not end_cache:
                 uncached_courses.append(course)
 
-    # If any courses need NITRIS catalog query, use a SINGLE authenticated client
     if uncached_courses:
         await status_msg.edit_text(
             f"⏳ Syncing catalogs for {len(uncached_courses)} uncached subjects from NITRIS..."
         )
         all_parsed: list[tuple[str, list]] = []
-        from app.nitris.client import NitrisClient
-        client = NitrisClient()
-        try:
-            await client.login(roll_number, password)
-            for course in uncached_courses:
-                sub_code = course.get("subject_code") or ""
-                if not sub_code:
-                    continue
+        
+        from app.nitris.job_queue import nitris_job_queue, Priority
+        from app.nitris.gateway import NitrisCircuitOpenError
+        from app.services.examination_service import _clean_code
+        
+        for course in uncached_courses:
+            sub_code = course.get("subject_code") or ""
+            if not sub_code:
+                continue
+            try:
+                clean_subj = _clean_code(sub_code)
+                dedup_key = f"qp_metadata:{clean_subj}:{selected_year}"
+                
+                future = await nitris_job_queue.enqueue(
+                    job_type="qp_metadata_fetch",
+                    user_id=user.id,
+                    priority=Priority.MEDIUM,
+                    dedup_key=dedup_key,
+                    payload={
+                        "academic_year": selected_year,
+                        "subject_code": sub_code,
+                        "roll_number": roll_number,
+                    },
+                    timeout=90.0,
+                )
+                
                 try:
-                    records = await ExaminationService.fetch_subject_metadata_from_portal(
-                        username=roll_number,
-                        password=password,
+                    result = await asyncio.wait_for(future, timeout=90.0)
+                    if result.get("success"):
+                        records = result.get("parsed_records", [])
+                        all_parsed.append((sub_code, records))
+                    else:
+                        logger.warning(
+                            "Batch metadata fetch failed for %s %s: %s",
+                            sub_code, selected_year, result.get("error", "unknown"),
+                        )
+                except asyncio.TimeoutError:
+                    logger.warning("Metadata fetch timed out for %s %s", sub_code, selected_year)
+            
+            except NitrisCircuitOpenError:
+                logger.warning("Circuit open during batch metadata fetch — stopping")
+                break
+            except Exception as e:
+                logger.warning("Batch metadata fetch failed for %s %s: %r", sub_code, selected_year, e)
+
+        if all_parsed:
+            async with get_db_session() as session:
+                exam_service = ExaminationService(session)
+                for sub_code, records in all_parsed:
+                    persisted = await exam_service.persist_subject_metadata(
+                        parsed_records=records,
                         academic_year=selected_year,
                         subject_code=sub_code,
-                        client=client,
                     )
-                    all_parsed.append((sub_code, records))
-                except Exception as e:
-                    logger.warning("Batch metadata fetch failed for %s %s: %r", sub_code, selected_year, e)
-        finally:
-            await client.close()
-
-        # Short DB session: persist all fetched records
-        async with get_db_session() as session:
-            exam_service = ExaminationService(session)
-            for sub_code, records in all_parsed:
-                persisted = await exam_service.persist_subject_metadata(
-                    parsed_records=records,
-                    academic_year=selected_year,
-                    subject_code=sub_code,
-                )
-                for rec in persisted:
-                    if rec.status != "paper_not_available" and rec.id not in cache_ids_to_deliver:
-                        cache_ids_to_deliver.append(rec.id)
-            await session.commit()
+                    for rec in persisted:
+                        if rec.status != "paper_not_available" and rec.id not in cache_ids_to_deliver:
+                            cache_ids_to_deliver.append(rec.id)
+                await session.commit()
 
     if not cache_ids_to_deliver:
         await status_msg.edit_text(
@@ -1809,7 +1973,6 @@ async def handle_qp_download_all_year(callback: types.CallbackQuery, state: FSMC
         )
         return
 
-    # 3. Deliver each paper via QPaperService
     total = len(cache_ids_to_deliver)
     await status_msg.edit_text(f"⏳ Delivering {total} papers — cache hits are instant...")
 
@@ -1838,7 +2001,6 @@ async def handle_qp_download_all_year(callback: types.CallbackQuery, state: FSMC
                 pass
         await asyncio.sleep(0.05)
 
-    # 4. Final summary
     summary = (
         f"📋 <b>Batch download complete</b>\n\n"
         f"📅 Year: <b>{esc(selected_year)}</b>\n"
@@ -1853,10 +2015,7 @@ async def handle_qp_download_all_year(callback: types.CallbackQuery, state: FSMC
     await status_msg.edit_text(summary, parse_mode=ParseMode.HTML)
 
 
-# ── Helper: translate QPResult → user-facing message ────────────────────────
-
 async def _present_qp_result(status_msg: types.Message, result: QPResult) -> None:
-    """Translate a QPResult into the user-facing message."""
     try:
         if result.delivered:
             try:
@@ -1894,7 +2053,6 @@ async def _present_qp_result(status_msg: types.Message, result: QPResult) -> Non
             )
             return
 
-        # Technical error
         await status_msg.edit_text(
             f"⚠️ <b>Temporary error fetching paper</b>\n\n"
             f"The system failed to fetch this paper right now. Please try again.\n"
@@ -1911,7 +2069,6 @@ async def _present_qp_result(status_msg: types.Message, result: QPResult) -> Non
 
 @dp.callback_query(F.data == "qp_search_prompt")
 async def handle_qp_search_prompt(callback: types.CallbackQuery, state: FSMContext) -> None:
-    """Prompts the user to enter a search keyword and sets FSM state."""
     try:
         await callback.answer()
     except Exception:
@@ -1932,7 +2089,7 @@ async def handle_qp_search_prompt(callback: types.CallbackQuery, state: FSMConte
 
 @dp.message(QuestionPaperFlow.waiting_for_search_query)
 async def process_qp_search_query(message: types.Message, state: FSMContext) -> None:
-    """Processes search queries, queries NITRIS live, and shows results lists or jumps straight to selector."""
+    """Processes search queries via the job queue (Phase 6)."""
     query = message.text.strip()
     telegram_id = message.from_user.id
     
@@ -1959,38 +2116,64 @@ async def process_qp_search_query(message: types.Message, state: FSMContext) -> 
             await status_msg.edit_text("❌ You are not registered. Use /start to register.")
             await state.clear()
             return
-            
-        password = decrypt_password(user.encrypted_password)
+    
+    from app.nitris.job_queue import nitris_job_queue, Priority
+    from app.nitris.gateway import NitrisCircuitOpenError
+    from app.nitris.rate_limiter import operation_cooldown, COOLDOWN_PAPERS_SEARCH
+    
+    allowed, wait = await operation_cooldown.check(
+        user.id, "qp_search", key=query,
+        cooldown_seconds=COOLDOWN_PAPERS_SEARCH,
+    )
+    if not allowed:
+        await status_msg.edit_text(
+            f"⏳ You just searched for this. Please wait {wait}s before trying again.",
+            parse_mode=ParseMode.HTML,
+        )
+        await state.clear()
+        return
+    
+    try:
+        future = await nitris_job_queue.enqueue(
+            job_type="qp_search",
+            user_id=user.id,
+            priority=Priority.MEDIUM,
+            dedup_key=f"qp_search:{query.lower()}",
+            payload={"query": query},
+        )
         
-        from app.nitris.client import NitrisClient
-        client = NitrisClient()
         try:
-            await client.login(user.roll_number, password)
-            
-            search_records = []
-            from app.nitris.examination_parser import parse_question_papers_html
-            
-            # Rich Search: query Autumn and Spring semesters of the completed previous year (2024-25) to capture 100% of curriculum subjects
-            try:
-                html_autumn = await client.fetch_question_papers(academic_year="2024-25/Autumn", subject_query=query)
-                search_records.extend(parse_question_papers_html(html_autumn))
-            except Exception as e_autumn:
-                logger.warning("Autumn semester search query failed or returned no results: %r", e_autumn)
-                
-            try:
-                html_spring = await client.fetch_question_papers(academic_year="2024-25/Spring", subject_query=query)
-                search_records.extend(parse_question_papers_html(html_spring))
-            except Exception as e_spring:
-                logger.warning("Spring semester search query failed or returned no results: %r", e_spring)
-                
-            parsed_records = search_records
-        except Exception as e:
-            logger.error("Failed querying subject search on portal: %r", e)
-            await status_msg.edit_text(f"❌ Portal query failed: {html.escape(str(e))}")
+            result = await asyncio.wait_for(future, timeout=90.0)
+        except asyncio.TimeoutError:
+            await status_msg.edit_text(
+                "⏳ <b>Search is taking longer than expected.</b>\n\n"
+                "NITRIS may be slow. Please try again in a moment.",
+                parse_mode=ParseMode.HTML,
+            )
             await state.clear()
             return
-        finally:
-            await client.close()
+        
+        if not result.get("success"):
+            error = result.get("error", "Unknown error")
+            await status_msg.edit_text(
+                f"❌ Portal query failed: {html.escape(str(error)[:200])}",
+                parse_mode=ParseMode.HTML,
+            )
+            await state.clear()
+            return
+        
+        records = result.get("records", [])
+        parsed_records = records
+    
+    except NitrisCircuitOpenError:
+        await status_msg.edit_text(
+            "⚠️ <b>NITRIS is temporarily unavailable.</b>\n\n"
+            "The system is protecting the portal from overload. "
+            "Please try again in ~60 seconds.",
+            parse_mode=ParseMode.HTML,
+        )
+        await state.clear()
+        return
             
     if not parsed_records:
         builder = InlineKeyboardBuilder()
@@ -2051,3 +2234,143 @@ async def process_qp_search_query(message: types.Message, state: FSMContext) -> 
     
     await message.answer(text, reply_markup=builder.as_markup(), parse_mode=ParseMode.HTML)
 
+
+# ── Admin Commands (Phase 0 + Phase 1 telemetry) ────────────────────
+
+def is_admin(user_id: int) -> bool:
+    """Check if a Telegram user ID is in the admin list."""
+    from app.config import config
+    return user_id in config.ADMIN_TELEGRAM_IDS
+
+
+@dp.message(Command("status"), StateFilter("*"))
+async def cmd_status(message: types.Message):
+    """Admin command: show system health and NITRIS gateway metrics."""
+    if not is_admin(message.from_user.id):
+        return
+    
+    from app.nitris.gateway import nitris_gateway
+    from app.nitris.job_queue import nitris_job_queue
+    from app.nitris.rate_limiter import operation_cooldown
+    from sqlalchemy import text as sql_text
+    
+    gw = nitris_gateway.get_metrics()
+    queue_depth = nitris_job_queue.get_queue_depth()
+    dedup_count = nitris_job_queue.get_active_dedup_count()
+    cooldown_stats = operation_cooldown.get_stats()
+    
+    try:
+        async with get_db_session() as session:
+            user_count = (await session.execute(
+                sql_text("SELECT COUNT(*) FROM users")
+            )).scalar()
+            valid_creds = (await session.execute(
+                sql_text("SELECT COUNT(*) FROM users WHERE credentials_valid = TRUE")
+            )).scalar()
+            pending_events = (await session.execute(
+                sql_text("SELECT COUNT(*) FROM events WHERE sent=false AND permanent_failure=false")
+            )).scalar()
+            stuck_qps = (await session.execute(
+                sql_text("SELECT COUNT(*) FROM question_paper_caches WHERE status='fetch_in_progress' AND lease_expires_at < NOW()")
+            )).scalar()
+            perm_failed = (await session.execute(
+                sql_text("SELECT COUNT(*) FROM question_paper_caches WHERE status='permanent_failure'")
+            )).scalar()
+            available_qps = (await session.execute(
+                sql_text("SELECT COUNT(*) FROM question_paper_caches WHERE status='paper_available'")
+            )).scalar()
+    except Exception as e:
+        logger.error("Failed to fetch DB stats: %r", e)
+        user_count = valid_creds = pending_events = stuck_qps = perm_failed = available_qps = "ERROR"
+    
+    circuit_emoji = {
+        "closed": "🟢",
+        "open": "🔴",
+        "half_open": "🟡",
+    }.get(gw.get("circuit_state", ""), "⚪")
+    
+    await message.answer(
+        f"📊 <b>NITRClaw System Status</b>\n\n"
+        f"🔧 <b>NITRIS Gateway</b>\n"
+        f"  Circuit: {circuit_emoji} <b>{gw.get('circuit_state', '?')}</b>\n"
+        f"  Concurrency: {gw.get('current_max_concurrent', '?')}/{gw.get('configured_max_concurrent', '?')}\n"
+        f"  Login interval: {gw.get('current_login_interval', '?')}s\n"
+        f"  Active: {gw.get('active_requests', 0)} requests, {gw.get('active_logins', 0)} logins\n"
+        f"  Errors: {gw.get('consecutive_errors', 0)} consecutive, {gw.get('total_errors', 0)} total\n"
+        f"  Total requests: {gw.get('total_requests', 0)} (logins: {gw.get('total_logins', 0)})\n"
+        f"  Last error: <code>{esc(str(gw.get('last_error') or 'none'))}</code>\n\n"
+        f"📋 <b>Job Queue</b>\n"
+        f"  Pending: {queue_depth}\n"
+        f"  Active single-flight dedups: {dedup_count}\n"
+        f"  Active cooldowns: {cooldown_stats.get('active_cooldowns', 0)}\n"
+        f"  Handlers: {', '.join(nitris_job_queue.get_registered_handlers())}\n\n"
+        f"👥 <b>Users</b>\n"
+        f"  Total: {user_count}\n"
+        f"  Valid creds: {valid_creds}\n\n"
+        f"📬 <b>Events</b>\n"
+        f"  Pending dispatch: {pending_events}\n\n"
+        f"📚 <b>QP Cache</b>\n"
+        f"  Available: {available_qps}\n"
+        f"  Stuck (lease expired): {stuck_qps}\n"
+        f"  Permanently failed: {perm_failed}\n",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@dp.message(Command("admin_reset_qp"), StateFilter("*"))
+async def cmd_admin_reset_qp(message: types.Message):
+    """Admin command: reset a stuck or permanently-failed QP cache row."""
+    if not is_admin(message.from_user.id):
+        return
+    
+    args = message.text.strip().split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer(
+            "Usage: <code>/admin_reset_qp &lt;cache_id&gt;</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    
+    try:
+        cache_id = int(args[1])
+    except ValueError:
+        await message.answer("❌ cache_id must be an integer.")
+        return
+    
+    from sqlalchemy import text as sql_text
+    try:
+        async with get_db_session() as session:
+            async with session.begin():
+                result = await session.execute(
+                    sql_text("""
+                        UPDATE question_paper_caches
+                        SET status = 'retryable_failure',
+                            attempt_count = 0,
+                            error_message = NULL,
+                            acquired_by = NULL,
+                            acquired_at = NULL,
+                            lease_expires_at = NULL,
+                            heartbeat_at = NULL,
+                            pending_file_id = NULL
+                        WHERE id = :id
+                        RETURNING subject_code, academic_year, exam_type
+                    """),
+                    {"id": cache_id},
+                )
+                row = result.first()
+        
+        if row:
+            await message.answer(
+                f"✅ <b>Reset QP cache_id={cache_id}</b>\n\n"
+                f"Subject: <code>{esc(row[0])}</code>\n"
+                f"Year: <code>{esc(row[1])}</code>\n"
+                f"Exam: <code>{esc(row[2])}</code>\n\n"
+                f"Status → retryable_failure, attempt_count → 0.\n"
+                f"Next request will re-acquire from NITRIS.",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await message.answer(f"❌ QP cache_id={cache_id} not found.")
+    except Exception as e:
+        logger.error("admin_reset_qp failed: %r", e)
+        await message.answer(f"❌ Failed: {html.escape(str(e))}")

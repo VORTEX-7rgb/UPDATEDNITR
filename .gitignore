@@ -1,27 +1,31 @@
-# Environment & Secrets
+# ── Environment & Secrets (NEVER COMMIT SECRETS) ───────────────────
 .env
 *.env
-.env.*
+.env.local
+.env.development
+.env.production
+!.env.example
 
-# Python Cache
+# ── Python Cache & Bytecode ─────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
+.pytest_cache/
 
-# Virtual Environments
+# ── Virtual Environments ────────────────────────────────────────────
 .venv/
 venv/
 ENV/
 env/
 
-# IDE & Editor
+# ── IDE & Editor ────────────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
 *.swo
 
-# Debug & Temporary Files
+# ── Debug, Logs & Temporary Files ───────────────────────────────────
 debug_html/
 *.log
 *.tmp

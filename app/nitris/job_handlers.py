@@ -1,0 +1,623 @@
+"""NITRIS job handlers — the actual work that runs inside the gateway.
+
+CRITICAL: Passwords are decrypted HERE, inside the gateway's acquire() block,
+used for the NITRIS login, and go out of scope when the handler returns.
+They are NEVER in the job payload, NEVER serialized, NEVER logged.
+
+Each handler:
+1. Acquires a gateway slot (concurrency cap + circuit breaker)
+2. Looks up user credentials from DB (INSIDE the gateway)
+3. Decrypts the password (INSIDE the gateway)
+4. Creates a NitrisClient, logs in through the gateway
+5. Does the NITRIS work
+6. Closes the client
+7. Persists results to DB
+8. Edits the user's Telegram message with the result (if callback provided)
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import html
+from datetime import datetime, timezone
+from typing import Optional, Any
+
+from sqlalchemy import select
+from sqlalchemy.orm import selectinload
+
+from app.bot.telegram import format_attendance_message
+from app.config import config
+from app.db.crypto import decrypt_password
+from app.db.database import get_db_session, async_session_factory
+from app.db.models import User, SyncState, InboxMessage, Snapshot
+from app.db.repositories.snapshot_repository import SnapshotRepository
+from app.db.repositories.inbox_repository import InboxRepository
+from app.db.repositories.event_repository import EventRepository
+from app.nitris.gateway import nitris_gateway, NitrisCircuitOpenError
+from app.nitris.job_queue import nitris_job_queue, NitrisJob, Priority
+from app.nitris.client import NitrisClient
+from app.nitris.exceptions import (
+    LoginError, SessionExpiredError, AttendanceParseError,
+    AttendanceWorkflowError, NitrisError,
+)
+from app.services.attendance_service import get_attendance_data
+from app.services.snapshot_service import SnapshotService
+from app.workers.sync_worker import sync_messages_for_user
+from app.utils import esc
+
+from aiogram.enums import ParseMode
+
+logger = logging.getLogger(__name__)
+
+# Bot instance — set on startup by init_job_handlers()
+_bot = None
+
+
+def init_job_handlers(bot) -> None:
+    """Register all NITRIS job handlers. Call once on startup."""
+    global _bot
+    _bot = bot
+
+    nitris_job_queue.register_handler("attendance_refresh", handle_attendance_refresh)
+    nitris_job_queue.register_handler("inbox_refresh", handle_inbox_refresh)
+    nitris_job_queue.register_handler("qp_metadata_fetch", handle_qp_metadata_fetch)
+    # Phase 6: additional handlers for previously-bypassed paths
+    nitris_job_queue.register_handler("inbox_detail_fetch", handle_inbox_detail_fetch)
+    nitris_job_queue.register_handler("attachment_download", handle_attachment_download)
+    nitris_job_queue.register_handler("qp_search", handle_qp_search)
+
+    logger.info(
+        "Registered NITRIS job handlers: %s",
+        nitris_job_queue.get_registered_handlers(),
+    )
+
+
+# ── Handler: attendance_refresh ─────────────────────────────────────
+
+async def handle_attendance_refresh(job: NitrisJob) -> dict:
+    """Fetch fresh attendance from NITRIS, save snapshot, edit user's message.
+
+    Payload:
+        - callback_chat_id: int (Telegram chat ID to edit)
+        - callback_message_id: int (Telegram message ID to edit)
+
+    Returns:
+        dict with keys: success, data (AttendanceResult or None), error (str or None)
+    """
+    user_id = job.user_id
+    callback_chat_id = job.payload.get("callback_chat_id")
+    callback_message_id = job.payload.get("callback_message_id")
+
+    # ── Step 1: Acquire gateway slot ────────────────────────────────
+    try:
+        async with nitris_gateway.acquire():
+            # ── Step 2: Look up user + decrypt password (INSIDE gateway) ──
+            async with async_session_factory() as session:
+                user = await session.get(User, user_id)
+                if not user:
+                    return {"success": False, "error": "User not found", "data": None}
+                if not user.credentials_valid:
+                    return {
+                        "success": False,
+                        "error": "Credentials marked invalid. Please /forgot to update.",
+                        "data": None,
+                    }
+                roll_number = user.roll_number
+                password = decrypt_password(user.encrypted_password)
+
+            # ── Step 3: NITRIS login + attendance fetch ───────────────
+            client = NitrisClient()
+            try:
+                await nitris_gateway.login_through_gateway(client, roll_number, password)
+                data = await get_attendance_data(roll_number, password, client=client)
+            finally:
+                await client.close()
+
+            # password goes out of scope here
+
+            # ── Step 4: Save snapshot + fire events ───────────────────
+            try:
+                async with get_db_session() as session:
+                    async with session.begin():
+                        snapshot_service = SnapshotService(session)
+                        await snapshot_service.create_snapshot_if_changed(
+                            user_id=user_id,
+                            module_name="attendance",
+                            attendance_result=data,
+                        )
+                # Update sync_state to reflect this manual refresh
+                await _update_sync_state(user_id, success=True)
+            except Exception as e:
+                logger.error("Failed to save attendance snapshot: %r", e)
+                # Don't fail the whole job — we still have fresh data to show
+
+            return {
+                "success": True,
+                "data": data,
+                "error": None,
+                "callback_chat_id": callback_chat_id,
+                "callback_message_id": callback_message_id,
+            }
+
+    except NitrisCircuitOpenError as e:
+        await _edit_callback_message(
+            callback_chat_id, callback_message_id,
+            "⚠️ <b>NITRIS is temporarily unavailable.</b>\n\n"
+            "The system is protecting the portal from overload. "
+            "Please try again in ~60 seconds.",
+        )
+        return {"success": False, "error": str(e), "data": None}
+
+    except LoginError as e:
+        # Mark credentials as invalid
+        await _mark_credentials_invalid(user_id, str(e))
+        await _edit_callback_message(
+            callback_chat_id, callback_message_id,
+            f"❌ <b>Login failed.</b>\n\n"
+            f"Your NITRIS credentials may have changed. "
+            f"Please use /forgot to update them.\n\n"
+            f"<i>Error: {html.escape(str(e))}</i>",
+        )
+        return {"success": False, "error": f"Login failed: {e}", "data": None}
+
+    except (AttendanceWorkflowError, AttendanceParseError) as e:
+        await _update_sync_state(user_id, success=False, error_msg=str(e))
+        await _edit_callback_message(
+            callback_chat_id, callback_message_id,
+            f"❌ <b>Could not fetch attendance.</b>\n\n"
+            f"The NITRIS portal may be experiencing issues. Please try again later.\n\n"
+            f"<i>Error: {html.escape(str(e)[:200])}</i>",
+        )
+        return {"success": False, "error": str(e), "data": None}
+
+    except Exception as e:
+        logger.error("attendance_refresh job failed: %r", e)
+        await _update_sync_state(user_id, success=False, error_msg=str(e))
+        await _edit_callback_message(
+            callback_chat_id, callback_message_id,
+            f"❌ <b>Unexpected error.</b>\n\n"
+            f"Please try again later.\n\n"
+            f"<i>Error: {html.escape(str(e)[:200])}</i>",
+        )
+        return {"success": False, "error": str(e), "data": None}
+
+
+# ── Handler: inbox_refresh ──────────────────────────────────────────
+
+async def handle_inbox_refresh(job: NitrisJob) -> dict:
+    """Sync inbox messages from NITRIS for a user.
+
+    Payload:
+        - callback_chat_id: int (optional, for editing message)
+        - callback_message_id: int (optional)
+    """
+    user_id = job.user_id
+    callback_chat_id = job.payload.get("callback_chat_id")
+    callback_message_id = job.payload.get("callback_message_id")
+
+    try:
+        async with nitris_gateway.acquire():
+            # Decrypt password INSIDE gateway
+            async with async_session_factory() as session:
+                user = await session.get(User, user_id)
+                if not user:
+                    return {"success": False, "error": "User not found"}
+                if not user.credentials_valid:
+                    return {"success": False, "error": "Credentials invalid"}
+                roll_number = user.roll_number
+                password = decrypt_password(user.encrypted_password)
+
+            client = NitrisClient()
+            try:
+                await nitris_gateway.login_through_gateway(client, roll_number, password)
+                await sync_messages_for_user(
+                    user_id, roll_number, password, _bot, client=client
+                )
+            finally:
+                await client.close()
+
+        return {"success": True, "error": None}
+
+    except NitrisCircuitOpenError as e:
+        return {"success": False, "error": str(e)}
+    except LoginError as e:
+        await _mark_credentials_invalid(user_id, str(e))
+        return {"success": False, "error": f"Login failed: {e}"}
+    except Exception as e:
+        logger.error("inbox_refresh job failed: %r", e)
+        return {"success": False, "error": str(e)}
+
+
+# ── Handler: qp_metadata_fetch ──────────────────────────────────────
+
+async def handle_qp_metadata_fetch(job: NitrisJob) -> dict:
+    """Fetch QP metadata from NITRIS for a (subject, year) tuple.
+
+    This handler supports SINGLE-FLIGHT DEDUP: if 100 students request the
+    same metadata simultaneously, only ONE NITRIS call happens.
+
+    Payload:
+        - roll_number: str (for the NITRIS login)
+        - academic_year: str (e.g. "2024-25/Autumn")
+        - subject_code: str (e.g. "CS2001")
+    """
+    user_id = job.user_id
+    academic_year = job.payload.get("academic_year", "")
+    subject_code = job.payload.get("subject_code", "")
+
+    try:
+        async with nitris_gateway.acquire():
+            # Decrypt password INSIDE gateway
+            async with async_session_factory() as session:
+                user = await session.get(User, user_id)
+                if not user:
+                    return {"success": False, "error": "User not found"}
+                if not user.credentials_valid:
+                    return {"success": False, "error": "Credentials invalid"}
+                roll_number = user.roll_number
+                password = decrypt_password(user.encrypted_password)
+
+            from app.services.examination_service import ExaminationService
+            client = NitrisClient()
+            try:
+                await nitris_gateway.login_through_gateway(client, roll_number, password)
+                parsed_records = await ExaminationService.fetch_subject_metadata_from_portal(
+                    username=roll_number,
+                    password=password,
+                    academic_year=academic_year,
+                    subject_code=subject_code,
+                    client=client,
+                )
+            finally:
+                await client.close()
+
+        return {
+            "success": True,
+            "parsed_records": parsed_records,
+            "academic_year": academic_year,
+            "subject_code": subject_code,
+        }
+
+    except NitrisCircuitOpenError as e:
+        return {"success": False, "error": str(e)}
+    except LoginError as e:
+        await _mark_credentials_invalid(user_id, str(e))
+        return {"success": False, "error": f"Login failed: {e}"}
+    except Exception as e:
+        logger.error("qp_metadata_fetch job failed: %r", e)
+        return {"success": False, "error": str(e)}
+
+
+# ── Handler: inbox_detail_fetch (Phase 6 — lazy load message body) ──
+
+async def handle_inbox_detail_fetch(job: NitrisJob) -> dict:
+    """Fetch a single inbox message body from NITRIS (lazy load).
+
+    Payload:
+        - message_id: int (InboxMessage.id)
+
+    Returns:
+        dict with success, body, attachment_url
+    """
+    user_id = job.user_id
+    message_id = job.payload.get("message_id")
+
+    if not message_id:
+        return {"success": False, "error": "message_id required"}
+
+    try:
+        async with nitris_gateway.acquire():
+            async with async_session_factory() as session:
+                user = await session.get(User, user_id)
+                if not user:
+                    return {"success": False, "error": "User not found"}
+                if not user.credentials_valid:
+                    return {"success": False, "error": "Credentials invalid"}
+                roll_number = user.roll_number
+                password = decrypt_password(user.encrypted_password)
+
+                # Load the message to get its token
+                from sqlalchemy import select as sa_select
+                stmt = sa_select(InboxMessage).where(
+                    InboxMessage.id == message_id,
+                    InboxMessage.user_id == user_id,
+                )
+                msg = (await session.execute(stmt)).scalar_one_or_none()
+                if not msg:
+                    return {"success": False, "error": "Message not found"}
+                token = msg.token
+
+            client = NitrisClient()
+            try:
+                await nitris_gateway.login_through_gateway(client, roll_number, password)
+
+                from app.nitris.parser import parse_message_detail_html
+
+                if token.startswith("postback:"):
+                    event_target = token.split("postback:")[1]
+                    real_token, detail_html = await client.submit_message_postback(event_target)
+                    detail_data = parse_message_detail_html(detail_html)
+
+                    from app.nitris.parser import extract_message_id
+                    portal_id = extract_message_id(real_token)
+
+                    async with get_db_session() as update_session:
+                        async with update_session.begin():
+                            from sqlalchemy import update as sqlalchemy_update
+                            update_values = {
+                                "token": real_token,
+                                "body": detail_data["body"],
+                                "attachment_url": detail_data["attachment_url"],
+                            }
+                            if portal_id:
+                                update_values["portal_message_id"] = portal_id
+                            stmt = (
+                                sqlalchemy_update(InboxMessage)
+                                .where(InboxMessage.id == message_id)
+                                .values(**update_values)
+                            )
+                            await update_session.execute(stmt)
+                else:
+                    detail_html = await client.fetch_message_detail(token)
+                    detail_data = parse_message_detail_html(detail_html)
+
+                    async with get_db_session() as update_session:
+                        async with update_session.begin():
+                            from app.db.repositories.inbox_repository import InboxRepository
+                            up_inbox_repo = InboxRepository(update_session)
+                            await up_inbox_repo.update_message_body(
+                                message_id=message_id,
+                                body=detail_data["body"],
+                                attachment_url=detail_data["attachment_url"],
+                            )
+            finally:
+                await client.close()
+
+        return {
+            "success": True,
+            "body": detail_data["body"],
+            "attachment_url": detail_data["attachment_url"],
+        }
+
+    except NitrisCircuitOpenError as e:
+        return {"success": False, "error": str(e)}
+    except LoginError as e:
+        await _mark_credentials_invalid(user_id, str(e))
+        return {"success": False, "error": f"Login failed: {e}"}
+    except Exception as e:
+        logger.error("inbox_detail_fetch job failed: %r", e)
+        return {"success": False, "error": str(e)}
+
+
+# ── Handler: attachment_download (Phase 6) ──────────────────────────
+
+async def handle_attachment_download(job: NitrisJob) -> dict:
+    """Download an inbox attachment from NITRIS and upload to Telegram.
+
+    Payload:
+        - message_id: int (InboxMessage.id)
+        - callback_chat_id: int (Telegram chat to send the file to)
+
+    Returns:
+        dict with success, file_id (Telegram file_id if uploaded), error
+    """
+    user_id = job.user_id
+    message_id = job.payload.get("message_id")
+    callback_chat_id = job.payload.get("callback_chat_id")
+
+    if not message_id or not callback_chat_id:
+        return {"success": False, "error": "message_id and callback_chat_id required"}
+
+    try:
+        async with nitris_gateway.acquire():
+            async with async_session_factory() as session:
+                user = await session.get(User, user_id)
+                if not user:
+                    return {"success": False, "error": "User not found"}
+                if not user.credentials_valid:
+                    return {"success": False, "error": "Credentials invalid"}
+                roll_number = user.roll_number
+                password = decrypt_password(user.encrypted_password)
+
+                from sqlalchemy import select as sa_select
+                stmt = sa_select(InboxMessage).where(
+                    InboxMessage.id == message_id,
+                    InboxMessage.user_id == user_id,
+                )
+                msg = (await session.execute(stmt)).scalar_one_or_none()
+                if not msg or not msg.attachment_url:
+                    return {"success": False, "error": "Message or attachment not found"}
+                attachment_url = msg.attachment_url
+                subject = msg.subject
+
+            client = NitrisClient()
+            try:
+                await nitris_gateway.login_through_gateway(client, roll_number, password)
+                file_bytes = await client.download_attachment(attachment_url)
+            finally:
+                await client.close()
+
+        # Check 50MB Telegram limit
+        MAX_FILE_SIZE = 50 * 1024 * 1024
+        if len(file_bytes) > MAX_FILE_SIZE:
+            return {
+                "success": False,
+                "error": "Attachment too large (>50MB) for Telegram upload.",
+            }
+
+        # Sanitize filename
+        import re
+        sanitized_subject = re.sub(r'[^a-zA-Z0-9_\- ]', '', subject)
+        sanitized_subject = re.sub(r'\s+', ' ', sanitized_subject).strip()
+        if not sanitized_subject:
+            sanitized_subject = f"notice_attachment_{message_id}"
+        filename = f"{sanitized_subject[:50]}.pdf"
+
+        from aiogram.types import BufferedInputFile
+        input_file = BufferedInputFile(file_bytes, filename=filename)
+
+        sent_message = await _bot.send_document(
+            chat_id=callback_chat_id,
+            document=input_file,
+        )
+
+        if sent_message.document:
+            file_id = sent_message.document.file_id
+            # Cache the file_id
+            async with get_db_session() as update_session:
+                async with update_session.begin():
+                    from app.db.repositories.inbox_repository import InboxRepository
+                    up_inbox_repo = InboxRepository(update_session)
+                    await up_inbox_repo.update_telegram_file_id(message_id, file_id)
+
+            return {"success": True, "file_id": file_id}
+
+        return {"success": False, "error": "Telegram upload returned no document file_id"}
+
+    except NitrisCircuitOpenError as e:
+        return {"success": False, "error": str(e)}
+    except LoginError as e:
+        await _mark_credentials_invalid(user_id, str(e))
+        return {"success": False, "error": f"Login failed: {e}"}
+    except Exception as e:
+        logger.error("attachment_download job failed: %r", e)
+        return {"success": False, "error": str(e)}
+
+
+# ── Handler: qp_search (Phase 6 — live QP subject search) ──────────
+
+async def handle_qp_search(job: NitrisJob) -> dict:
+    """Search NITRIS for question paper subjects matching a query.
+
+    Payload:
+        - query: str (search term)
+        - academic_year: str (optional, defaults to "2024-25")
+
+    Returns:
+        dict with success, records (list of QuestionPaperRecord)
+    """
+    user_id = job.user_id
+    query = job.payload.get("query", "")
+
+    if len(query) < 2:
+        return {"success": False, "error": "Query too short"}
+
+    try:
+        async with nitris_gateway.acquire():
+            async with async_session_factory() as session:
+                user = await session.get(User, user_id)
+                if not user:
+                    return {"success": False, "error": "User not found"}
+                if not user.credentials_valid:
+                    return {"success": False, "error": "Credentials invalid"}
+                roll_number = user.roll_number
+                password = decrypt_password(user.encrypted_password)
+
+            client = NitrisClient()
+            try:
+                await nitris_gateway.login_through_gateway(client, roll_number, password)
+
+                from app.nitris.examination_parser import parse_question_papers_html
+
+                search_records = []
+                try:
+                    html_autumn = await client.fetch_question_papers(
+                        academic_year="2024-25/Autumn", subject_query=query
+                    )
+                    search_records.extend(parse_question_papers_html(html_autumn))
+                except Exception as e_autumn:
+                    logger.warning("Autumn search failed: %r", e_autumn)
+
+                try:
+                    html_spring = await client.fetch_question_papers(
+                        academic_year="2024-25/Spring", subject_query=query
+                    )
+                    search_records.extend(parse_question_papers_html(html_spring))
+                except Exception as e_spring:
+                    logger.warning("Spring search failed: %r", e_spring)
+            finally:
+                await client.close()
+
+        return {"success": True, "records": search_records}
+
+    except NitrisCircuitOpenError as e:
+        return {"success": False, "error": str(e)}
+    except LoginError as e:
+        await _mark_credentials_invalid(user_id, str(e))
+        return {"success": False, "error": f"Login failed: {e}"}
+    except Exception as e:
+        logger.error("qp_search job failed: %r", e)
+        return {"success": False, "error": str(e)}
+
+
+# ── Helpers ─────────────────────────────────────────────────────────
+
+async def _edit_callback_message(
+    chat_id: Optional[int],
+    message_id: Optional[int],
+    text: str,
+) -> None:
+    """Edit a Telegram message if chat_id and message_id are provided."""
+    if not _bot or not chat_id or not message_id:
+        return
+    try:
+        await _bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        logger.warning("Failed to edit callback message: %r", e)
+
+
+async def _update_sync_state(
+    user_id: int, success: bool, error_msg: Optional[str] = None,
+) -> None:
+    """Update the SyncState tracker after a manual refresh."""
+    try:
+        async with get_db_session() as session:
+            async with session.begin():
+                stmt = select(SyncState).where(SyncState.user_id == user_id)
+                res = await session.execute(stmt)
+                state = res.scalar_one_or_none()
+
+                if not state:
+                    state = SyncState(user_id=user_id, failure_count=0)
+                    session.add(state)
+
+                state.last_sync = datetime.now(timezone.utc)
+                if success:
+                    state.last_success = datetime.now(timezone.utc)
+                    state.last_error = None
+                    state.failure_count = 0
+                else:
+                    state.last_error = (error_msg or "Unknown error")[:1000]
+                    state.failure_count = (state.failure_count or 0) + 1
+    except Exception as e:
+        logger.error("Failed to update SyncState for user_id=%d: %r", user_id, e)
+
+
+async def _mark_credentials_invalid(user_id: int, error_msg: str) -> None:
+    """Mark a user's credentials as invalid after a LoginError."""
+    try:
+        from sqlalchemy import text
+        from app.nitris.gateway import CREDENTIAL_COOLDOWN_SECONDS, CREDENTIAL_INVALID_THRESHOLD
+        async with async_session_factory() as session:
+            async with session.begin():
+                await session.execute(text("""
+                    UPDATE users
+                    SET qp_fail_count = qp_fail_count + 1,
+                        qp_cooldown_until = NOW() + INTERVAL '1 hour',
+                        credentials_valid = CASE
+                                              WHEN qp_fail_count + 1 >= 3 THEN FALSE
+                                              ELSE credentials_valid
+                                            END,
+                        updated_at = NOW()
+                    WHERE id = :user_id
+                """), {"user_id": user_id})
+        logger.warning(
+            "Marked credential failure for user_id=%d: %s", user_id, error_msg[:100]
+        )
+    except Exception as e:
+        logger.error("Failed to mark credentials invalid for user_id=%d: %r", user_id, e)

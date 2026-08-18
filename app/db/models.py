@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Optional, Any
 from enum import Enum
-from sqlalchemy import BigInteger, String, ForeignKey, DateTime, Boolean, Index, JSON, Integer, Text
+from sqlalchemy import BigInteger, String, ForeignKey, DateTime, Boolean, Index, JSON, Integer, Text, UniqueConstraint
 
 class EventType(str, Enum):
     NEW_SUBJECT_ADDED = "new_subject_added"
@@ -49,6 +49,9 @@ class User(Base):
     telegram_id: Mapped[int] = mapped_column(BigInteger, unique=True, nullable=False)
     roll_number: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
     encrypted_password: Mapped[str] = mapped_column(String(500), nullable=False)
+    credentials_valid: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    qp_fail_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    qp_cooldown_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -68,6 +71,9 @@ class User(Base):
     )
     inbox_messages: Mapped[list["InboxMessage"]] = relationship(
         "InboxMessage", back_populates="user", cascade="all, delete-orphan"
+    )
+    sync_schedules: Mapped[list["ModuleSyncSchedule"]] = relationship(
+        "ModuleSyncSchedule", back_populates="user", cascade="all, delete-orphan"
     )
 
     def __repr__(self) -> str:
@@ -242,6 +248,7 @@ class QuestionPaperCache(Base):
     
     portal_postback_target: Mapped[str] = mapped_column(String(500), nullable=False)
     telegram_file_id: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    pending_file_id: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
 
     # State machine
     status: Mapped[str] = mapped_column(
@@ -249,6 +256,8 @@ class QuestionPaperCache(Base):
     )
     acquired_by: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     acquired_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    heartbeat_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     file_kind: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)  # pdf | zip
     file_size_bytes: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     last_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -292,6 +301,53 @@ Index(
     QuestionPaperCache.attempt_count,
     QuestionPaperCache.last_attempt_at,
 )
+
+
+class ModuleSyncSchedule(Base):
+    """Durable per-user per-module sync schedule for the background TTL scheduler."""
+
+    __tablename__ = "module_sync_schedule"
+    __table_args__ = (
+        UniqueConstraint("user_id", "module_name", name="uq_module_sync_schedule_user_module"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    module_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    last_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_sync_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    last_status: Mapped[str] = mapped_column(String(20), default="pending", nullable=False)
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    consecutive_failures: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    scheduler_claimed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    # Relationships
+    user: Mapped["User"] = relationship("User", back_populates="sync_schedules")
+
+    def __repr__(self) -> str:
+        return (
+            f"<ModuleSyncSchedule id={self.id} user_id={self.user_id} module='{self.module_name}' "
+            f"next_sync_at={self.next_sync_at} status='{self.last_status}' failures={self.consecutive_failures}>"
+        )
+
+
+Index(
+    "idx_module_sync_schedule_due",
+    ModuleSyncSchedule.next_sync_at,
+    postgresql_where=ModuleSyncSchedule.last_status != "disabled",
+)
+Index("idx_module_sync_schedule_claim", ModuleSyncSchedule.scheduler_claimed_at)
 
 # Event dispatcher atomic-claim partial index
 Index(

@@ -8,11 +8,14 @@ from aiogram.enums import ParseMode
 from app.config import config
 from app.bot.telegram import dp, init_qpaper_service, shutdown_qpaper_service
 from app.workers.sync_worker import (
-    run_sync_worker,
     run_dispatch_worker,
     init_event_dispatcher,
     shutdown_event_dispatcher,
 )
+from app.nitris.gateway import nitris_gateway
+from app.nitris.job_queue import nitris_job_queue
+from app.nitris.job_handlers import init_job_handlers
+from app.services.scheduler_service import run_scheduler_loop, init_scheduler
 
 # Windows Asyncio Event Loop Fix for WinError 10054 / 121 / 64
 if sys.platform == "win32":
@@ -36,30 +39,61 @@ async def main():
     )
     logging.info("Starting Telegram Bot...")
     
+    # ── Phase 1+2: Initialize NITRIS Gateway + Job Queue ────────────────
+    # Register job handlers (attendance_refresh, inbox_refresh, qp_metadata_fetch, etc.)
+    init_job_handlers(bot)
+    
+    # Phase 5: Register background sync handlers (sync_attendance, sync_inbox)
+    await init_scheduler()
+    
+    # Start the job queue workers (workers go through the gateway)
+    await nitris_job_queue.start(bot)
+    
+    # ── Services ────────────────────────────────────────────────────────
     # Initialize Question Paper service & start background stale-lock reaper
     await init_qpaper_service(bot)
 
     # Initialize Event Dispatcher service & start background stale-claim reaper
     await init_event_dispatcher(bot)
 
-    # Start background workers
-    sync_worker_task = asyncio.create_task(run_sync_worker(bot))
+    # ── Phase 5: Start the durable scheduler (replaces run_sync_worker) ──
+    scheduler_task = asyncio.create_task(run_scheduler_loop(bot))
+    
+    # Start the event dispatch worker
     dispatch_worker_task = asyncio.create_task(run_dispatch_worker(bot))
     
+    gw_metrics = nitris_gateway.get_metrics()
+    logging.info(
+        "NITRIS Gateway: max_concurrent=%d, login_interval=%.1fs, circuit_threshold=%d",
+        gw_metrics["configured_max_concurrent"],
+        gw_metrics["configured_login_interval"],
+        gw_metrics["circuit_threshold"],
+    )
+    logging.info(
+        "NITRIS Job Queue: %d workers, handlers=%s",
+        config.NITRIS_JOB_WORKERS,
+        nitris_job_queue.get_registered_handlers(),
+    )
+    logging.info(
+        "Module TTLs: %s",
+        {k: f"{v}s" for k, v in config.MODULE_TTL_SECONDS.items()},
+    )
+    
     try:
-        # Start polling
         await dp.start_polling(bot, polling_timeout=10)
     finally:
-        # Cancel background worker tasks cleanly
         logging.info("Stopping background workers & services...")
+        await nitris_job_queue.stop()
         await shutdown_qpaper_service()
         await shutdown_event_dispatcher()
-        sync_worker_task.cancel()
+        
+        scheduler_task.cancel()
         dispatch_worker_task.cancel()
         try:
-            await asyncio.gather(sync_worker_task, dispatch_worker_task, return_exceptions=True)
+            await asyncio.gather(scheduler_task, dispatch_worker_task, return_exceptions=True)
         except Exception:
             pass
+        
         logging.info("Background workers stopped successfully.")
 
 if __name__ == "__main__":
