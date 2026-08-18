@@ -112,26 +112,13 @@ async def init_qpaper_service(bot: Bot) -> None:
                     "Register at least one student before downloading papers."
                 )
             
-            candidates = []
-            for r in rows:
-                try:
-                    password = decrypt_password(r.encrypted_password)
-                    candidates.append((r.roll_number, password, r.id))
-                except Exception as e:
-                    logger.error(
-                        "Failed to decrypt password for user_id=%d roll=%s: %r — skipping",
-                        r.id, r.roll_number, e,
-                    )
-                    continue
-            
-            if not candidates:
-                raise RuntimeError(
-                    "All candidate passwords failed to decrypt — "
-                    "check ENCRYPTION_KEY configuration."
-                )
+            # Return (roll, user_id, encrypted_password) — NOT decrypted plaintext.
+            # The caller (_nitris_download) decrypts one at a time inside acquire().
+            candidates = [(r.roll_number, r.id, r.encrypted_password) for r in rows]
             
             logger.info(
-                "creds_provider: returning %d candidate(s) for QP acquisition",
+                "creds_provider: returning %d candidate(s) for QP acquisition "
+                "(passwords NOT decrypted — will be decrypted one-at-a-time inside gateway)",
                 len(candidates),
             )
             return candidates
@@ -390,7 +377,27 @@ async def process_password(message: types.Message, state: FSMContext):
     await state.set_state(Registration.verifying)
     
     try:
-        data = await get_attendance_data(roll, password)
+        # Route registration verification through the NITRIS gateway.
+        from app.nitris.gateway import nitris_gateway, NitrisCircuitOpenError
+        from app.nitris.client import NitrisClient as _NitrisClient
+        
+        async with nitris_gateway.acquire():
+            _reg_client = _NitrisClient()
+            try:
+                await nitris_gateway.login_through_gateway(_reg_client, roll, password)
+                data = await get_attendance_data(roll, password, client=_reg_client)
+            finally:
+                await _reg_client.close()
+    except NitrisCircuitOpenError as e:
+        logger.warning("Registration blocked — NITRIS circuit open: %s", e)
+        await state.set_state(Registration.waiting_for_password)
+        await status_msg.edit_text(
+            "⚠️ <b>NITRIS is temporarily unavailable.</b>\n\n"
+            "The system is protecting the portal from overload. "
+            "Please try registering again in ~60 seconds.",
+            parse_mode=ParseMode.HTML
+        )
+        return
     except LoginError as e:
         logger.error("Login verification failed for %s: %s", roll, e)
         await state.set_state(Registration.waiting_for_password)

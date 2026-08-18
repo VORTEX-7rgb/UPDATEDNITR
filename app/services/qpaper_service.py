@@ -434,14 +434,35 @@ class QPaperService:
 
         last_err = None
         for candidate in candidates:
-            if isinstance(candidate, (list, tuple)) and len(candidate) >= 2:
+            encrypted_password = None
+            password = None
+            user_id = 0
+            if isinstance(candidate, (list, tuple)) and len(candidate) >= 3:
+                roll = candidate[0]
+                user_id = candidate[1]
+                encrypted_password = candidate[2]
+            elif isinstance(candidate, (list, tuple)) and len(candidate) == 2:
                 roll = candidate[0]
                 password = candidate[1]
             else:
                 continue
 
             from app.nitris.gateway import nitris_gateway
+            from app.nitris.exceptions import LoginError
+            from app.db.crypto import decrypt_password
+
             async with nitris_gateway.acquire():
+                # Decrypt the password INSIDE acquire() — just-in-time
+                if encrypted_password is not None:
+                    try:
+                        password = decrypt_password(encrypted_password)
+                    except Exception as e:
+                        logger.error(
+                            "Failed to decrypt password for user_id=%d: %r — skipping candidate",
+                            user_id, e,
+                        )
+                        continue
+
                 client = NitrisClient()
                 try:
                     await nitris_gateway.login_through_gateway(client, roll, password)
@@ -452,6 +473,10 @@ class QPaperService:
                     )
                     kind = _sniff_kind(file_bytes)
                     return file_bytes, kind
+                except LoginError as e:
+                    last_err = e
+                    logger.warning("QP download login failed for roll=%s: %r", roll, e)
+                    continue
                 except Exception as e:
                     last_err = e
                     logger.warning("QP download attempt failed for roll=%s: %r", roll, e)

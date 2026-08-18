@@ -172,9 +172,30 @@ class NitrisGateway:
             self._sem.release()
 
     async def login_through_gateway(self, client, username: str, password: str) -> None:
-        """Helper to execute portal login inside a paced gateway slot."""
-        async with self.acquire(is_login=True):
+        """Pace a NITRIS login. MUST be called inside an acquire() block.
+
+        Eliminates nested semaphore acquisition. Enforces minimum interval
+        between logins and tracks login metrics without re-acquiring the semaphore.
+        """
+        # Enforce minimum interval between logins (pacing)
+        async with self._login_lock:
+            now = time.monotonic()
+            elapsed = now - self.metrics.last_login_time
+            if elapsed < self.current_login_interval:
+                delay = self.current_login_interval - elapsed
+                logger.debug("Pacing login by %.2fs", delay)
+                await asyncio.sleep(delay)
+            self.metrics.last_login_time = time.monotonic()
+
+        async with self._state_lock:
+            self.metrics.total_logins += 1
+            self.metrics.active_logins += 1
+
+        try:
             await client.login(username, password)
+        finally:
+            async with self._state_lock:
+                self.metrics.active_logins -= 1
 
     async def _record_success(self, is_login: bool, latency: float) -> None:
         async with self._state_lock:
