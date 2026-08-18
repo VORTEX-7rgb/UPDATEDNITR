@@ -90,6 +90,10 @@ class NitrisGateway:
         )
 
     @property
+    def max_concurrent(self) -> int:
+        return self.current_max_concurrent
+
+    @property
     def _metrics(self) -> GatewayMetrics:
         self.metrics.circuit_state = self.circuit_state
         return self.metrics

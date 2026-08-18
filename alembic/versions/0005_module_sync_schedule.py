@@ -46,6 +46,21 @@ def upgrade() -> None:
         ON module_sync_schedule (scheduler_claimed_at)
     """)
 
+    # Backfill: create schedule rows for existing users with staggered next_sync_at
+    # to avoid a thundering herd on startup.
+    op.execute("""
+        INSERT INTO module_sync_schedule (user_id, module_name, next_sync_at, last_status)
+        SELECT
+            u.id,
+            m.module,
+            NOW() + (RANDOM() * INTERVAL '6 hours'),
+            'pending'
+        FROM users u
+        CROSS JOIN (VALUES ('attendance'), ('inbox')) AS m(module)
+        WHERE u.credentials_valid = TRUE
+        ON CONFLICT (user_id, module_name) DO NOTHING
+    """)
+
 
 def downgrade() -> None:
     op.execute("DROP TABLE IF EXISTS module_sync_schedule")

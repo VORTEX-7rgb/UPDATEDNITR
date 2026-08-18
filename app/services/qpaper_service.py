@@ -440,22 +440,23 @@ class QPaperService:
             else:
                 continue
 
-            client = NitrisClient()
-            try:
-                from app.nitris.gateway import nitris_gateway
-                await nitris_gateway.login_through_gateway(client, roll, password)
-                file_bytes = await client.download_question_paper_bytes(
-                    academic_year=ac_year,
-                    subject_query=sub_code,
-                    event_target=postback_target,
-                )
-                kind = _sniff_kind(file_bytes)
-                return file_bytes, kind
-            except Exception as e:
-                last_err = e
-                logger.warning("QP download attempt failed for roll=%s: %r", roll, e)
-            finally:
-                await client.close()
+            from app.nitris.gateway import nitris_gateway
+            async with nitris_gateway.acquire():
+                client = NitrisClient()
+                try:
+                    await nitris_gateway.login_through_gateway(client, roll, password)
+                    file_bytes = await client.download_question_paper_bytes(
+                        academic_year=ac_year,
+                        subject_query=sub_code,
+                        event_target=postback_target,
+                    )
+                    kind = _sniff_kind(file_bytes)
+                    return file_bytes, kind
+                except Exception as e:
+                    last_err = e
+                    logger.warning("QP download attempt failed for roll=%s: %r", roll, e)
+                finally:
+                    await client.close()
 
         raise last_err or RuntimeError("All candidate credentials failed to download paper")
 

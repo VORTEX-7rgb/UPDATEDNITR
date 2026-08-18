@@ -1875,8 +1875,6 @@ async def handle_qp_download_all_year(callback: types.CallbackQuery, state: FSMC
             return
         courses = list(snapshot.snapshot_json["records"])
         user_id = user.id
-        roll_number = user.roll_number
-        password = decrypt_password(user.encrypted_password)
 
     total_courses = len(courses)
     await status_msg.edit_text(

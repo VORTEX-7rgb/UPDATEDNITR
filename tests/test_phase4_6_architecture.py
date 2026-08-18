@@ -56,8 +56,8 @@ async def test_gateway_concurrency_cap():
     tasks = [hold_slot(0.1) for _ in range(10)]
     await asyncio.gather(*tasks)
     
-    # max_concurrent is 5, so we should never see more than 5 concurrent
-    assert max_seen <= 5, f"Concurrency exceeded cap: {max_seen} > 5"
+    # max_concurrent is enforced, so we should never see more than max_concurrent
+    assert max_seen <= nitris_gateway.max_concurrent, f"Concurrency exceeded cap: {max_seen} > {nitris_gateway.max_concurrent}"
 
 
 @pytest.mark.asyncio
@@ -261,10 +261,10 @@ def test_module_ttl_config():
     assert "inbox" in config.MODULE_TTL_SECONDS
     assert "timetable" in config.MODULE_TTL_SECONDS
     
-    # attendance: 6h = 21600s
-    assert config.MODULE_TTL_SECONDS["attendance"] == 6 * 3600
-    # inbox: 15min = 900s
-    assert config.MODULE_TTL_SECONDS["inbox"] == 15 * 60
+    # attendance: 12h = 43200s
+    assert config.MODULE_TTL_SECONDS["attendance"] == 12 * 3600
+    # inbox: 4h = 14400s
+    assert config.MODULE_TTL_SECONDS["inbox"] == 4 * 3600
     # timetable: 7d = 604800s
     assert config.MODULE_TTL_SECONDS["timetable"] == 7 * 24 * 3600
     

@@ -30,8 +30,8 @@ class Config:
 
     # ── NITRIS Gateway config (Phase 1) ─────────────────────────────────────
     # Conservative FIXED capacity. Adapts DOWNWARD only on failures (never up).
-    # These defaults are safe for a single bot process serving up to ~5k users.
-    NITRIS_GATEWAY_MAX_CONCURRENT = int(os.getenv("NITRIS_GATEWAY_MAX_CONCURRENT", "5"))
+    # Scaled to safely serve up to 5k+ registered students.
+    NITRIS_GATEWAY_MAX_CONCURRENT = int(os.getenv("NITRIS_GATEWAY_MAX_CONCURRENT", "8"))
     NITRIS_GATEWAY_MIN_LOGIN_INTERVAL = float(os.getenv("NITRIS_GATEWAY_MIN_LOGIN_INTERVAL", "1.5"))
     NITRIS_GATEWAY_CIRCUIT_ERROR_THRESHOLD = int(os.getenv("NITRIS_GATEWAY_CIRCUIT_ERROR_THRESHOLD", "10"))
     NITRIS_GATEWAY_CIRCUIT_RECOVERY_SECONDS = float(os.getenv("NITRIS_GATEWAY_CIRCUIT_RECOVERY_SECONDS", "60"))
@@ -40,18 +40,17 @@ class Config:
     # Number of worker coroutines pulling from the priority queue.
     # Each worker goes through the gateway, so effective concurrency is
     # min(NITRIS_JOB_WORKERS, NITRIS_GATEWAY_MAX_CONCURRENT).
-    NITRIS_JOB_WORKERS = int(os.getenv("NITRIS_JOB_WORKERS", "3"))
+    NITRIS_JOB_WORKERS = int(os.getenv("NITRIS_JOB_WORKERS", "6"))
 
     # ── Per-module TTL scheduler config (Phase 5) ───────────────────────────
     # Authoritative per-module sync intervals (in seconds).
-    # DO NOT hardcode these elsewhere — import from config.
-    # attendance: 6h (updates daily after each class)
-    # inbox: 15min (near-real-time)
+    # Scaled for 5k users:
+    # attendance: 12h (updates daily after each class)
+    # inbox: 4h (students get Telegram notifications on new notices)
     # timetable: 7d (changes only at semester boundary)
-    # question_papers: no periodic background sync (cached forever via Telegram file_id)
     MODULE_TTL_SECONDS = {
-        "attendance": int(os.getenv("MODULE_TTL_ATTENDANCE", str(6 * 3600))),      # 6h
-        "inbox": int(os.getenv("MODULE_TTL_INBOX", str(15 * 60))),                  # 15min
+        "attendance": int(os.getenv("MODULE_TTL_ATTENDANCE", str(12 * 3600))),     # 12h
+        "inbox": int(os.getenv("MODULE_TTL_INBOX", str(4 * 3600))),                 # 4h
         "timetable": int(os.getenv("MODULE_TTL_TIMETABLE", str(7 * 24 * 3600))),    # 7d
     }
 
