@@ -366,6 +366,7 @@ def test_migrations_exist():
         "0003_event_dispatcher_state.py",
         "0004_qp_lease_and_creds.py",
         "0005_module_sync_schedule.py",
+        "0006_add_timetable.py",
     ]
     
     for exp in expected:
@@ -387,3 +388,21 @@ def test_migration_0005_references_correct_down_revision():
     
     assert mod.down_revision == "0004_qp_lease_and_creds"
     assert mod.revision == "0005_module_sync_schedule"
+
+
+def test_migration_0006_references_correct_down_revision():
+    """Migration 0006 chains from 0005."""
+    import importlib.util
+    migrations_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "alembic", "versions"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "mig6", os.path.join(migrations_dir, "0006_add_timetable.py")
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    
+    assert mod.down_revision == "0005_module_sync_schedule"
+    assert mod.revision == "0006_add_timetable"
+

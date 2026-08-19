@@ -1,9 +1,9 @@
 """SQLAlchemy declarative database models with strict indexing and constraints."""
 
-from datetime import datetime
+from datetime import datetime, time
 from typing import Optional, Any
 from enum import Enum
-from sqlalchemy import BigInteger, String, ForeignKey, DateTime, Boolean, Index, JSON, Integer, Text, UniqueConstraint
+from sqlalchemy import BigInteger, String, ForeignKey, DateTime, Boolean, Index, JSON, Integer, Text, UniqueConstraint, SmallInteger, Time
 
 class EventType(str, Enum):
     NEW_SUBJECT_ADDED = "new_subject_added"
@@ -74,6 +74,9 @@ class User(Base):
     )
     sync_schedules: Mapped[list["ModuleSyncSchedule"]] = relationship(
         "ModuleSyncSchedule", back_populates="user", cascade="all, delete-orphan"
+    )
+    timetable_entries: Mapped[list["TimetableEntry"]] = relationship(
+        "TimetableEntry", back_populates="user", cascade="all, delete-orphan"
     )
 
     def __repr__(self) -> str:
@@ -361,4 +364,69 @@ Index(
     Event.id,
     postgresql_where=Event.permanent_failure == True,
 )
+
+
+class TimetableEntry(Base):
+    """Per-user weekly class timetable. Synced MANUALLY via /timetable.
+
+    One row per (user, weekday, period). The full week has ≤ 45 rows for a
+    typical NITR student (5 days × 9 periods). Sync replaces the entire set
+    transactionally (DELETE+INSERT inside one BEGIN/COMMIT) — no partial state.
+
+    Time storage is wall-clock IST (e.g. time(9, 0) for 09:00). India has no
+    DST, so naive TIME is correct and unambiguous. The "now" lookup compares
+    `datetime.now(ZoneInfo("Asia/Kolkata")).time()` against these values
+    directly — both sides are IST wall-clock, no tz-conversion needed.
+
+    Schema mirrors the NITRIS_PORTAL_RECON.json timetable shape 1:1:
+        {"day":"Monday", "period_index":1, "start_time":"08:00",
+         "end_time":"08:55", "subject":"ER2251", "room":""}
+    Plus an `is_break` flag for the LUNCH row (recon tags lunch explicitly).
+    """
+
+    __tablename__ = "timetable_entries"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    weekday: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    period_index: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    start_time: Mapped[time] = mapped_column(Time, nullable=False)
+    end_time: Mapped[time] = mapped_column(Time, nullable=False)
+    subject_code: Mapped[str] = mapped_column(Text, nullable=False)
+    room: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+    is_break: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    # Bonus fields scraped from the cell `title` attribute (future-proof for
+    # displaying human-readable course names). Empty string if NITRIS omits them.
+    subject_name: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+    course_type: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+    synced_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    # Relationships
+    user: Mapped["User"] = relationship("User", back_populates="timetable_entries")
+
+    def __repr__(self) -> str:
+        tag = " BREAK" if self.is_break else ""
+        return (
+            f"<TimetableEntry id={self.id} user_id={self.user_id} "
+            f"day={self.weekday} p{self.period_index} "
+            f"{self.start_time}-{self.end_time} "
+            f"{self.subject_code!r} room={self.room!r}{tag}>"
+        )
+
+
+# Composite index for ordered per-day walk (used by /now and /timetable display)
+Index(
+    "idx_timetable_user_day_period",
+    TimetableEntry.user_id,
+    TimetableEntry.weekday,
+    TimetableEntry.period_index,
+)
+
 

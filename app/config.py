@@ -1,7 +1,22 @@
 import os
 from dotenv import load_dotenv
+from zoneinfo import ZoneInfo
 
-load_dotenv()
+# Load .env but DON'T override existing env vars. This lets test harnesses
+# (conftest.py) and CI set DATABASE_URL / ENCRYPTION_KEY without being
+# clobbered by a stray .env file found by dotenv's upward directory walk.
+load_dotenv(override=False)
+
+# ── IST (Asia/Kolkata) — the single source of truth for all date/time work ──
+# India has no DST since 1970, so this ZoneInfo is stable forever. EVERY
+# datetime.now() call in this codebase MUST pass this tz:
+#     datetime.now(config.IST)
+# Bare datetime.now() is forbidden in the timetable module — the AST test
+# test_no_naive_datetime_now.py enforces this. Without explicit IST, a UTC-default
+# server clock would shift weekday/time by 5h30m and silently affect every
+# "now/next" computation.
+IST = ZoneInfo("Asia/Kolkata")
+
 
 class Config:
     BOT_TOKEN = os.getenv("BOT_TOKEN", "")
@@ -73,4 +88,19 @@ class Config:
     # MUST be False in production — snapshots contain student PII.
     DEBUG = os.getenv("DEBUG", "").lower() in ("1", "true", "yes")
 
+    # ── Timetable feature (Phase 6) ────────────────────────────────────────
+    # Lookahead window for the "next class" search when there are no more
+    # classes today (or on weekends). 7 = the natural weekly cycle.
+    TIMETABLE_LOOKAHEAD_DAYS = int(os.getenv("TIMETABLE_LOOKAHEAD_DAYS", "7"))
+
+    # Grace period in minutes — a class ending at 10:00 still shows as "current"
+    # up to 10:0X (where X = grace). Prevents the awkward "no class now" blip
+    # the second a class ends while the student is packing up.
+    TIMETABLE_CLASS_END_GRACE_MIN = int(os.getenv("TIMETABLE_CLASS_END_GRACE_MIN", "2"))
+
+    # Single-flight dedup key prefix for timetable sync jobs.
+    TIMETABLE_SYNC_DEDUP_PREFIX = "timetable_sync"
+
+
 config = Config()
+

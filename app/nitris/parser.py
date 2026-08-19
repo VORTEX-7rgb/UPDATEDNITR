@@ -1,13 +1,364 @@
 """Parse the final rendered attendance HTML into structured data."""
 
 import logging
+import re
 from dataclasses import dataclass, asdict
+from datetime import time, datetime
 from typing import Optional
 from bs4 import BeautifulSoup
-from app.nitris.constants import ATTENDANCE_TABLE_ID, STUDENT_INFO_LABEL_ID
-from app.nitris.exceptions import AttendanceParseError
+from app.nitris.constants import (
+    ATTENDANCE_TABLE_ID, STUDENT_INFO_LABEL_ID,
+    TIMETABLE_HEADING_TEXT, TIMETABLE_TABLE_CSS_CLASS,
+    TIMETABLE_TITLE_RE, TIMETABLE_ROOM_RE, TIMETABLE_TIME_RE,
+)
+from app.nitris.exceptions import AttendanceParseError, HomeParseError
 
 logger = logging.getLogger(__name__)
+
+
+# ── Timetable data classes ───────────────────────────────────────────────────
+
+# Day name → weekday number (Python convention: Monday=0 ... Sunday=6).
+# Used by the parser AND by the now/next algorithm — both sides MUST agree.
+_DAY_TO_WEEKDAY = {
+    "Monday": 0, "Tuesday": 1, "Wednesday": 2,
+    "Thursday": 3, "Friday": 4, "Saturday": 5, "Sunday": 6,
+}
+WEEKDAY_NAMES = tuple(_DAY_TO_WEEKDAY.keys())  # ("Monday", "Tuesday", ...)
+
+
+@dataclass(frozen=True)
+class TimetableSlot:
+    """One parsed timetable entry. Matches the recon JSON shape 1:1."""
+    day: str                    # "Monday" ... "Sunday"
+    weekday: int                # 0..6 (Mon=0, Sun=6)
+    period_index: int           # 1..N
+    start_time: str             # "08:00" (24-hour, HH:MM)
+    end_time: str               # "08:55"
+    subject: str                # course code, e.g. "MN2101"; "LUNCH" for break
+    room: str                   # "205" / "LA 117" / "" if no room
+    is_break: bool = False      # True for the LUNCH row
+    # Bonus metadata scraped from the cell `title` attribute. Empty if NITRIS
+    # doesn't supply them. Not part of the recon canonical shape, but useful
+    # for future "show course name" UX without re-scraping.
+    subject_name: str = ""
+    course_type: str = ""
+
+
+@dataclass
+class HomeParseResult:
+    """Result of parse_home_page(). Today only the timetable is extracted;
+    webmail creds, recent messages, anti-ragging etc. are reserved for
+    future phases (see NITRIS_PORTAL_RECON.json `files_to_add_or_modify_in_repo`)."""
+    timetable: list[TimetableSlot]
+    raw_html_bytes: int = 0
+
+    def to_timetable_dicts(self) -> list[dict]:
+        return [asdict(s) for s in self.timetable]
+
+
+# ── Timetable parser ─────────────────────────────────────────────────────────
+
+def _find_timetable_table(soup: BeautifulSoup):
+    """Locate the timetable <table> element in the Home.aspx HTML.
+
+    The timetable table is directly preceded by the heading 'Course Class Time Table'
+    and contains period times ('08:00', '09:00') along with day names ('Monday', 'Tuesday').
+    """
+    # 1. Heading anchor (h1..h6 containing Course Class Time Table)
+    for h in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"]):
+        htext = h.get_text(" ", strip=True).lower()
+        if "course class time table" in htext or "class time table" in htext or "timetable" in htext:
+            tbl = h.find_next("table")
+            if tbl is not None:
+                return tbl
+
+    # 2. Table containing both day names AND period time strings
+    for tbl in soup.find_all("table"):
+        txt = tbl.get_text(" ", strip=True)
+        if "Monday" in txt and ("08:00" in txt or "8:00" in txt or "09:00" in txt or "12:00" in txt):
+            return tbl
+
+    # 3. Fallback: table with PERIOD and Monday
+    for tbl in soup.find_all("table"):
+        txt = tbl.get_text(" ", strip=True)
+        if "PERIOD" in txt and "Monday" in txt:
+            return tbl
+
+    return None
+
+
+def _parse_header_times(header_container) -> list[tuple[str, str]]:
+    """Parse the header element (thead or first tr) into a list of (start_time, end_time) tuples.
+
+    The first cell is the corner cell ("PERIOD DAY") and is skipped. Each
+    subsequent cell renders as "08:00 hr 08:55 hr" — the regex extracts the
+    two HH:MM tokens; the " hr" suffixes are discarded.
+    """
+    time_slots: list[tuple[str, str]] = []
+    # th/td cells inside the header container
+    header_cells = header_container.find_all(["th", "td"])
+    if not header_cells or len(header_cells) < 2:
+        raise HomeParseError(
+            f"Timetable header has too few cells (got {len(header_cells)})."
+        )
+
+    for cell in header_cells[1:]:  # skip corner
+        text = cell.get_text(" ", strip=True)  # "08:00 hr 08:55 hr"
+        times = TIMETABLE_TIME_RE.findall(text)
+        if len(times) >= 2:
+            time_slots.append((times[0], times[1]))
+
+    if not time_slots:
+        raise HomeParseError(
+            f"Could not extract time slots from timetable header."
+        )
+
+    return time_slots
+
+
+def _parse_period_cell(cell, day_name: str, weekday: int, period_index: int,
+                       start: str, end: str) -> Optional[TimetableSlot]:
+    """Parse a single <th> period cell into a TimetableSlot (or None for empty).
+
+    Cell structure:
+        <th title="{ER2251 : Mining Geology : Theory}">
+            ER2251<br/> <i style="...">{# 205}</i>
+        </th>
+    OR for empty slots:
+        <th title="">-</th>
+    OR for the LUNCH rowspan cell:
+        <th rowspan="5" ...>L<br/>U<br/>N<br/>C<br/>H</th>
+    """
+    text = cell.get_text(" ", strip=True)
+
+    # LUNCH cell — NITRIS renders it as vertical letters L<br/>U<br/>N<br/>C<br/>H
+    # which bs4 turns into "L U N C H" (with separators). Strip ALL whitespace
+    # before checking, so the column-shifted / line-broken forms both match.
+    text_compact = "".join(text.upper().split())
+    if "LUNCH" in text_compact or text_compact == "LUNCH":
+        return TimetableSlot(
+            day=day_name, weekday=weekday, period_index=period_index,
+            start_time=start, end_time=end,
+            subject="LUNCH", room="", is_break=True,
+        )
+
+    # Empty slot — NITRIS uses "-" as placeholder
+    if not text or text.strip() == "-":
+        return None
+
+    # Real class cell — extract subject + room + bonus metadata from title
+    title_attr = (cell.get("title") or "").strip()
+
+    subject_code = ""
+    subject_name = ""
+    course_type = ""
+
+    if title_attr:
+        m = re.match(TIMETABLE_TITLE_RE, title_attr)
+        if m:
+            subject_code = m.group(1).strip()
+            subject_name = m.group(2).strip()
+            course_type = m.group(3).strip()
+
+    # Fallback: parse subject code from the first text node (in case title is
+    # empty or differently formatted). The visible cell text starts with the
+    # subject code, then has the <i>{# ...}</i> suffix appended.
+    if not subject_code:
+        # Get only the leading text node, before any <br/> or <i>
+        # (bs4 .contents gives direct children in document order)
+        for child in cell.children:
+            if isinstance(child, str):
+                candidate = child.strip()
+                if candidate and candidate != "-":
+                    subject_code = candidate
+                    break
+        if not subject_code:
+            # Last-ditch fallback
+            subject_code = text.split()[0] if text.split() else ""
+
+    # Room — from <i>{# 205}</i>
+    room = ""
+    i_el = cell.find("i")
+    if i_el:
+        i_text = i_el.get_text(" ", strip=True)
+        m = re.search(TIMETABLE_ROOM_RE, i_text)
+        if m:
+            room = m.group(1).strip()
+
+    return TimetableSlot(
+        day=day_name, weekday=weekday, period_index=period_index,
+        start_time=start, end_time=end,
+        subject=subject_code, room=room, is_break=False,
+        subject_name=subject_name, course_type=course_type,
+    )
+
+
+def parse_timetable_from_home(html: str) -> list[TimetableSlot]:
+    """Parse the timetable widget from Home.aspx HTML.
+
+    Returns a list of TimetableSlot objects (one per non-empty slot, plus
+    one LUNCH slot per weekday the LUNCH rowspan covers).
+
+    Raises HomeParseError if the timetable table cannot be located, if the
+    header row is missing, or if the tbody is absent.
+
+    Rowspan handling
+    -----------------
+    NITRIS renders LUNCH as a single `<th rowspan="5">` cell in Monday's row
+    that visually spans Mon-Fri. BeautifulSoup does NOT auto-fill the missing
+    cells in Tue-Fri rows, so a naive walk would shift Tuesday's classes left
+    into the lunch slot. We track active rowspan cells (column → cell +
+    remaining rows) and pre-fill the aligned[] array for each row, so the
+    column layout stays correct for every day.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    tbl = _find_timetable_table(soup)
+    if tbl is None:
+        raise HomeParseError(
+            "Timetable table not found in Home.aspx HTML. "
+            "Either the student has no timetable published, or NITRIS changed the dashboard markup."
+        )
+
+    # Find header row — inside <thead> or first <tr> with time matches
+    header_el = tbl.find("thead")
+    if not header_el:
+        for tr in tbl.find_all("tr"):
+            if len(TIMETABLE_TIME_RE.findall(tr.get_text(" ", strip=True))) >= 2:
+                header_el = tr
+                break
+
+    if not header_el:
+        raise HomeParseError("Timetable table header row (with period times) missing.")
+
+    time_slots = _parse_header_times(header_el)
+    n_slots = len(time_slots)
+    if n_slots == 0:
+        raise HomeParseError("Timetable header parsed zero time slots.")
+
+    # Find all data rows
+    tbody = tbl.find("tbody")
+    if tbody:
+        data_rows = tbody.find_all("tr", recursive=False)
+    else:
+        # Filter out the header row
+        data_rows = [r for r in tbl.find_all("tr", recursive=False) if r != header_el]
+
+    if not data_rows:
+        raise HomeParseError("Timetable table has no day rows.")
+
+    # Track rowspan cells: col_idx → (cell_obj, remaining_rows_to_span)
+    active_rowspans: dict[int, tuple[object, int]] = {}
+
+    entries: list[TimetableSlot] = []
+
+    for row in data_rows:
+        cells = row.find_all(["th", "td"], recursive=False)
+        if not cells:
+            continue
+
+        day_name = cells[0].get_text(strip=True)
+        weekday = _DAY_TO_WEEKDAY.get(day_name)
+        if weekday is None:
+            logger.debug("Skipping unknown timetable row: day_name=%r", day_name)
+            continue
+
+        period_cells = cells[1:]  # drop the day label cell
+
+        # Build the aligned column array (one slot per header column).
+        # Step A: pre-fill columns that are absorbed by an active rowspan cell.
+        aligned: list[Optional[object]] = [None] * n_slots
+        for col, (cell_obj, _remaining) in active_rowspans.items():
+            if 0 <= col < n_slots:
+                aligned[col] = cell_obj
+
+        # Step B: walk this row's explicit cells, placing each at the next
+        # FREE column (skipping columns already occupied by rowspan cells).
+        col_idx = 0
+        new_rowspans: list[tuple[int, object, int]] = []
+        for cell in period_cells:
+            # Skip past occupied columns
+            while col_idx < n_slots and aligned[col_idx] is not None:
+                col_idx += 1
+            if col_idx >= n_slots:
+                logger.warning(
+                    "Timetable row %s has more cells than header columns — dropping extras",
+                    day_name,
+                )
+                break
+
+            aligned[col_idx] = cell
+
+            # Register new rowspan cells for future rows
+            rs_str = cell.get("rowspan")
+            if rs_str:
+                try:
+                    rs = int(rs_str)
+                    if rs >= 2:
+                        # This cell will appear in this row + (rs-1) future rows.
+                        new_rowspans.append((col_idx, cell, rs - 1))
+                except ValueError:
+                    pass
+
+            col_idx += 1
+
+        # Step C: decrement remaining rowspans; expire those that hit zero.
+        expired_cols = []
+        for col in list(active_rowspans.keys()):
+            cell_obj, remaining = active_rowspans[col]
+            new_remaining = remaining - 1
+            if new_remaining <= 0:
+                expired_cols.append(col)
+            else:
+                active_rowspans[col] = (cell_obj, new_remaining)
+        for col in expired_cols:
+            del active_rowspans[col]
+
+        # Step D: add new rowspans discovered this row.
+        for col, cell_obj, rem in new_rowspans:
+            active_rowspans[col] = (cell_obj, rem)
+
+        # Step E: emit entries from the aligned array
+        for slot_idx, cell in enumerate(aligned):
+            if slot_idx >= n_slots:
+                break
+            start, end = time_slots[slot_idx]
+            period_idx = slot_idx + 1  # 1-indexed
+
+            if cell is None:
+                # Empty slot — no class and no rowspan covering this column
+                continue
+
+            slot = _parse_period_cell(
+                cell, day_name, weekday, period_idx, start, end
+            )
+            if slot is not None:
+                entries.append(slot)
+
+    if not entries:
+        raise HomeParseError(
+            "Timetable parser produced zero entries — the dashboard may be empty or the markup changed."
+        )
+
+    return entries
+
+
+def parse_home_page(html: str) -> HomeParseResult:
+    """Parse the full Home.aspx dashboard.
+
+    Currently extracts only the timetable. Future versions will also extract:
+      - webmail credentials (per NITRIS_PORTAL_RECON.json `home_page_extracts`)
+      - recent messages
+      - anti-ragging status
+      - calendar month events
+
+    Returns a HomeParseResult with all extracted data.
+    """
+    slots = parse_timetable_from_home(html)
+    return HomeParseResult(timetable=slots, raw_html_bytes=len(html))
+
+
+
 
 
 @dataclass

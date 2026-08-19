@@ -53,6 +53,9 @@ from app.services.qpaper_service import QPaperService, QPResult
 
 dp = Dispatcher()
 
+from app.bot.handlers.timetable import router as timetable_router
+dp.include_router(timetable_router)
+
 qpaper_service: Optional[QPaperService] = None
 
 async def init_qpaper_service(bot: Bot) -> None:
@@ -246,7 +249,10 @@ def format_dashboard_text(user: User, unread_count: int = 0) -> str:
 def get_dashboard_keyboard(unread_count: int = 0) -> types.InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(types.InlineKeyboardButton(text="📊 Get Latest Attendance", callback_data="db_attendance"))
-    
+    builder.row(
+        types.InlineKeyboardButton(text="📅 Timetable", callback_data="tt_view_full"),
+        types.InlineKeyboardButton(text="⏰ Now & Next", callback_data="tt_now_next"),
+    )
     inbox_text = f"📩 Inbox ({unread_count})" if unread_count > 0 else "📩 Inbox"
     builder.row(
         types.InlineKeyboardButton(text=inbox_text, callback_data="db_inbox"),
@@ -1542,13 +1548,10 @@ from app.db.repositories.snapshot_repository import SnapshotRepository
 from app.db.models import QuestionPaperCache
 
 YEAR_MAP = {
-    "2526A": "2025-26/Spring",
+    
     "2526S": "2025-26/Autumn",
-    "2425S": "2024-25/Spring",
     "2425A": "2024-25/Autumn",
-    "2324S": "2023-24/Spring",
     "2324A": "2023-24/Autumn",
-    "2223S": "2022-23/Spring",
     "2223A": "2022-23/Autumn"
 }
 

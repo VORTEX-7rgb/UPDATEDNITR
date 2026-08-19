@@ -65,6 +65,7 @@ def init_job_handlers(bot) -> None:
     nitris_job_queue.register_handler("inbox_detail_fetch", handle_inbox_detail_fetch)
     nitris_job_queue.register_handler("attachment_download", handle_attachment_download)
     nitris_job_queue.register_handler("qp_search", handle_qp_search)
+    nitris_job_queue.register_handler("timetable_sync", handle_timetable_sync)
 
     logger.info(
         "Registered NITRIS job handlers: %s",
@@ -667,3 +668,66 @@ async def _mark_credentials_invalid(user_id: int, error_msg: str) -> None:
         )
     except Exception as e:
         logger.error("Failed to mark credentials invalid for user_id=%d: %r", user_id, e)
+
+
+# ── Handler: timetable_sync ──────────────────────────────────────────
+
+async def handle_timetable_sync(job: NitrisJob) -> dict:
+    """Manual timetable sync from Home.aspx dashboard.
+
+    Payload:
+        - callback_chat_id: int (optional Telegram chat ID to edit/reply)
+        - callback_message_id: int (optional Telegram message ID to edit)
+
+    Returns:
+        dict with success, error, entry_count, synced_at_ist.
+    """
+    from app.services.timetable_service import sync_user_timetable
+    from app.bot.handlers.timetable import get_day_selector_keyboard, get_not_synced_keyboard
+    from app.config import IST
+    from datetime import datetime
+
+    user_id = job.user_id
+    callback_chat_id = job.payload.get("callback_chat_id")
+    callback_message_id = job.payload.get("callback_message_id")
+
+    result = await sync_user_timetable(
+        user_id=user_id,
+        callback_chat_id=callback_chat_id,
+        callback_message_id=callback_message_id,
+    )
+
+    # Edit the loading message with result if callback provided
+    if _bot and callback_chat_id and callback_message_id:
+        try:
+            if result.get("success"):
+                entry_count = result.get("entry_count", 0)
+                synced_at_ist = result.get("synced_at_ist", "")
+                today_weekday = min(datetime.now(IST).weekday(), 5)
+                await _bot.edit_message_text(
+                    chat_id=callback_chat_id,
+                    message_id=callback_message_id,
+                    text=(
+                        f"✅ <b>Timetable synced successfully!</b>\n\n"
+                        f"📊 Saved <b>{entry_count}</b> class slots.\n"
+                        f"🕒 <i>{synced_at_ist}</i>\n\n"
+                        f"Choose an option below to view your schedule:"
+                    ),
+                    reply_markup=get_day_selector_keyboard(today_weekday),
+                    parse_mode=ParseMode.HTML,
+                )
+            else:
+                err = result.get("error", "Unknown error")
+                await _bot.edit_message_text(
+                    chat_id=callback_chat_id,
+                    message_id=callback_message_id,
+                    text=f"❌ <b>Timetable sync failed:</b>\n\n{esc(str(err))}",
+                    reply_markup=get_not_synced_keyboard(),
+                    parse_mode=ParseMode.HTML,
+                )
+        except Exception as e:
+            logger.warning("timetable_sync: could not edit callback message: %r", e)
+
+    return result
+
+

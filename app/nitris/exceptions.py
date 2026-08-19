@@ -31,3 +31,8 @@ class AttendanceTableMissingError(NitrisError):
 
 class AttendanceParseError(NitrisError):
     """Could not parse the attendance table HTML."""
+
+
+class HomeParseError(NitrisError):
+    """Could not parse the Home.aspx dashboard or timetable HTML."""
+

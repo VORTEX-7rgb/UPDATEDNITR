@@ -1,0 +1,290 @@
+"""Telegram bot handlers for Timetable & 'Now & Next Class' features."""
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime
+from typing import Optional
+
+from aiogram import Router, F, types
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, StateFilter
+
+from app.config import config, IST
+from app.db.database import get_db_session
+from app.db.repositories.user_repository import UserRepository
+from app.db.repositories.timetable_repository import TimetableRepository
+from app.nitris.job_queue import nitris_job_queue, Priority
+from app.nitris.rate_limiter import operation_cooldown
+from app.services.now_next_service import (
+    resolve_now_and_next,
+    format_now_next_message,
+    format_day_schedule,
+    WEEKDAY_LABELS,
+)
+from app.utils import esc
+
+logger = logging.getLogger(__name__)
+
+router = Router(name="timetable_router")
+
+COOLDOWN_TIMETABLE_SYNC = 60  # seconds
+
+
+# ── Keyboards ────────────────────────────────────────────────────────────────
+
+def get_now_next_keyboard() -> types.InlineKeyboardMarkup:
+    """Keyboard attached to the Now & Next Class message."""
+    return types.InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                types.InlineKeyboardButton(text="🔄 Refresh", callback_data="tt_now_next"),
+                types.InlineKeyboardButton(text="📅 Full Timetable", callback_data="tt_view_full"),
+            ],
+            [
+                types.InlineKeyboardButton(text="⚡ Sync from NITRIS", callback_data="tt_sync"),
+            ],
+        ]
+    )
+
+
+def get_not_synced_keyboard() -> types.InlineKeyboardMarkup:
+    """Keyboard shown when user has no timetable synced yet."""
+    return types.InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                types.InlineKeyboardButton(
+                    text="🔄 Sync Timetable Now", callback_data="tt_sync"
+                )
+            ]
+        ]
+    )
+
+
+def get_day_selector_keyboard(selected_day: int) -> types.InlineKeyboardMarkup:
+    """Day selector bar for viewing weekly timetable (Mon-Sat)."""
+    days = [("Mon", 0), ("Tue", 1), ("Wed", 2), ("Thu", 3), ("Fri", 4), ("Sat", 5)]
+    buttons = []
+    for label, day_idx in days:
+        text = f"• {label} •" if day_idx == selected_day else label
+        buttons.append(
+            types.InlineKeyboardButton(text=text, callback_data=f"tt_day_{day_idx}")
+        )
+
+    # 3 buttons per row
+    row1 = buttons[:3]
+    row2 = buttons[3:]
+
+    return types.InlineKeyboardMarkup(
+        inline_keyboard=[
+            row1,
+            row2,
+            [
+                types.InlineKeyboardButton(text="⏰ Now & Next", callback_data="tt_now_next"),
+                types.InlineKeyboardButton(text="🔄 Sync from NITRIS", callback_data="tt_sync"),
+            ],
+        ]
+    )
+
+
+# ── Core Handlers ────────────────────────────────────────────────────────────
+
+async def _handle_now_next_display(telegram_user_id: int) -> tuple[str, types.InlineKeyboardMarkup]:
+    """Load user timetable from DB, resolve against current IST time, and format response."""
+    async with get_db_session() as session:
+        user_repo = UserRepository(session)
+        user = await user_repo.get_by_telegram_id(telegram_user_id)
+        if not user:
+            return (
+                "⚠️ <b>You are not registered yet.</b>\nPlease send /start to register.",
+                types.InlineKeyboardMarkup(inline_keyboard=[]),
+            )
+
+        tt_repo = TimetableRepository(session)
+        entries = await tt_repo.get_user_timetable(user.id)
+        last_synced = await tt_repo.get_last_synced_at(user.id)
+
+    if not entries:
+        return (
+            "📅 <b>Timetable Not Synced Yet</b>\n\n"
+            "You haven't synced your class schedule from NITRIS yet.\n"
+            "Tap the button below to fetch your timetable automatically!",
+            get_not_synced_keyboard(),
+        )
+
+    result = resolve_now_and_next(entries, datetime.now(IST))
+    text = format_now_next_message(result, last_synced)
+    return text, get_now_next_keyboard()
+
+
+async def _handle_day_display(telegram_user_id: int, weekday: int) -> tuple[str, types.InlineKeyboardMarkup]:
+    """Format one day's timetable schedule."""
+    async with get_db_session() as session:
+        user_repo = UserRepository(session)
+        user = await user_repo.get_by_telegram_id(telegram_user_id)
+        if not user:
+            return (
+                "⚠️ <b>You are not registered yet.</b>\nPlease send /start to register.",
+                types.InlineKeyboardMarkup(inline_keyboard=[]),
+            )
+
+        tt_repo = TimetableRepository(session)
+        entries = await tt_repo.get_user_timetable(user.id)
+        last_synced = await tt_repo.get_last_synced_at(user.id)
+
+    if not entries:
+        return (
+            "📅 <b>Timetable Not Synced Yet</b>\n\n"
+            "You haven't synced your class schedule from NITRIS yet.\n"
+            "Tap the button below to fetch your timetable automatically!",
+            get_not_synced_keyboard(),
+        )
+
+    text = format_day_schedule(entries, weekday)
+    if last_synced:
+        synced_ist = last_synced.astimezone(IST) if last_synced.tzinfo else last_synced.replace(tzinfo=IST)
+        text += f"\n\n🔄 <i>Last synced: {synced_ist.strftime('%d %b %Y, %I:%M %p IST')}</i>"
+
+    return text, get_day_selector_keyboard(weekday)
+
+
+async def _enqueue_sync(
+    telegram_user_id: int,
+    callback_chat_id: int,
+    callback_message_id: int,
+) -> tuple[bool, str]:
+    """Enqueue a timetable sync job to NitrisJobQueue."""
+    async with get_db_session() as session:
+        user_repo = UserRepository(session)
+        user = await user_repo.get_by_telegram_id(telegram_user_id)
+        if not user:
+            return False, "⚠️ You are not registered yet. Please send /start to register."
+        if not user.credentials_valid:
+            return False, "⚠️ Your credentials are marked invalid. Use /forgot to update them."
+        user_id = user.id
+
+    # Check anti-spam cooldown (proper async await)
+    allowed, wait = await operation_cooldown.check(
+        user_id, "timetable_sync", cooldown_seconds=COOLDOWN_TIMETABLE_SYNC
+    )
+    if not allowed:
+        return False, f"⏳ Please wait <b>{wait}s</b> before syncing timetable again."
+
+    # Enqueue job to NitrisJobQueue
+    dedup_key = f"{config.TIMETABLE_SYNC_DEDUP_PREFIX}:{user_id}"
+    await nitris_job_queue.enqueue(
+        job_type="timetable_sync",
+        user_id=user_id,
+        priority=Priority.HIGH,
+        payload={
+            "callback_chat_id": callback_chat_id,
+            "callback_message_id": callback_message_id,
+        },
+        dedup_key=dedup_key,
+    )
+    return True, "🔄 <b>Syncing timetable with NITRIS...</b>\n<i>Please wait a few seconds.</i>"
+
+
+# ── Commands ─────────────────────────────────────────────────────────────────
+
+@router.message(Command("now"), StateFilter("*"))
+@router.message(Command("next"), StateFilter("*"))
+@router.message(Command("class"), StateFilter("*"))
+async def cmd_now_next(message: types.Message):
+    """Command /now, /next, /class: Show current and next upcoming class."""
+    text, kb = await _handle_now_next_display(message.from_user.id)
+    await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("timetable"), StateFilter("*"))
+@router.message(Command("schedule"), StateFilter("*"))
+async def cmd_timetable(message: types.Message):
+    """Command /timetable: Show timetable for today or full weekly schedule."""
+    today_weekday = min(datetime.now(IST).weekday(), 5)  # Cap at Saturday (5) if Sunday
+    text, kb = await _handle_day_display(message.from_user.id, today_weekday)
+    await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("timetablesync"), StateFilter("*"))
+async def cmd_timetable_sync(message: types.Message):
+    """Command /timetablesync: On-demand timetable sync from NITRIS."""
+    status_msg = await message.answer(
+        "🔄 <b>Starting timetable sync...</b>",
+        parse_mode=ParseMode.HTML,
+    )
+    ok, text = await _enqueue_sync(
+        message.from_user.id,
+        message.chat.id,
+        status_msg.message_id,
+    )
+    if not ok:
+        await status_msg.edit_text(text, parse_mode=ParseMode.HTML)
+
+
+# ── Callback Handlers ────────────────────────────────────────────────────────
+
+@router.callback_query(F.data == "tt_now_next")
+async def cb_now_next(callback: types.CallbackQuery):
+    """Callback tt_now_next: Display current & next class."""
+    try:
+        await callback.answer()
+    except Exception:
+        pass
+    text, kb = await _handle_now_next_display(callback.from_user.id)
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    except Exception:
+        await callback.message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+@router.callback_query(F.data == "tt_view_full")
+async def cb_view_full(callback: types.CallbackQuery):
+    """Callback tt_view_full: Display full day timetable with selector."""
+    try:
+        await callback.answer()
+    except Exception:
+        pass
+    today_weekday = min(datetime.now(IST).weekday(), 5)
+    text, kb = await _handle_day_display(callback.from_user.id, today_weekday)
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    except Exception:
+        await callback.message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+@router.callback_query(F.data.startswith("tt_day_"))
+async def cb_select_day(callback: types.CallbackQuery):
+    """Callback tt_day_{N}: Switch displayed day."""
+    try:
+        await callback.answer()
+    except Exception:
+        pass
+    try:
+        weekday = int(callback.data.split("tt_day_")[-1])
+    except ValueError:
+        weekday = 0
+
+    text, kb = await _handle_day_display(callback.from_user.id, weekday)
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data == "tt_sync")
+async def cb_sync(callback: types.CallbackQuery):
+    """Callback tt_sync: Trigger manual timetable sync from NITRIS."""
+    try:
+        await callback.answer("⏳ Requesting timetable from NITRIS...")
+    except Exception:
+        pass
+    ok, text = await _enqueue_sync(
+        callback.from_user.id,
+        callback.message.chat.id,
+        callback.message.message_id,
+    )
+    try:
+        await callback.message.edit_text(text, parse_mode=ParseMode.HTML)
+    except Exception:
+        await callback.message.answer(text, parse_mode=ParseMode.HTML)
+

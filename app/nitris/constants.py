@@ -68,3 +68,21 @@ QUESTION_TABLE_ID = "ContentPlaceHolder2_ContentPlaceHolder1_mainContent_gvSubje
 # Both were using stale navigation tokens that NITRIS rotates periodically, which
 # caused 503 errors and random failures. URLs are now resolved dynamically from
 # the module sidebar HTML at runtime — see NitrisClient._resolve_module_subpage_url().
+
+import re
+
+# ── Home page (timetable widget) ────────────────────────────────────────────
+# The class timetable is rendered as a <table class="table table-bordered ...">
+# immediately after the <h4>Course Class Time Table and Room#</h4> heading on
+# the student dashboard (Home.aspx). It is workflow Pattern A — single GET, no
+# postback, no launcher visit (per NITRIS_PORTAL_RECON.json).
+TIMETABLE_HEADING_TEXT = "Course Class Time Table"
+TIMETABLE_TABLE_CSS_CLASS = "table-bordered"
+# Cell title attribute format: "{ER2251 : Mining Geology : Theory}"
+TIMETABLE_TITLE_RE = r"^\{\s*([^:]+?)\s*:\s*([^:]+?)\s*:\s*([^}]+?)\s*\}$"
+# The room is wrapped in <i style="...">{# 205}</i> — the "# " prefix is NITRIS
+# convention, the rest is the room label (e.g. "205", "LA 117", "" if none).
+TIMETABLE_ROOM_RE = r"#\s*([^}]*?)\s*\}"
+# Header column time format: "08:00 hr 08:55 hr" (start + " hr " + end + " hr").
+TIMETABLE_TIME_RE = re.compile(r"(\d{1,2}:\d{2})")
+

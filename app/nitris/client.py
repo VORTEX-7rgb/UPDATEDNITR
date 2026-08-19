@@ -1024,5 +1024,41 @@ class NitrisClient:
     # Backward-compat alias
     download_question_paper_pdf = download_question_paper_bytes
 
+    # ── Home page fetch (timetable widget) ──────────────────────────────────
+
+    async def fetch_home_html(self) -> str:
+        """GET the student Home.aspx dashboard HTML.
+
+        The class timetable is a widget on the home dashboard — NOT a separate
+        module page. Per NITRIS_PORTAL_RECON.json, this is workflow Pattern A
+        (single GET, no postback, no launcher visit). The student is already
+        authenticated via login(); this just returns the rendered HTML.
+
+        The HTML returned here is then parsed by
+        `app.nitris.parser.parse_home_page()` to extract the timetable
+        (and, in a future phase, webmail creds + recent messages + calendar).
+
+        Raises SessionExpiredError if NITRIS bounces us back to Login.aspx
+        (i.e. the ASP.NET_SessionId cookie expired since login).
+        """
+        resp = await self.client.get(
+            HOME_PAGE_URL,
+            headers={"Referer": f"{self.base_url}/nitris/Login.aspx"},
+        )
+        if resp.status_code != 200:
+            raise AttendanceWorkflowError(
+                f"Failed to load Home.aspx (status {resp.status_code}) — "
+                f"cannot fetch timetable widget."
+            )
+        html = resp.text
+        if is_login_page(html):
+            raise SessionExpiredError(
+                "Session expired — Home.aspx returned login page. "
+                "Re-login required for the next sync cycle."
+            )
+        logger.info("Fetched Home.aspx (%d bytes)", len(html))
+        return html
+
     async def close(self) -> None:
         await self.client.aclose()
+
