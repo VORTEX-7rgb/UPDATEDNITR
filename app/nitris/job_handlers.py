@@ -183,17 +183,24 @@ async def handle_inbox_refresh(job: NitrisJob) -> dict:
     callback_chat_id = job.payload.get("callback_chat_id")
     callback_message_id = job.payload.get("callback_message_id")
 
+    # ── Step 1: DB lookup — OUTSIDE gateway ──
+    try:
+        async with async_session_factory() as session:
+            user = await session.get(User, user_id)
+            if not user:
+                return {"success": False, "error": "User not found"}
+            if not user.credentials_valid:
+                return {"success": False, "error": "Credentials invalid"}
+            roll_number = user.roll_number
+            encrypted_password = user.encrypted_password
+    except Exception as e:
+        logger.error("inbox_refresh DB lookup failed: %r", e)
+        return {"success": False, "error": f"DB lookup failed: {e}"}
+
+    # ── Step 2: NITRIS work — INSIDE gateway ──
     try:
         async with nitris_gateway.acquire():
-            # Decrypt password INSIDE gateway
-            async with async_session_factory() as session:
-                user = await session.get(User, user_id)
-                if not user:
-                    return {"success": False, "error": "User not found"}
-                if not user.credentials_valid:
-                    return {"success": False, "error": "Credentials invalid"}
-                roll_number = user.roll_number
-                password = decrypt_password(user.encrypted_password)
+            password = decrypt_password(encrypted_password)
 
             client = NitrisClient()
             try:
@@ -228,22 +235,33 @@ async def handle_qp_metadata_fetch(job: NitrisJob) -> dict:
         - roll_number: str (for the NITRIS login)
         - academic_year: str (e.g. "2024-25/Autumn")
         - subject_code: str (e.g. "CS2001")
+
+    ARCHITECTURE (lease boundary fix):
+        DB lookup is OUTSIDE acquire(). Only decrypt → login → NITRIS HTTP
+        → client.close is inside the gateway.
     """
     user_id = job.user_id
     academic_year = job.payload.get("academic_year", "")
     subject_code = job.payload.get("subject_code", "")
 
+    # ── Step 1: DB lookup — OUTSIDE gateway ──
+    try:
+        async with async_session_factory() as session:
+            user = await session.get(User, user_id)
+            if not user:
+                return {"success": False, "error": "User not found"}
+            if not user.credentials_valid:
+                return {"success": False, "error": "Credentials invalid"}
+            roll_number = user.roll_number
+            encrypted_password = user.encrypted_password
+    except Exception as e:
+        logger.error("qp_metadata_fetch DB lookup failed: %r", e)
+        return {"success": False, "error": f"DB lookup failed: {e}"}
+
+    # ── Step 2: NITRIS work — INSIDE gateway ──
     try:
         async with nitris_gateway.acquire():
-            # Decrypt password INSIDE gateway
-            async with async_session_factory() as session:
-                user = await session.get(User, user_id)
-                if not user:
-                    return {"success": False, "error": "User not found"}
-                if not user.credentials_valid:
-                    return {"success": False, "error": "Credentials invalid"}
-                roll_number = user.roll_number
-                password = decrypt_password(user.encrypted_password)
+            password = decrypt_password(encrypted_password)
 
             from app.services.examination_service import ExaminationService
             client = NitrisClient()
@@ -394,6 +412,11 @@ async def handle_attachment_download(job: NitrisJob) -> dict:
 
     Returns:
         dict with success, file_id (Telegram file_id if uploaded), error
+
+    ARCHITECTURE (lease boundary fix):
+        DB lookups, Telegram upload, and DB file_id caching are all OUTSIDE
+        acquire(). Only decrypt → login → NITRIS download → client.close
+        is inside the gateway.
     """
     user_id = job.user_id
     message_id = job.payload.get("message_id")
@@ -402,27 +425,36 @@ async def handle_attachment_download(job: NitrisJob) -> dict:
     if not message_id or not callback_chat_id:
         return {"success": False, "error": "message_id and callback_chat_id required"}
 
+    # ── Step 1: DB lookups — OUTSIDE gateway ──
+    try:
+        async with async_session_factory() as session:
+            user = await session.get(User, user_id)
+            if not user:
+                return {"success": False, "error": "User not found"}
+            if not user.credentials_valid:
+                return {"success": False, "error": "Credentials invalid"}
+            roll_number = user.roll_number
+            encrypted_password = user.encrypted_password
+
+            from sqlalchemy import select as sa_select
+            stmt = sa_select(InboxMessage).where(
+                InboxMessage.id == message_id,
+                InboxMessage.user_id == user_id,
+            )
+            msg = (await session.execute(stmt)).scalar_one_or_none()
+            if not msg or not msg.attachment_url:
+                return {"success": False, "error": "Message or attachment not found"}
+            attachment_url = msg.attachment_url
+            subject = msg.subject
+    except Exception as e:
+        logger.error("attachment_download DB lookup failed: %r", e)
+        return {"success": False, "error": f"DB lookup failed: {e}"}
+
+    # ── Step 2: NITRIS download — INSIDE gateway ──
+    file_bytes = None
     try:
         async with nitris_gateway.acquire():
-            async with async_session_factory() as session:
-                user = await session.get(User, user_id)
-                if not user:
-                    return {"success": False, "error": "User not found"}
-                if not user.credentials_valid:
-                    return {"success": False, "error": "Credentials invalid"}
-                roll_number = user.roll_number
-                password = decrypt_password(user.encrypted_password)
-
-                from sqlalchemy import select as sa_select
-                stmt = sa_select(InboxMessage).where(
-                    InboxMessage.id == message_id,
-                    InboxMessage.user_id == user_id,
-                )
-                msg = (await session.execute(stmt)).scalar_one_or_none()
-                if not msg or not msg.attachment_url:
-                    return {"success": False, "error": "Message or attachment not found"}
-                attachment_url = msg.attachment_url
-                subject = msg.subject
+            password = decrypt_password(encrypted_password)
 
             client = NitrisClient()
             try:
@@ -431,6 +463,17 @@ async def handle_attachment_download(job: NitrisJob) -> dict:
             finally:
                 await client.close()
 
+    except NitrisCircuitOpenError as e:
+        return {"success": False, "error": str(e)}
+    except LoginError as e:
+        await _mark_credentials_invalid(user_id, str(e))
+        return {"success": False, "error": f"Login failed: {e}"}
+    except Exception as e:
+        logger.error("attachment_download NITRIS work failed: %r", e)
+        return {"success": False, "error": str(e)}
+
+    # ── Step 3: Telegram upload + DB caching — OUTSIDE gateway ──
+    try:
         # Check 50MB Telegram limit
         MAX_FILE_SIZE = 50 * 1024 * 1024
         if len(file_bytes) > MAX_FILE_SIZE:
@@ -468,13 +511,8 @@ async def handle_attachment_download(job: NitrisJob) -> dict:
 
         return {"success": False, "error": "Telegram upload returned no document file_id"}
 
-    except NitrisCircuitOpenError as e:
-        return {"success": False, "error": str(e)}
-    except LoginError as e:
-        await _mark_credentials_invalid(user_id, str(e))
-        return {"success": False, "error": f"Login failed: {e}"}
     except Exception as e:
-        logger.error("attachment_download job failed: %r", e)
+        logger.error("attachment_download Telegram/DB phase failed: %r", e)
         return {"success": False, "error": str(e)}
 
 
@@ -489,6 +527,10 @@ async def handle_qp_search(job: NitrisJob) -> dict:
 
     Returns:
         dict with success, records (list of QuestionPaperRecord)
+
+    ARCHITECTURE (lease boundary fix):
+        DB lookup is OUTSIDE acquire(). Only decrypt → login → NITRIS HTTP
+        → client.close is inside the gateway.
     """
     user_id = job.user_id
     query = job.payload.get("query", "")
@@ -496,16 +538,25 @@ async def handle_qp_search(job: NitrisJob) -> dict:
     if len(query) < 2:
         return {"success": False, "error": "Query too short"}
 
+    # ── Step 1: DB lookup — OUTSIDE gateway ──
+    try:
+        async with async_session_factory() as session:
+            user = await session.get(User, user_id)
+            if not user:
+                return {"success": False, "error": "User not found"}
+            if not user.credentials_valid:
+                return {"success": False, "error": "Credentials invalid"}
+            roll_number = user.roll_number
+            encrypted_password = user.encrypted_password
+    except Exception as e:
+        logger.error("qp_search DB lookup failed: %r", e)
+        return {"success": False, "error": f"DB lookup failed: {e}"}
+
+    # ── Step 2: NITRIS work — INSIDE gateway ──
+    search_records = None
     try:
         async with nitris_gateway.acquire():
-            async with async_session_factory() as session:
-                user = await session.get(User, user_id)
-                if not user:
-                    return {"success": False, "error": "User not found"}
-                if not user.credentials_valid:
-                    return {"success": False, "error": "Credentials invalid"}
-                roll_number = user.roll_number
-                password = decrypt_password(user.encrypted_password)
+            password = decrypt_password(encrypted_password)
 
             client = NitrisClient()
             try:
@@ -540,7 +591,7 @@ async def handle_qp_search(job: NitrisJob) -> dict:
         await _mark_credentials_invalid(user_id, str(e))
         return {"success": False, "error": f"Login failed: {e}"}
     except Exception as e:
-        logger.error("qp_search job failed: %r", e)
+        logger.error("qp_search NITRIS work failed: %r", e)
         return {"success": False, "error": str(e)}
 
 

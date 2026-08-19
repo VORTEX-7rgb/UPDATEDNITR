@@ -88,31 +88,92 @@ async def test_sqlalchemy_error_does_not_trip_circuit():
     assert gw.metrics.consecutive_errors == 0
 
 
+import ast
+
+
+def _get_acquire_body_source(fn) -> str:
+    """Extract unparsed Python source of the `async with nitris_gateway.acquire():` body using AST."""
+    tree = ast.parse(inspect.getsource(fn))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AsyncWith):
+            for item in node.items:
+                call_str = ast.unparse(item.context_expr)
+                if "nitris_gateway.acquire" in call_str:
+                    return "\n".join(ast.unparse(stmt) for stmt in node.body)
+    raise ValueError(f"No acquire block in {fn.__name__}")
+
+
 def test_attendance_refresh_handler_boundary():
-    """Verify source structure of handle_attendance_refresh keeps DB writes outside acquire()."""
+    """Verify handle_attendance_refresh keeps DB lookups & writes outside acquire()."""
     import app.nitris.job_handlers as jh
-    src = inspect.getsource(jh.handle_attendance_refresh)
+    acquire_body = _get_acquire_body_source(jh.handle_attendance_refresh)
 
-    acquire_idx = src.find("async with nitris_gateway.acquire():")
-    assert acquire_idx != -1
+    assert "session.get" not in acquire_body
+    assert "async_session_factory" not in acquire_body
+    assert "create_snapshot" not in acquire_body
+    assert "session.begin" not in acquire_body
+    assert "decrypt_password" in acquire_body
+    assert "login_through_gateway" in acquire_body
 
-    # snapshot save must come AFTER acquire block finishes
-    snapshot_idx = src.find("snapshot_service.create_snapshot_if_changed")
-    assert snapshot_idx != -1
-    assert snapshot_idx > acquire_idx, "Snapshot creation must be outside acquire block"
+
+def test_inbox_refresh_handler_boundary():
+    """Verify handle_inbox_refresh keeps DB lookups outside acquire()."""
+    import app.nitris.job_handlers as jh
+    acquire_body = _get_acquire_body_source(jh.handle_inbox_refresh)
+
+    assert "session.get" not in acquire_body
+    assert "async_session_factory" not in acquire_body
+    assert "decrypt_password" in acquire_body
+    assert "login_through_gateway" in acquire_body
+
+
+def test_qp_metadata_fetch_handler_boundary():
+    """Verify handle_qp_metadata_fetch keeps DB lookups outside acquire()."""
+    import app.nitris.job_handlers as jh
+    acquire_body = _get_acquire_body_source(jh.handle_qp_metadata_fetch)
+
+    assert "session.get" not in acquire_body
+    assert "async_session_factory" not in acquire_body
+    assert "decrypt_password" in acquire_body
+    assert "login_through_gateway" in acquire_body
 
 
 def test_inbox_detail_fetch_handler_boundary():
-    """Verify source structure of handle_inbox_detail_fetch keeps DB writes outside acquire()."""
+    """Verify handle_inbox_detail_fetch keeps DB lookups & writes outside acquire()."""
     import app.nitris.job_handlers as jh
-    src = inspect.getsource(jh.handle_inbox_detail_fetch)
+    acquire_body = _get_acquire_body_source(jh.handle_inbox_detail_fetch)
 
-    acquire_idx = src.find("async with nitris_gateway.acquire():")
-    assert acquire_idx != -1
+    assert "session.get" not in acquire_body
+    assert "async_session_factory" not in acquire_body
+    assert "update_message_body" not in acquire_body
+    assert "session.begin" not in acquire_body
+    assert "decrypt_password" in acquire_body
+    assert "login_through_gateway" in acquire_body
 
-    update_inbox_idx = src.find("update_message_body")
-    assert update_inbox_idx != -1
-    assert update_inbox_idx > acquire_idx, "update_message_body must be outside acquire block"
+
+def test_attachment_download_handler_boundary():
+    """Verify handle_attachment_download keeps DB lookups, Telegram upload & DB cache outside acquire()."""
+    import app.nitris.job_handlers as jh
+    acquire_body = _get_acquire_body_source(jh.handle_attachment_download)
+
+    assert "session.get" not in acquire_body
+    assert "async_session_factory" not in acquire_body
+    assert "send_document" not in acquire_body
+    assert "update_telegram_file_id" not in acquire_body
+    assert "session.begin" not in acquire_body
+    assert "decrypt_password" in acquire_body
+    assert "login_through_gateway" in acquire_body
+
+
+def test_qp_search_handler_boundary():
+    """Verify handle_qp_search keeps DB lookups outside acquire()."""
+    import app.nitris.job_handlers as jh
+    acquire_body = _get_acquire_body_source(jh.handle_qp_search)
+
+    assert "session.get" not in acquire_body
+    assert "async_session_factory" not in acquire_body
+    assert "decrypt_password" in acquire_body
+    assert "login_through_gateway" in acquire_body
 
 
 @pytest.mark.asyncio
