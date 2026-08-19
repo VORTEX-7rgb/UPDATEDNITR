@@ -1,7 +1,7 @@
 """Single chokepoint gateway for all outbound NITRIS portal interactions.
 
 Features:
-  - Hard concurrency limit (Semaphore)
+  - Dynamic concurrency limit (adaptive admission controller)
   - Downward-only adaptation on failure (reduces concurrency, widens login interval)
   - Strict login pacing (minimum interval between sequential login requests)
   - Circuit breaker (trips to OPEN after consecutive errors to protect portal & avoid 503 bans)
@@ -75,9 +75,12 @@ class NitrisGateway:
         self.circuit_error_threshold = circuit_error_threshold or config.NITRIS_GATEWAY_CIRCUIT_ERROR_THRESHOLD
         self.circuit_recovery_seconds = circuit_recovery_seconds or config.NITRIS_GATEWAY_CIRCUIT_RECOVERY_SECONDS
 
-        self._sem = asyncio.Semaphore(self.current_max_concurrent)
         self._login_lock = asyncio.Lock()
-        self._state_lock = asyncio.Lock()
+        # asyncio.Condition doubles as the metrics mutex AND the admission
+        # controller. Unlike a fixed asyncio.Semaphore (sized once and never
+        # resized), the Condition enforces the *current* effective cap, so
+        # downward/upward adaptation actually throttles NITRIS for real.
+        self._state_lock = asyncio.Condition()
 
         self.circuit_state = CircuitState.CLOSED
         self.circuit_opened_at: float = 0.0
@@ -102,7 +105,6 @@ class NitrisGateway:
     def _reset_metrics_for_testing(self) -> None:
         """Reset gateway state for pytest isolation."""
         self.current_max_concurrent = self.configured_max_concurrent
-        self._sem = asyncio.Semaphore(self.current_max_concurrent)
         self.circuit_state = CircuitState.CLOSED
         self.circuit_opened_at = 0.0
         self.metrics = GatewayMetrics()
@@ -133,9 +135,11 @@ class NitrisGateway:
                 f"{int(self.circuit_recovery_seconds - (time.monotonic() - self.circuit_opened_at))}s"
             )
 
-        # 2. Acquire Concurrency Slot
-        await self._sem.acquire()
+        # 2. Acquire Concurrency Slot (dynamic admission — respects the current
+        #    effective cap, which shrinks on failure and grows on recovery).
         async with self._state_lock:
+            while self.metrics.active_requests >= self.current_max_concurrent:
+                await self._state_lock.wait()
             self.metrics.active_requests += 1
             if is_login:
                 self.metrics.active_logins += 1
@@ -160,13 +164,16 @@ class NitrisGateway:
             # Success path
             await self._record_success(is_login, time.monotonic() - start_time)
 
-        except LoginError:
-            # Credential errors are user faults — don't trip the NITRIS circuit
+        except (LoginError, SessionExpiredError):
+            # Per-user faults (bad credentials, one student's expired ASP.NET
+            # session) must NOT trip the global circuit breaker. One student's
+            # stale cookie should not take the whole bot down for everyone.
             raise
 
         except NitrisError as exc:
-            # NITRIS-related errors (SessionExpired, Workflow, InvalidContext, etc.)
-            # These DO trip the circuit breaker
+            # NITRIS workflow/portal errors (503 error pages, postback failures,
+            # invalid context) DO trip the circuit breaker — they signal the
+            # portal itself is erroring, not a single user's session.
             await self._record_error(exc)
             raise
 
@@ -185,7 +192,7 @@ class NitrisGateway:
                 self.metrics.active_requests -= 1
                 if is_login:
                     self.metrics.active_logins -= 1
-            self._sem.release()
+                self._state_lock.notify_all()
 
     async def login_through_gateway(self, client, username: str, password: str) -> None:
         """Pace a NITRIS login. MUST be called inside an acquire() block.

@@ -2,7 +2,7 @@
 
 import logging
 from typing import Any
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Event
@@ -41,17 +41,3 @@ class EventRepository:
         )
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
-
-    async def mark_sent(self, event_ids: list[int]) -> None:
-        """Update multiple events as successfully dispatched in a bulk write."""
-        if not event_ids:
-            return
-            
-        logger.info("Marking %d events as sent in database", len(event_ids))
-        stmt = (
-            update(Event)
-            .where(Event.id.in_(event_ids))
-            .values(sent=True)
-        )
-        await self.session.execute(stmt)
-        await self.session.flush()

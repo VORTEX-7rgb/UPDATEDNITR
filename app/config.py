@@ -63,6 +63,11 @@ class Config:
     # Scheduler claim staleness — claimed rows become reclaimable after this
     SCHEDULER_CLAIM_STALE_SECONDS = int(os.getenv("SCHEDULER_CLAIM_STALE_SECONDS", "300"))  # 5min
 
+    # Scheduler queue-depth backpressure — when the job queue has at least this
+    # many pending jobs, the scheduler skips claiming new work. Prevents the
+    # cold-start / post-downtime thundering herd (all 5k users due at once).
+    SCHEDULER_MAX_QUEUE_DEPTH = int(os.getenv("SCHEDULER_MAX_QUEUE_DEPTH", "50"))
+
     # ── Debug mode (Phase 0 security) ───────────────────────────────────────
     # When True, NITRIS HTML snapshots are saved to disk for debugging.
     # MUST be False in production — snapshots contain student PII.

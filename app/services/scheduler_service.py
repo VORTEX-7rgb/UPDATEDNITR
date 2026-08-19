@@ -217,16 +217,19 @@ async def ensure_schedule_exists(
 ) -> None:
     """Create a schedule row if it doesn't exist (for new users).
 
-    Called on registration. next_sync_at defaults to NOW() so the first
-    sync happens on the next scheduler cycle.
+    Called on registration. next_sync_at is spread pseudo-randomly across the
+    module TTL window (instead of NOW()) so a bulk sign-up or cold start does
+    not dump every user into the same scheduler cycle.
     """
+    ttl_seconds = float(config.MODULE_TTL_SECONDS.get(module_name, 3600))
+    spread_seconds = random.uniform(0.0, ttl_seconds)
     async with session_factory() as session:
         async with session.begin():
             await session.execute(text("""
                 INSERT INTO module_sync_schedule (user_id, module_name, next_sync_at, last_status)
-                VALUES (:uid, :mod, NOW(), 'pending')
+                VALUES (:uid, :mod, NOW() + make_interval(secs => :spread), 'pending')
                 ON CONFLICT (user_id, module_name) DO NOTHING
-            """), {"uid": user_id, "mod": module_name})
+            """), {"uid": user_id, "mod": module_name, "spread": spread_seconds})
 
 
 async def run_scheduler_loop(bot=None) -> None:
@@ -254,6 +257,19 @@ async def run_scheduler_loop(bot=None) -> None:
             # Check circuit breaker — don't claim work if NITRIS is down
             if nitris_gateway.is_circuit_open():
                 logger.debug("Scheduler: NITRIS circuit open, skipping claim cycle")
+                await asyncio.sleep(poll_interval)
+                continue
+
+            # Queue-depth backpressure — if the job queue is already saturated,
+            # skip this cycle. Prevents the cold-start / post-downtime thundering
+            # herd (all 5k users due at once) that would otherwise grow the queue
+            # unboundedly and trigger stale-claim duplicate enqueues.
+            queue_depth = nitris_job_queue.get_queue_depth()
+            if queue_depth >= config.SCHEDULER_MAX_QUEUE_DEPTH:
+                logger.info(
+                    "Scheduler: job queue saturated (%d pending) — skipping claim cycle",
+                    queue_depth,
+                )
                 await asyncio.sleep(poll_interval)
                 continue
 
@@ -325,58 +341,49 @@ async def init_scheduler() -> None:
     from app.db.models import User
     from app.nitris.client import NitrisClient
     from app.services.attendance_service import get_attendance_data
-    from app.workers.sync_worker import sync_messages_for_user
+    from app.workers.sync_worker import prepare_inbox_sync, persist_inbox_sync
 
     @nitris_job_queue.handler("sync_attendance")
     async def handle_sync_attendance(job):
-        """Background attendance sync (LOW priority)."""
+        """Background attendance sync (LOW priority).
+
+        Lease boundary: DB reads OUTSIDE the gateway lock, NITRIS work
+        (login + scrape) INSIDE, DB writes OUTSIDE again.
+        """
         user_id = job.user_id
         schedule_id = job.payload.get("schedule_id")
         module_name = job.payload.get("module_name", "attendance")
 
+        # Phase 1: DB lookup -- OUTSIDE gateway
+        try:
+            async with async_session_factory() as session:
+                user = await session.get(User, user_id)
+                if not user or not user.credentials_valid:
+                    await update_schedule_after_job(
+                        async_session_factory, schedule_id,
+                        success=False, error_msg="user_invalid_or_missing",
+                        module_name=module_name,
+                    )
+                    return {"success": False, "error": "user_invalid"}
+                roll_number = user.roll_number
+                password = decrypt_password(user.encrypted_password)
+        except Exception as e:
+            logger.error("sync_attendance DB lookup failed for user_id=%d: %r", user_id, e)
+            await update_schedule_after_job(
+                async_session_factory, schedule_id,
+                success=False, error_msg=str(e), module_name=module_name,
+            )
+            return {"success": False, "error": str(e)}
+
+        # Phase 2: NITRIS work -- INSIDE gateway (login + scrape only)
         try:
             async with nitris_gateway.acquire():
-                async with async_session_factory() as session:
-                    user = await session.get(User, user_id)
-                    if not user or not user.credentials_valid:
-                        await update_schedule_after_job(
-                            async_session_factory, schedule_id,
-                            success=False, error_msg="user_invalid_or_missing",
-                            module_name=module_name,
-                        )
-                        return {"success": False, "error": "user_invalid"}
-                    roll_number = user.roll_number
-                    password = decrypt_password(user.encrypted_password)
-
                 client = NitrisClient()
                 try:
                     await nitris_gateway.login_through_gateway(client, roll_number, password)
                     data = await get_attendance_data(roll_number, password, client=client)
-
-                    # Save snapshot
-                    try:
-                        from app.services.snapshot_service import SnapshotService
-                        async with get_db_session() as session:
-                            async with session.begin():
-                                snapshot_service = SnapshotService(session)
-                                await snapshot_service.create_snapshot_if_changed(
-                                    user_id=user_id,
-                                    module_name="attendance",
-                                    attendance_result=data,
-                                )
-                    except Exception as e:
-                        logger.error("Failed to save attendance snapshot: %r", e)
-
-                    await _update_sync_state(user_id, success=True)
                 finally:
                     await client.close()
-
-            await update_schedule_after_job(
-                async_session_factory, schedule_id,
-                success=True, module_name=module_name,
-            )
-            return {"success": True}
-
         except NitrisCircuitOpenError as e:
             await update_schedule_after_job(
                 async_session_factory, schedule_id,
@@ -384,7 +391,7 @@ async def init_scheduler() -> None:
             )
             return {"success": False, "error": str(e)}
         except Exception as e:
-            logger.error("sync_attendance failed for user_id=%d: %r", user_id, e)
+            logger.error("sync_attendance NITRIS fetch failed for user_id=%d: %r", user_id, e)
             await update_schedule_after_job(
                 async_session_factory, schedule_id,
                 success=False, error_msg=str(e), module_name=module_name,
@@ -392,42 +399,70 @@ async def init_scheduler() -> None:
             await _update_sync_state(user_id, success=False, error_msg=str(e))
             return {"success": False, "error": str(e)}
 
+        # Phase 3: DB write -- OUTSIDE gateway
+        try:
+            from app.services.snapshot_service import SnapshotService
+            async with get_db_session() as session:
+                async with session.begin():
+                    snapshot_service = SnapshotService(session)
+                    await snapshot_service.create_snapshot_if_changed(
+                        user_id=user_id,
+                        module_name="attendance",
+                        attendance_result=data,
+                    )
+            await _update_sync_state(user_id, success=True)
+        except Exception as e:
+            logger.error("Failed to save attendance snapshot for user_id=%d: %r", user_id, e)
+            await _update_sync_state(user_id, success=False, error_msg=str(e))
+
+        await update_schedule_after_job(
+            async_session_factory, schedule_id,
+            success=True, module_name=module_name,
+        )
+        return {"success": True}
+
+
     @nitris_job_queue.handler("sync_inbox")
     async def handle_sync_inbox(job):
-        """Background inbox sync (LOW priority)."""
+        """Background inbox sync (LOW priority).
+
+        Lease boundary: DB reads OUTSIDE gateway, NITRIS network INSIDE,
+        DB writes OUTSIDE again.
+        """
         user_id = job.user_id
         schedule_id = job.payload.get("schedule_id")
         module_name = job.payload.get("module_name", "inbox")
 
+        # Phase 1: DB lookup -- OUTSIDE gateway
+        try:
+            async with async_session_factory() as session:
+                user = await session.get(User, user_id)
+                if not user or not user.credentials_valid:
+                    await update_schedule_after_job(
+                        async_session_factory, schedule_id,
+                        success=False, error_msg="user_invalid_or_missing",
+                        module_name=module_name,
+                    )
+                    return {"success": False, "error": "user_invalid"}
+                roll_number = user.roll_number
+                password = decrypt_password(user.encrypted_password)
+        except Exception as e:
+            logger.error("sync_inbox DB lookup failed for user_id=%d: %r", user_id, e)
+            await update_schedule_after_job(
+                async_session_factory, schedule_id,
+                success=False, error_msg=str(e), module_name=module_name,
+            )
+            return {"success": False, "error": str(e)}
+
+        # Phase 2: NITRIS network -- INSIDE gateway (login + fetch + details)
         try:
             async with nitris_gateway.acquire():
-                async with async_session_factory() as session:
-                    user = await session.get(User, user_id)
-                    if not user or not user.credentials_valid:
-                        await update_schedule_after_job(
-                            async_session_factory, schedule_id,
-                            success=False, error_msg="user_invalid_or_missing",
-                            module_name=module_name,
-                        )
-                        return {"success": False, "error": "user_invalid"}
-                    roll_number = user.roll_number
-                    password = decrypt_password(user.encrypted_password)
-
                 client = NitrisClient()
                 try:
                     await nitris_gateway.login_through_gateway(client, roll_number, password)
-                    await sync_messages_for_user(
-                        user_id, roll_number, password, None, client=client
-                    )
+                    scraped, detail_cache, existing_by_id = await prepare_inbox_sync(client, user_id)
                 finally:
                     await client.close()
-
-            await update_schedule_after_job(
-                async_session_factory, schedule_id,
-                success=True, module_name=module_name,
-            )
-            return {"success": True}
-
         except NitrisCircuitOpenError as e:
             await update_schedule_after_job(
                 async_session_factory, schedule_id,
@@ -435,11 +470,29 @@ async def init_scheduler() -> None:
             )
             return {"success": False, "error": str(e)}
         except Exception as e:
-            logger.error("sync_inbox failed for user_id=%d: %r", user_id, e)
+            logger.error("sync_inbox NITRIS fetch failed for user_id=%d: %r", user_id, e)
             await update_schedule_after_job(
                 async_session_factory, schedule_id,
                 success=False, error_msg=str(e), module_name=module_name,
             )
             return {"success": False, "error": str(e)}
 
-    logger.info("Registered scheduler sync handlers: sync_attendance, sync_inbox")
+        # Phase 3: DB write -- OUTSIDE gateway
+        try:
+            await persist_inbox_sync(user_id, scraped, detail_cache, existing_by_id)
+        except Exception as e:
+            logger.error("sync_inbox persist failed for user_id=%d: %r", user_id, e)
+            await update_schedule_after_job(
+                async_session_factory, schedule_id,
+                success=False, error_msg=str(e), module_name=module_name,
+            )
+            return {"success": False, "error": str(e)}
+
+        await update_schedule_after_job(
+            async_session_factory, schedule_id,
+            success=True, module_name=module_name,
+        )
+        return {"success": True}
+
+
+logger.info("Registered scheduler sync handlers: sync_attendance, sync_inbox")

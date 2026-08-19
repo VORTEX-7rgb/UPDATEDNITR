@@ -295,6 +295,7 @@ class QPaperService:
                     SET status = :in_progress,
                         acquired_by = :job_id,
                         acquired_at = NOW(),
+                        lease_expires_at = NOW() + make_interval(secs => :stale_secs),
                         last_attempt_at = NOW(),
                         attempt_count = attempt_count + 1,
                         error_message = NULL,
@@ -476,6 +477,9 @@ class QPaperService:
                 except LoginError as e:
                     last_err = e
                     logger.warning("QP download login failed for roll=%s: %r", roll, e)
+                    if user_id:
+                        from app.nitris.job_handlers import _mark_credentials_invalid
+                        await _mark_credentials_invalid(user_id, str(e))
                     continue
                 except Exception as e:
                     last_err = e

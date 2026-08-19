@@ -70,6 +70,23 @@ class InboxRepository:
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
 
+    async def get_by_portal_message_ids(
+        self, user_id: int, portal_message_ids: list[int]
+    ) -> list[InboxMessage]:
+        """Fetch all messages matching a set of portal message IDs for a user."""
+        if not portal_message_ids:
+            return []
+        stmt = (
+            select(InboxMessage)
+            .where(
+                InboxMessage.user_id == user_id,
+                InboxMessage.portal_message_id.in_(portal_message_ids),
+            )
+            .order_by(InboxMessage.id.desc())
+        )
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
     async def update_message_body(
         self, message_id: int, body: str, attachment_url: Optional[str]
     ) -> None:

@@ -2292,7 +2292,7 @@ async def cmd_status(message: types.Message):
                 sql_text("SELECT COUNT(*) FROM events WHERE sent=false AND permanent_failure=false")
             )).scalar()
             stuck_qps = (await session.execute(
-                sql_text("SELECT COUNT(*) FROM question_paper_caches WHERE status='fetch_in_progress' AND lease_expires_at < NOW()")
+                sql_text("SELECT COUNT(*) FROM question_paper_caches WHERE status='fetch_in_progress' AND (lease_expires_at < NOW() OR (lease_expires_at IS NULL AND acquired_at < NOW() - INTERVAL '5 minutes'))")
             )).scalar()
             perm_failed = (await session.execute(
                 sql_text("SELECT COUNT(*) FROM question_paper_caches WHERE status='permanent_failure'")
