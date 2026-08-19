@@ -424,6 +424,8 @@ async def process_password(message: types.Message, state: FSMContext):
         )
         return
 
+    is_new_user = False  # Track for admin notification (True ONLY in create_user branch)
+
     try:
         async with get_db_session() as session:
             async with session.begin():
@@ -432,9 +434,11 @@ async def process_password(message: types.Message, state: FSMContext):
                 if existing_user:
                     await user_repo.update_credentials(existing_user.id, roll, password)
                     user_id = existing_user.id
+                    is_new_user = False
                 else:
                     new_user = await user_repo.create_user(telegram_id, roll, password)
                     user_id = new_user.id
+                    is_new_user = True
                     
                 snapshot_service = SnapshotService(session)
                 await snapshot_service.create_snapshot_if_changed(
@@ -487,6 +491,19 @@ async def process_password(message: types.Message, state: FSMContext):
         logger.error("Failed to complete database updates during registration: %r", e)
         await status_msg.edit_text("❌ A database error occurred during registration. Please use /start to retry.")
         await state.clear()
+
+    # ── Admin notification (additive, fire-and-forget) ───────────────────
+    # Fires ONLY when a brand-new user registers (not on /forgot or credential updates).
+    # Wrapped in its own try/except so notification failure never affects user.
+    if is_new_user and roll:
+        try:
+            from app.bot.handlers.admin_notify import notify_admins_of_new_user
+            await notify_admins_of_new_user(message.bot, roll)
+        except Exception as notify_err:
+            logger.warning(
+                "Admin new-user notification failed (registration succeeded for roll=%s): %r",
+                roll, notify_err,
+            )
 
 
 @dp.message(Deregistration.waiting_for_confirm)
