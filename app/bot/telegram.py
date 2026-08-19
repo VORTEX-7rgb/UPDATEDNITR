@@ -2320,9 +2320,19 @@ async def cmd_status(message: types.Message):
             available_qps = (await session.execute(
                 sql_text("SELECT COUNT(*) FROM question_paper_caches WHERE status='paper_available'")
             )).scalar()
+
+            # User activity stats (DAU/WAU/MAU, signup trend, sync health)
+            from app.bot.handlers.admin_stats import fetch_user_activity_stats
+            user_activity_stats = await fetch_user_activity_stats(session)
     except Exception as e:
         logger.error("Failed to fetch DB stats: %r", e)
         user_count = valid_creds = pending_events = stuck_qps = perm_failed = available_qps = "ERROR"
+        user_activity_stats = {}
+
+    from app.bot.handlers.admin_stats import format_user_activity_section
+    user_activity_section = format_user_activity_section(
+        user_activity_stats, user_count, valid_creds,
+    )
     
     circuit_emoji = {
         "closed": "🟢",
@@ -2348,6 +2358,7 @@ async def cmd_status(message: types.Message):
         f"👥 <b>Users</b>\n"
         f"  Total: {user_count}\n"
         f"  Valid creds: {valid_creds}\n\n"
+        f"{user_activity_section}\n"
         f"📬 <b>Events</b>\n"
         f"  Pending dispatch: {pending_events}\n\n"
         f"📚 <b>QP Cache</b>\n"
