@@ -42,7 +42,7 @@ from app.nitris.exceptions import (
 )
 from app.services.attendance_service import get_attendance_data
 from app.services.snapshot_service import SnapshotService
-from app.workers.sync_worker import sync_messages_for_user
+from app.workers.sync_worker import prepare_inbox_sync, persist_inbox_sync
 from app.utils import esc
 
 from aiogram.enums import ParseMode
@@ -205,11 +205,12 @@ async def handle_inbox_refresh(job: NitrisJob) -> dict:
             client = NitrisClient()
             try:
                 await nitris_gateway.login_through_gateway(client, roll_number, password)
-                await sync_messages_for_user(
-                    user_id, roll_number, password, _bot, client=client
-                )
+                scraped, detail_cache, existing_by_id = await prepare_inbox_sync(client, user_id)
             finally:
                 await client.close()
+
+        # DB write -- OUTSIDE the gateway lock (lease boundary fix)
+        await persist_inbox_sync(user_id, scraped, detail_cache, existing_by_id)
 
         return {"success": True, "error": None}
 
