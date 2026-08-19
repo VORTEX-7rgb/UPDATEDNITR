@@ -64,14 +64,15 @@ async def test_gateway_concurrency_cap():
 async def test_gateway_circuit_opens_on_errors():
     """Circuit opens after threshold consecutive errors."""
     from app.nitris.gateway import nitris_gateway, CircuitState
+    from app.nitris.exceptions import NitrisError
     nitris_gateway._reset_metrics_for_testing()
     
     # Trigger errors by raising inside acquire()
     for _ in range(10):
         try:
             async with nitris_gateway.acquire():
-                raise Exception("test error")
-        except Exception:
+                raise NitrisError("test error")
+        except NitrisError:
             pass
     
     assert nitris_gateway._metrics.circuit_state == CircuitState.OPEN
@@ -82,14 +83,15 @@ async def test_gateway_circuit_opens_on_errors():
 async def test_gateway_rejects_fast_when_open():
     """When circuit is OPEN, acquire() rejects immediately."""
     from app.nitris.gateway import nitris_gateway, NitrisCircuitOpenError
+    from app.nitris.exceptions import NitrisError
     nitris_gateway._reset_metrics_for_testing()
     
     # Open the circuit
     for _ in range(10):
         try:
             async with nitris_gateway.acquire():
-                raise Exception("test")
-        except Exception:
+                raise NitrisError("test")
+        except NitrisError:
             pass
     
     # Now acquire() should reject immediately

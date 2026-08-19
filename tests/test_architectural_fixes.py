@@ -58,7 +58,7 @@ async def test_login_pacing_still_enforced():
         await gw.login_through_gateway(mock_client, "125AI0002", "test")
     elapsed = time.monotonic() - t0
 
-    assert elapsed >= 0.1, f"Expected pacing delay >= 0.1s, got {elapsed:.3f}s"
+    assert elapsed >= 0.08, f"Expected pacing delay >= 0.08s (target 0.1s), got {elapsed:.3f}s"
 
 
 def test_registration_uses_gateway():

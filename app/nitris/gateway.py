@@ -16,6 +16,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, AsyncGenerator
+import httpx
 
 from app.config import config
 from app.nitris.exceptions import NitrisError, LoginError, SessionExpiredError
@@ -159,9 +160,24 @@ class NitrisGateway:
             # Success path
             await self._record_success(is_login, time.monotonic() - start_time)
 
-        except Exception as exc:
-            # Error path
+        except LoginError:
+            # Credential errors are user faults — don't trip the NITRIS circuit
+            raise
+
+        except NitrisError as exc:
+            # NITRIS-related errors (SessionExpired, Workflow, InvalidContext, etc.)
+            # These DO trip the circuit breaker
             await self._record_error(exc)
+            raise
+
+        except (httpx.TransportError, httpx.TimeoutException) as exc:
+            # Network-level failures to reach NITRIS — trip the circuit
+            await self._record_error(exc)
+            raise
+
+        except Exception:
+            # Non-NITRIS errors (DB failures, Telegram errors, bugs)
+            # These do NOT trip the NITRIS circuit breaker
             raise
 
         finally:

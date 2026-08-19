@@ -1542,7 +1542,8 @@ from app.db.repositories.snapshot_repository import SnapshotRepository
 from app.db.models import QuestionPaperCache
 
 YEAR_MAP = {
-    "2526S": "2025-26/Spring",
+    "2526A": "2025-26/Spring",
+    "2526S": "2025-26/Autumn",
     "2425S": "2024-25/Spring",
     "2425A": "2024-25/Autumn",
     "2324S": "2023-24/Spring",
@@ -1810,12 +1811,27 @@ async def handle_paper_download(callback: types.CallbackQuery, state: FSMContext
     telegram_id = callback.from_user.id
     cache_id = int(callback.data.split("_")[-1])
 
+    # Check if paper is already available in cache for instant delivery
+    snap = await qpaper_service._read_cache(cache_id)
+    is_cached = snap and snap[0] == "paper_available" and snap[1]
+
+    if is_cached:
+        try:
+            await callback.answer("🚀 Delivering cached paper...")
+        except Exception:
+            pass
+        result: QPResult = await qpaper_service.deliver(cache_id, telegram_id)
+        if not result.delivered:
+            status_msg = await callback.message.answer("⚠️ Processing paper...")
+            await _present_qp_result(status_msg, result)
+        return
+
     try:
-        await callback.answer("⏳ Fetching paper...")
+        await callback.answer("⏳ Fetching from portal...")
     except Exception:
         pass
 
-    status_msg = await callback.message.answer("⏳ Resolving paper...")
+    status_msg = await callback.message.answer("⏳ Acquiring paper from NITRIS portal...")
     result: QPResult = await qpaper_service.deliver(cache_id, telegram_id)
     await _present_qp_result(status_msg, result)
 
@@ -1932,7 +1948,7 @@ async def handle_qp_download_all_year(callback: types.CallbackQuery, state: FSMC
                     payload={
                         "academic_year": selected_year,
                         "subject_code": sub_code,
-                        "roll_number": roll_number,
+                        "roll_number": user.roll_number,
                     },
                     timeout=90.0,
                 )

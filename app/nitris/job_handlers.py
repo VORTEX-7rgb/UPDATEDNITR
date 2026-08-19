@@ -88,56 +88,31 @@ async def handle_attendance_refresh(job: NitrisJob) -> dict:
     callback_chat_id = job.payload.get("callback_chat_id")
     callback_message_id = job.payload.get("callback_message_id")
 
-    # ── Step 1: Acquire gateway slot ────────────────────────────────
+    # ── Step 1: DB lookup (encrypted credential) — OUTSIDE gateway ────
+    async with async_session_factory() as session:
+        user = await session.get(User, user_id)
+        if not user:
+            return {"success": False, "error": "User not found", "data": None}
+        if not user.credentials_valid:
+            return {
+                "success": False,
+                "error": "Credentials marked invalid. Please /forgot to update.",
+                "data": None,
+            }
+        roll_number = user.roll_number
+        encrypted_password = user.encrypted_password
+
+    # ── Step 2: NITRIS work (decrypt + login + HTTP) — INSIDE gateway ──
     try:
         async with nitris_gateway.acquire():
-            # ── Step 2: Look up user + decrypt password (INSIDE gateway) ──
-            async with async_session_factory() as session:
-                user = await session.get(User, user_id)
-                if not user:
-                    return {"success": False, "error": "User not found", "data": None}
-                if not user.credentials_valid:
-                    return {
-                        "success": False,
-                        "error": "Credentials marked invalid. Please /forgot to update.",
-                        "data": None,
-                    }
-                roll_number = user.roll_number
-                password = decrypt_password(user.encrypted_password)
-
-            # ── Step 3: NITRIS login + attendance fetch ───────────────
+            password = decrypt_password(encrypted_password)
             client = NitrisClient()
             try:
                 await nitris_gateway.login_through_gateway(client, roll_number, password)
                 data = await get_attendance_data(roll_number, password, client=client)
             finally:
                 await client.close()
-
-            # password goes out of scope here
-
-            # ── Step 4: Save snapshot + fire events ───────────────────
-            try:
-                async with get_db_session() as session:
-                    async with session.begin():
-                        snapshot_service = SnapshotService(session)
-                        await snapshot_service.create_snapshot_if_changed(
-                            user_id=user_id,
-                            module_name="attendance",
-                            attendance_result=data,
-                        )
-                # Update sync_state to reflect this manual refresh
-                await _update_sync_state(user_id, success=True)
-            except Exception as e:
-                logger.error("Failed to save attendance snapshot: %r", e)
-                # Don't fail the whole job — we still have fresh data to show
-
-            return {
-                "success": True,
-                "data": data,
-                "error": None,
-                "callback_chat_id": callback_chat_id,
-                "callback_message_id": callback_message_id,
-            }
+                # password drops out of scope here
 
     except NitrisCircuitOpenError as e:
         await _edit_callback_message(
@@ -170,16 +145,29 @@ async def handle_attendance_refresh(job: NitrisJob) -> dict:
         )
         return {"success": False, "error": str(e), "data": None}
 
+    # ── Step 3: Save snapshot + fire events — OUTSIDE gateway slot ───
+    try:
+        async with get_db_session() as session:
+            async with session.begin():
+                snapshot_service = SnapshotService(session)
+                await snapshot_service.create_snapshot_if_changed(
+                    user_id=user_id,
+                    module_name="attendance",
+                    attendance_result=data,
+                )
+        # Update sync_state to reflect this manual refresh
+        await _update_sync_state(user_id, success=True)
     except Exception as e:
-        logger.error("attendance_refresh job failed: %r", e)
-        await _update_sync_state(user_id, success=False, error_msg=str(e))
-        await _edit_callback_message(
-            callback_chat_id, callback_message_id,
-            f"❌ <b>Unexpected error.</b>\n\n"
-            f"Please try again later.\n\n"
-            f"<i>Error: {html.escape(str(e)[:200])}</i>",
-        )
-        return {"success": False, "error": str(e), "data": None}
+        logger.error("Failed to save attendance snapshot: %r", e)
+        # Don't fail the whole job — we still have fresh data to show
+
+    return {
+        "success": True,
+        "data": data,
+        "error": None,
+        "callback_chat_id": callback_chat_id,
+        "callback_message_id": callback_message_id,
+    }
 
 
 # ── Handler: inbox_refresh ──────────────────────────────────────────
@@ -305,80 +293,48 @@ async def handle_inbox_detail_fetch(job: NitrisJob) -> dict:
     if not message_id:
         return {"success": False, "error": "message_id required"}
 
+    # ── Step 1: Look up user & token — OUTSIDE gateway ─────────────────
+    async with async_session_factory() as session:
+        user = await session.get(User, user_id)
+        if not user:
+            return {"success": False, "error": "User not found"}
+        if not user.credentials_valid:
+            return {"success": False, "error": "Credentials invalid"}
+        roll_number = user.roll_number
+        encrypted_password = user.encrypted_password
+
+        # Load the message to get its token
+        from sqlalchemy import select as sa_select
+        stmt = sa_select(InboxMessage).where(
+            InboxMessage.id == message_id,
+            InboxMessage.user_id == user_id,
+        )
+        msg = (await session.execute(stmt)).scalar_one_or_none()
+        if not msg:
+            return {"success": False, "error": "Message not found"}
+        token = msg.token
+
+    # ── Step 2: NITRIS work — INSIDE gateway slot ───────────────────────
+    real_token = None
+    detail_data = None
     try:
         async with nitris_gateway.acquire():
-            async with async_session_factory() as session:
-                user = await session.get(User, user_id)
-                if not user:
-                    return {"success": False, "error": "User not found"}
-                if not user.credentials_valid:
-                    return {"success": False, "error": "Credentials invalid"}
-                roll_number = user.roll_number
-                password = decrypt_password(user.encrypted_password)
-
-                # Load the message to get its token
-                from sqlalchemy import select as sa_select
-                stmt = sa_select(InboxMessage).where(
-                    InboxMessage.id == message_id,
-                    InboxMessage.user_id == user_id,
-                )
-                msg = (await session.execute(stmt)).scalar_one_or_none()
-                if not msg:
-                    return {"success": False, "error": "Message not found"}
-                token = msg.token
-
+            password = decrypt_password(encrypted_password)
             client = NitrisClient()
             try:
                 await nitris_gateway.login_through_gateway(client, roll_number, password)
-
                 from app.nitris.parser import parse_message_detail_html
 
                 if token.startswith("postback:"):
                     event_target = token.split("postback:")[1]
                     real_token, detail_html = await client.submit_message_postback(event_target)
                     detail_data = parse_message_detail_html(detail_html)
-
-                    from app.nitris.parser import extract_message_id
-                    portal_id = extract_message_id(real_token)
-
-                    async with get_db_session() as update_session:
-                        async with update_session.begin():
-                            from sqlalchemy import update as sqlalchemy_update
-                            update_values = {
-                                "token": real_token,
-                                "body": detail_data["body"],
-                                "attachment_url": detail_data["attachment_url"],
-                            }
-                            if portal_id:
-                                update_values["portal_message_id"] = portal_id
-                            stmt = (
-                                sqlalchemy_update(InboxMessage)
-                                .where(InboxMessage.id == message_id)
-                                .values(**update_values)
-                            )
-                            await update_session.execute(stmt)
                 else:
                     detail_html = await client.fetch_message_detail(token)
                     detail_data = parse_message_detail_html(detail_html)
-
-                    async with get_db_session() as update_session:
-                        async with update_session.begin():
-                            from app.db.repositories.inbox_repository import InboxRepository
-                            up_inbox_repo = InboxRepository(update_session)
-                            await up_inbox_repo.update_message_body(
-                                message_id=message_id,
-                                body=detail_data["body"],
-                                attachment_url=detail_data["attachment_url"],
-                            )
             finally:
                 await client.close()
-
-        return {
-            "success": True,
-            "body": detail_data["body"],
-            "attachment_url": detail_data["attachment_url"],
-        }
-
+                # password drops out of scope here
     except NitrisCircuitOpenError as e:
         return {"success": False, "error": str(e)}
     except LoginError as e:
@@ -387,6 +343,44 @@ async def handle_inbox_detail_fetch(job: NitrisJob) -> dict:
     except Exception as e:
         logger.error("inbox_detail_fetch job failed: %r", e)
         return {"success": False, "error": str(e)}
+
+    # ── Step 3: DB update — OUTSIDE gateway slot ────────────────────────
+    try:
+        async with get_db_session() as update_session:
+            async with update_session.begin():
+                if token.startswith("postback:") and real_token:
+                    from app.nitris.parser import extract_message_id
+                    portal_id = extract_message_id(real_token)
+                    from sqlalchemy import update as sqlalchemy_update
+                    update_values = {
+                        "token": real_token,
+                        "body": detail_data["body"],
+                        "attachment_url": detail_data["attachment_url"],
+                    }
+                    if portal_id:
+                        update_values["portal_message_id"] = portal_id
+                    stmt = (
+                        sqlalchemy_update(InboxMessage)
+                        .where(InboxMessage.id == message_id)
+                        .values(**update_values)
+                    )
+                    await update_session.execute(stmt)
+                else:
+                    from app.db.repositories.inbox_repository import InboxRepository
+                    up_inbox_repo = InboxRepository(update_session)
+                    await up_inbox_repo.update_message_body(
+                        message_id=message_id,
+                        body=detail_data["body"],
+                        attachment_url=detail_data["attachment_url"],
+                    )
+    except Exception as e:
+        logger.error("Failed updating inbox message in DB: %r", e)
+
+    return {
+        "success": True,
+        "body": detail_data["body"] if detail_data else "",
+        "attachment_url": detail_data["attachment_url"] if detail_data else None,
+    }
 
 
 # ── Handler: attachment_download (Phase 6) ──────────────────────────

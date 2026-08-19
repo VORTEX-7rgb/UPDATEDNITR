@@ -6,6 +6,7 @@ import time
 import pytest
 
 from app.nitris.gateway import NitrisGateway, CircuitState, CircuitBreakerOpenError
+from app.nitris.exceptions import AttendanceWorkflowError, NitrisError
 from app.nitris.job_queue import NitrisJobQueue, JobPriority
 from app.nitris.rate_limiter import check_and_set_cooldown, clear_cooldown, get_active_cooldowns_count
 from app.bot.telegram import format_attendance_message_from_snapshot
@@ -47,8 +48,8 @@ async def test_gateway_concurrency_and_downward_adaptation():
     for _ in range(3):
         try:
             async with gw.acquire():
-                raise RuntimeError("503 Service Unavailable")
-        except RuntimeError:
+                raise AttendanceWorkflowError("503 Service Unavailable")
+        except AttendanceWorkflowError:
             pass
 
     assert gw.current_max_concurrent == 3
@@ -57,8 +58,8 @@ async def test_gateway_concurrency_and_downward_adaptation():
     for _ in range(2):
         try:
             async with gw.acquire():
-                raise RuntimeError("503 Service Unavailable")
-        except RuntimeError:
+                raise AttendanceWorkflowError("503 Service Unavailable")
+        except AttendanceWorkflowError:
             pass
 
     assert gw.circuit_state == CircuitState.OPEN
@@ -77,7 +78,9 @@ async def test_gateway_circuit_breaker_open_rejects_fast():
     for _ in range(2):
         try:
             async with gw.acquire():
-                raise RuntimeError("Portal Error")
+                raise AttendanceWorkflowError("Portal Error")
+        except AttendanceWorkflowError:
+            pass
         except RuntimeError:
             pass
 
