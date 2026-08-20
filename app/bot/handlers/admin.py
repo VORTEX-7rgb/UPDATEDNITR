@@ -1,14 +1,18 @@
 """Admin-only commands: system status and QP cache reset."""
 
 import logging
+import asyncio
 import html
 
 from aiogram import Router, types
 from aiogram.filters import Command, StateFilter
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramAPIError
+from sqlalchemy import select
 
 from app.config import config
 from app.db.database import get_db_session
+from app.db.models import User
 from app.utils import esc
 
 logger = logging.getLogger(__name__)
@@ -163,3 +167,143 @@ async def cmd_admin_reset_qp(message: types.Message):
     except Exception as e:
         logger.error("admin_reset_qp failed: %r", e)
         await message.answer(f"❌ Failed: {html.escape(str(e))}")
+
+
+# --- Broadcast ---
+
+BROADCAST_MAX_RETRIES = 3      # per-user FloodWait/transient retries
+BROADCAST_PACING_SECONDS = 0.05  # ~20 msg/s, under Telegram's ~30/s global limit
+BROADCAST_MAX_LEN = 4000        # Telegram hard limit is 4096; leave headroom
+BROADCAST_PROGRESS_EVERY = 250  # edit status message every N sends
+
+
+async def _send_broadcast_one(bot, telegram_id: int, text: str) -> str:
+    """Send one plain-text broadcast message.
+
+    Returns a status string: 'ok' | 'blocked' | 'inactive' | 'failed'.
+    Mirrors the FloodWait/blocked/deactivated handling already used by
+    EventDispatcherService._send_with_retry, but for plain text.
+    """
+    for attempt in range(BROADCAST_MAX_RETRIES):
+        try:
+            await bot.send_message(chat_id=telegram_id, text=text)
+            return "ok"
+        except TelegramRetryAfter as e:
+            if attempt + 1 >= BROADCAST_MAX_RETRIES:
+                logger.warning("Broadcast floodwait exhausted for %d", telegram_id)
+                return "failed"
+            logger.warning("Broadcast FloodWait to %d: %ds — backing off", telegram_id, e.retry_after)
+            await asyncio.sleep(e.retry_after + 0.5)
+        except TelegramForbiddenError:
+            return "blocked"
+        except TelegramAPIError as e:
+            msg = str(e).lower()
+            if "chat not found" in msg or "deactivated" in msg:
+                return "inactive"
+            if attempt + 1 >= BROADCAST_MAX_RETRIES:
+                return "failed"
+            await asyncio.sleep(1.0 * (attempt + 1))
+    return "failed"
+
+
+async def _run_broadcast(
+    bot, telegram_ids: list[int], text: str,
+    status_chat_id: int, status_message_id: int,
+) -> None:
+    """Background worker: fan out the broadcast and report a final summary.
+
+    Runs sequentially (no event-loop flooding), closes over no DB session,
+    and never raises — so a failure in one send can't kill the whole run.
+    """
+    sent = blocked = inactive = failed = 0
+    total = len(telegram_ids)
+
+    for idx, tid in enumerate(telegram_ids, start=1):
+        status = await _send_broadcast_one(bot, tid, text)
+        if status == "ok":
+            sent += 1
+        elif status == "blocked":
+            blocked += 1
+        elif status == "inactive":
+            inactive += 1
+        else:
+            failed += 1
+
+        if idx % BROADCAST_PROGRESS_EVERY == 0:
+            try:
+                await bot.edit_message_text(
+                    chat_id=status_chat_id,
+                    message_id=status_message_id,
+                    text=(
+                        f"📣 <b>Broadcasting…</b> {idx}/{total}\n"
+                        f"✅ {sent} · 🚫 {blocked} · 👤 {inactive} · ❌ {failed}"
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+
+        # Gentle pacing under Telegram's global ~30 msg/s bot limit.
+        await asyncio.sleep(BROADCAST_PACING_SECONDS)
+
+    summary = (
+        f"✅ <b>Broadcast complete</b>\n\n"
+        f"📨 Delivered: <b>{sent}</b>/{total}\n"
+        f"🚫 Blocked the bot: <b>{blocked}</b>\n"
+        f"👤 Inactive/deleted: <b>{inactive}</b>\n"
+        f"❌ Failed: <b>{failed}</b>"
+    )
+    try:
+        await bot.edit_message_text(
+            chat_id=status_chat_id, message_id=status_message_id,
+            text=summary, parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        try:
+            await bot.send_message(status_chat_id, summary, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            logger.error("Failed to deliver broadcast summary to admin %d: %r", status_chat_id, e)
+
+
+@router.message(Command("broadcast"), StateFilter("*"))
+async def cmd_broadcast(message: types.Message):
+    """Admin command: send a plain-text message to all registered users."""
+    if not is_admin(message.from_user.id):
+        return
+
+    args = message.text.strip().split(maxsplit=1)
+    if len(args) < 2 or not args[1].strip():
+        await message.answer(
+            "Usage: <code>/broadcast &lt;message text&gt;</code>\n\n"
+            "Sends the message to <b>ALL</b> registered users as plain text.\n"
+            "Runs in the background and reports a summary when done.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    text = args[1].strip()
+    if len(text) > BROADCAST_MAX_LEN:
+        text = text[:BROADCAST_MAX_LEN]
+
+    # Fetch IDs in a SHORT DB session, then close it before any network send.
+    async with get_db_session() as session:
+        rows = (await session.execute(select(User.telegram_id))).scalars().all()
+    telegram_ids = list(rows)
+
+    if not telegram_ids:
+        await message.answer("⚠️ No registered users to broadcast to.")
+        return
+
+    status_msg = await message.answer(
+        f"📣 <b>Broadcast started</b>\n\n"
+        f"👥 Target: <b>{len(telegram_ids)}</b> users\n"
+        f"⏳ Running in background — this message updates with progress.",
+        parse_mode=ParseMode.HTML,
+    )
+
+    asyncio.create_task(
+        _run_broadcast(
+            message.bot, telegram_ids, text,
+            status_msg.chat.id, status_msg.message_id,
+        )
+    )
