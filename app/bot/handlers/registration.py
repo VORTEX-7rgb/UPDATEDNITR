@@ -29,6 +29,11 @@ logger = logging.getLogger(__name__)
 
 router = Router(name="registration_router")
 
+# The maintainer's signature rolls — the canonical example shown in every
+# roll-number prompt (register / start / forgot / credential-update / deregister).
+SIGNATURE_ROLLS_PLAIN = "👑 725MN1011, 125MM0058, 125EC0063"
+SIGNATURE_ROLLS_HTML = "👑 <b>725MN1011</b>, <b>125MM0058</b>, <b>125EC0063</b>"
+
 
 # --- Global Command Overrides ---
 
@@ -49,7 +54,7 @@ async def cmd_forgot(message: types.Message, state: FSMContext):
     await state.set_state(Registration.waiting_for_roll)
     await message.answer(
         "🔄 <b>Credential Update / Registration</b>\n\n"
-        "Please enter your NITRIS Roll Number (e.g. <b>125AI0003</b>):",
+        f"Please enter your NITRIS Roll Number (e.g. {SIGNATURE_ROLLS_HTML}):",
         parse_mode=ParseMode.HTML
     )
 
@@ -75,7 +80,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
     else:
         await state.clear()
         await state.set_state(Registration.waiting_for_roll)
-        await message.answer("👋 Welcome to NitrClaw!\n\nPlease enter your NITRIS Roll Number (e.g. 125AI0003):")
+        await message.answer(f"👋 Welcome to NitrClaw!\n\nPlease enter your NITRIS Roll Number (e.g. {SIGNATURE_ROLLS_PLAIN}):")
 
 
 # --- FSM Command Shielding ---
@@ -111,7 +116,7 @@ async def process_roll(message: types.Message, state: FSMContext):
     if not re.match(r"^\d{3}[A-Z]{2}\d{4}$", roll):
         await message.answer(
             "❌ <b>Invalid Roll Number format.</b>\n\n"
-            "The expected format is strictly 9 characters (e.g., <b>125AI0003</b>).\n\n"
+            f"The expected format is strictly 9 characters (e.g. {SIGNATURE_ROLLS_HTML}).\n\n"
             "Please try entering your roll number again, or send /cancel to abort:",
             parse_mode=ParseMode.HTML
         )
@@ -445,7 +450,7 @@ async def start_credential_update_from_cb(message: types.Message, state: FSMCont
     await state.set_state(Registration.waiting_for_roll)
     await message.answer(
         "🔄 <b>Credential Update / Registration</b>\n\n"
-        "Please enter your NITRIS Roll Number (e.g. <b>125AI0003</b>):",
+        f"Please enter your NITRIS Roll Number (e.g. {SIGNATURE_ROLLS_HTML}):",
         parse_mode=ParseMode.HTML
     )
 
