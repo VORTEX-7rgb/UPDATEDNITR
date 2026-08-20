@@ -38,12 +38,12 @@ class AttachmentStatus(str, Enum):
     acquisition + concurrent request collapse + stale-lock recovery.
 
     State transitions (all atomic via UPDATE...WHERE status=...):
-      [none]                       → fetch_in_progress    (first claim)
+      [none]                       → retryable_failure    (row inserted on cold start)
+      retryable_failure            → fetch_in_progress    (claimed for acquisition)
       fetch_in_progress            → available             (download+upload succeeded)
       fetch_in_progress            → not_available         (NITRIS confirmed 404)
       fetch_in_progress            → retryable_failure     (transient error)
       fetch_in_progress            → permanent_failure    (exhausted retries or hard error)
-      retryable_failure            → fetch_in_progress    (re-claim on next request)
       fetch_in_progress(stale)     → fetch_in_progress    (stale-lock reaper, >5 min)
     """
     AVAILABLE = "available"
@@ -316,7 +316,7 @@ class AttachmentCache(Base):
     # State machine (mirrors QuestionPaperCache)
     status: Mapped[str] = mapped_column(
         String(30), nullable=False,
-        default=AttachmentStatus.FETCH_IN_PROGRESS.value, index=True,
+        default=AttachmentStatus.RETRYABLE_FAILURE.value, index=True,
     )
     acquired_by: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     acquired_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)

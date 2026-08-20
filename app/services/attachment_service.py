@@ -157,10 +157,24 @@ class AttachmentService:
         status, file_id, file_kind = await self._read_cache(cache_id)
 
         if status == AttachmentStatus.AVAILABLE.value and file_id:
-            delivered = await self._deliver_cached(
-                cache_id, telegram_id, file_id, canonical_path, subject
+            return await self._deliver_cached(
+                cache_id=cache_id,
+                telegram_id=telegram_id,
+                telegram_file_id=file_id,
+                canonical_path=canonical_path,
+                subject=subject,
+                file_kind=file_kind,
+                recover_callback=lambda: self._claim_or_wait_and_deliver(
+                    cache_id=cache_id,
+                    attachment_url=attachment_url,
+                    canonical_path=canonical_path,
+                    telegram_id=telegram_id,
+                    source_user_id=source_user_id,
+                    source_roll_number=source_roll_number,
+                    encrypted_password=encrypted_password,
+                    subject=subject,
+                ),
             )
-            return AttachmentResult(delivered=delivered, file_kind=file_kind, cache_id=cache_id)
 
         if status == AttachmentStatus.NOT_AVAILABLE.value:
             return AttachmentResult(not_available=True, cache_id=cache_id)
@@ -184,7 +198,7 @@ class AttachmentService:
         )
 
     async def _find_or_create_cache_row(self, canonical_path: str) -> int:
-        """Find existing cache ID or insert a new one atomically."""
+        """Find existing cache ID or insert a new one atomically using PostgreSQL ON CONFLICT."""
         async with self.session_factory() as session:
             stmt = select(AttachmentCache.id).where(
                 AttachmentCache.attachment_path == canonical_path
@@ -195,21 +209,33 @@ class AttachmentService:
 
         async with self.session_factory() as session:
             async with session.begin():
+                insert_stmt = sql_text("""
+                    INSERT INTO attachment_caches (attachment_path, status, attempt_count)
+                    VALUES (:path, :status, 0)
+                    ON CONFLICT (attachment_path) DO NOTHING
+                    RETURNING id
+                """)
+                res = await session.execute(
+                    insert_stmt,
+                    {
+                        "path": canonical_path,
+                        "status": AttachmentStatus.RETRYABLE_FAILURE.value,
+                    },
+                )
+                inserted_id = res.scalar_one_or_none()
+                if inserted_id:
+                    return inserted_id
+
+                # Another worker won the insert race — re-select the winning row
                 stmt = select(AttachmentCache.id).where(
                     AttachmentCache.attachment_path == canonical_path
                 )
                 row = (await session.execute(stmt)).scalar_one_or_none()
                 if row:
                     return row
-
-                new_cache = AttachmentCache(
-                    attachment_path=canonical_path,
-                    status=AttachmentStatus.RETRYABLE_FAILURE.value,
-                    attempt_count=0,
+                raise RuntimeError(
+                    f"Failed to find or create attachment cache row for path: {canonical_path}"
                 )
-                session.add(new_cache)
-                await session.flush()
-                return new_cache.id
 
     async def _read_cache(self, cache_id: int) -> tuple[str, Optional[str], Optional[str]]:
         """Read (status, telegram_file_id, file_kind) for a cache_id."""
@@ -340,10 +366,14 @@ class AttachmentService:
             if uploaded_to_user:
                 return AttachmentResult(delivered=True, file_kind=kind, cache_id=cache_id)
 
-            delivered = await self._deliver_cached(
-                cache_id, telegram_id, telegram_file_id, canonical_path, subject
+            return await self._deliver_cached(
+                cache_id=cache_id,
+                telegram_id=telegram_id,
+                telegram_file_id=telegram_file_id,
+                canonical_path=canonical_path,
+                subject=subject,
+                file_kind=kind,
             )
-            return AttachmentResult(delivered=delivered, file_kind=kind, cache_id=cache_id)
 
     async def _nitris_download(
         self,
@@ -509,10 +539,14 @@ class AttachmentService:
             status, file_id, file_kind = await self._read_cache(cache_id)
 
             if status == AttachmentStatus.AVAILABLE.value and file_id:
-                delivered = await self._deliver_cached(
-                    cache_id, telegram_id, file_id, canonical_path, subject
+                return await self._deliver_cached(
+                    cache_id=cache_id,
+                    telegram_id=telegram_id,
+                    telegram_file_id=file_id,
+                    canonical_path=canonical_path,
+                    subject=subject,
+                    file_kind=file_kind,
                 )
-                return AttachmentResult(delivered=delivered, file_kind=file_kind, cache_id=cache_id)
 
             if status == AttachmentStatus.NOT_AVAILABLE.value:
                 return AttachmentResult(not_available=True, cache_id=cache_id)
@@ -536,11 +570,14 @@ class AttachmentService:
         telegram_file_id: str,
         canonical_path: str,
         subject: str,
-    ) -> bool:
-        """Forward cached Telegram file_id to user with FloodWait handling and invalid file_id auto-recovery."""
+        file_kind: Optional[str] = None,
+        recover_callback: Optional[Callable[[], Any]] = None,
+    ) -> AttachmentResult:
+        """Forward cached Telegram file_id to user with FloodWait budget and invalid file_id auto-recovery."""
         async with self._get_deliver_sem():
             caption = f"📎 <b>Attachment:</b> {subject[:60]}" if subject else "📎 <b>Notice Attachment</b>"
             delay = self.delivery_retry_base_delay
+            fw_attempts = 0
 
             for attempt in range(self.delivery_max_retries):
                 try:
@@ -549,25 +586,41 @@ class AttachmentService:
                         document=telegram_file_id,
                         caption=caption,
                     )
-                    return True
+                    return AttachmentResult(delivered=True, file_kind=file_kind, cache_id=cache_id)
                 except TelegramRetryAfter as e:
-                    logger.warning("AttachmentService: FloodWait %ds for chat %d", e.retry_after, telegram_id)
+                    fw_attempts += 1
+                    if fw_attempts > self.floodwait_max_retries:
+                        logger.warning(
+                            "AttachmentService: FloodWait exhausted (%d/%d) for chat %d",
+                            fw_attempts, self.floodwait_max_retries, telegram_id
+                        )
+                        return AttachmentResult(
+                            error=f"Telegram rate-limited ({e.retry_after}s). Please retry.",
+                            cache_id=cache_id,
+                        )
+                    logger.warning(
+                        "AttachmentService: FloodWait %ds for chat %d (retry %d/%d)",
+                        e.retry_after, telegram_id, fw_attempts, self.floodwait_max_retries
+                    )
                     await asyncio.sleep(e.retry_after + 0.5)
                 except TelegramForbiddenError:
                     logger.warning("AttachmentService: bot blocked by user %d", telegram_id)
-                    return False
+                    return AttachmentResult(permanent=True, error="Bot was blocked by user", cache_id=cache_id)
                 except TelegramBadRequest as e:
                     err_msg = str(e).lower()
                     if "wrong file identifier" in err_msg or "file_id" in err_msg:
                         logger.warning("AttachmentService: invalid file_id for cache_id=%d — resetting cache", cache_id)
                         await self._invalidate_file_id(cache_id)
-                    return False
+                        if recover_callback:
+                            logger.info("AttachmentService: executing recovery callback for cache_id=%d", cache_id)
+                            return await recover_callback()
+                    return AttachmentResult(error=f"Telegram delivery failed: {e}", cache_id=cache_id)
                 except Exception as e:
                     logger.error("AttachmentService: send attempt %d failed: %r", attempt + 1, e)
                     if attempt < self.delivery_max_retries - 1:
                         await asyncio.sleep(delay)
                         delay *= 2
-            return False
+            return AttachmentResult(error="Delivery retry limit reached", cache_id=cache_id)
 
     async def _invalidate_file_id(self, cache_id: int) -> None:
         """Reset cache when Telegram rejects file_id."""

@@ -126,8 +126,14 @@ class Config:
 
     # Telegram storage channel for global attachments. Defaults to the QP storage
     # channel if ATTACHMENT_STORAGE_CHAT_ID is unset (shared media channel).
+    _raw_attach_chat = os.getenv("ATTACHMENT_STORAGE_CHAT_ID")
     _raw_qp_chat = os.getenv("QP_STORAGE_CHAT_ID")
-    ATTACHMENT_STORAGE_CHAT_ID = int(os.getenv("ATTACHMENT_STORAGE_CHAT_ID", str(_raw_qp_chat))) if _raw_qp_chat else 0
+    if _raw_attach_chat:
+        ATTACHMENT_STORAGE_CHAT_ID = int(_raw_attach_chat)
+    elif _raw_qp_chat:
+        ATTACHMENT_STORAGE_CHAT_ID = int(_raw_qp_chat)
+    else:
+        ATTACHMENT_STORAGE_CHAT_ID = 0
 
 
 config = Config()

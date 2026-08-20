@@ -82,6 +82,27 @@ class FakeSession:
             merged.update(params)
 
         async with self.lock:
+            # 0. INSERT ... ON CONFLICT (attachment_path) DO NOTHING RETURNING id
+            if "INSERT INTO attachment_caches" in sql and "ON CONFLICT" in sql:
+                path = merged.get("path")
+                for cid, row in self.store.items():
+                    if row.get("attachment_path") == path:
+                        return _FakeResult([])
+                new_id = max(self.store.keys(), default=0) + 1
+                self.store[new_id] = {
+                    "id": new_id,
+                    "attachment_path": path,
+                    "status": merged.get("status", AttachmentStatus.RETRYABLE_FAILURE.value),
+                    "attempt_count": 0,
+                    "telegram_file_id": None,
+                    "file_kind": None,
+                    "acquired_at": None,
+                    "acquired_by": None,
+                    "lease_expires_at": None,
+                    "error_message": None,
+                }
+                return _FakeResult([new_id])
+
             if "UPDATE attachment_caches" in sql and "SET status = 'fetch_in_progress'" in sql:
                 cid = merged.get("cache_id")
                 row = self.store.get(cid)
@@ -106,7 +127,7 @@ class FakeSession:
                 return _FakeResult([])
 
             if "attachment_caches.attachment_path =" in sql:
-                path = merged.get("attachment_path_1") or merged.get("attachment_path")
+                path = merged.get("attachment_path_1") or merged.get("attachment_path") or merged.get("path")
                 for cid, row in self.store.items():
                     if path and row.get("attachment_path") == path:
                         return _FakeResult([cid])
