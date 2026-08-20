@@ -61,6 +61,7 @@ def init_job_handlers(bot) -> None:
 
     nitris_job_queue.register_handler("attendance_refresh", handle_attendance_refresh)
     nitris_job_queue.register_handler("inbox_refresh", handle_inbox_refresh)
+    nitris_job_queue.register_handler("sync_onboarding", handle_sync_onboarding)
     nitris_job_queue.register_handler("qp_metadata_fetch", handle_qp_metadata_fetch)
     # Phase 6: additional handlers for previously-bypassed paths
     nitris_job_queue.register_handler("inbox_detail_fetch", handle_inbox_detail_fetch)
@@ -111,7 +112,7 @@ async def handle_attendance_refresh(job: NitrisJob) -> dict:
             client = NitrisClient()
             try:
                 await nitris_gateway.login_through_gateway(client, roll_number, password, user_id=user_id)
-                data = await get_attendance_data(roll_number, password, client=client)
+                data = await get_attendance_data(roll_number, password, client=client, user_id=user_id)
             finally:
                 await client.close()
                 # password drops out of scope here
@@ -224,6 +225,92 @@ async def handle_inbox_refresh(job: NitrisJob) -> dict:
     except Exception as e:
         logger.error("inbox_refresh job failed: %r", e)
         return {"success": False, "error": str(e)}
+
+
+# ── Handler: sync_onboarding (post-registration baseline prefetch) ──
+
+async def handle_sync_onboarding(job: NitrisJob) -> dict:
+    """Silent post-registration baseline sync: inbox + timetable on ONE login.
+
+    Runs in the background right after a user registers so that:
+      - the inbox cache is warm (first tap is instant), and
+      - historical messages are inserted WITHOUT "new message" notifications
+        (baseline=True), so a fresh user isn't spammed with their whole
+        NITRIS backlog.
+
+    Payload: none (user_id comes from the job). Inbox and timetable are
+    scraped/persisted independently — a failure in one can't break the other.
+    """
+    user_id = job.user_id
+
+    # ── Phase 1: DB lookup — OUTSIDE gateway ──
+    try:
+        async with async_session_factory() as session:
+            user = await session.get(User, user_id)
+            if not user or not user.credentials_valid:
+                return {"success": False, "error": "user_invalid_or_missing"}
+            roll_number = user.roll_number
+            encrypted_password = user.encrypted_password
+    except Exception as e:
+        logger.error("sync_onboarding DB lookup failed for user_id=%d: %r", user_id, e)
+        return {"success": False, "error": str(e)}
+
+    # ── Phase 2: ONE login, then scrape inbox + timetable — INSIDE gateway ──
+    scraped = detail_cache = existing_by_id = None
+    slots = None
+    try:
+        async with nitris_gateway.acquire():
+            password = decrypt_password(encrypted_password)
+            client = NitrisClient()
+            try:
+                await nitris_gateway.login_through_gateway(client, roll_number, password, user_id=user_id)
+
+                # Inbox scrape (list + recent-message details) — best-effort.
+                try:
+                    scraped, detail_cache, existing_by_id = await prepare_inbox_sync(client, user_id)
+                except Exception as e:
+                    logger.warning("sync_onboarding inbox scrape failed for user_id=%d: %r", user_id, e)
+
+                # Timetable scrape (Home.aspx) — best-effort, independent.
+                try:
+                    from app.nitris.parser import parse_home_page
+                    home_html = await client.fetch_home_html()
+                    slots = parse_home_page(home_html).timetable
+                except Exception as e:
+                    logger.warning("sync_onboarding timetable scrape failed for user_id=%d: %r", user_id, e)
+            finally:
+                await client.close()
+    except NitrisCircuitOpenError as e:
+        return {"success": False, "error": str(e)}
+    except (LoginError, CredentialsQuarantinedError) as e:
+        await on_login_failure(user_id, str(e))
+        return {"success": False, "error": f"Login failed: {e}"}
+    except Exception as e:
+        logger.error("sync_onboarding NITRIS work failed for user_id=%d: %r", user_id, e)
+        return {"success": False, "error": str(e)}
+
+    # ── Phase 3: persist — OUTSIDE gateway ──
+    if scraped is not None:
+        try:
+            await persist_inbox_sync(
+                user_id, scraped, detail_cache or {}, existing_by_id or {}, baseline=True,
+            )
+        except Exception as e:
+            logger.error("sync_onboarding inbox persist failed for user_id=%d: %r", user_id, e)
+
+    if slots is not None:
+        try:
+            from app.db.repositories.timetable_repository import TimetableRepository
+            from app.config import IST
+            synced_at = datetime.now(IST)
+            async with get_db_session() as session:
+                async with session.begin():
+                    repo = TimetableRepository(session)
+                    await repo.replace_user_timetable(user_id=user_id, slots=slots, synced_at=synced_at)
+        except Exception as e:
+            logger.error("sync_onboarding timetable persist failed for user_id=%d: %r", user_id, e)
+
+    return {"success": True}
 
 
 # ── Handler: qp_metadata_fetch ──────────────────────────────────────
@@ -679,7 +766,7 @@ async def handle_timetable_sync(job: NitrisJob) -> dict:
             if result.get("success"):
                 entry_count = result.get("entry_count", 0)
                 synced_at_ist = result.get("synced_at_ist", "")
-                today_weekday = min(datetime.now(IST).weekday(), 4)
+                today_weekday = min(datetime.now(IST).weekday(), 5)
                 await _bot.edit_message_text(
                     chat_id=callback_chat_id,
                     message_id=callback_message_id,

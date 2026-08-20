@@ -238,6 +238,19 @@ async def process_password(message: types.Message, state: FSMContext):
             from app.nitris.auth_gate import on_credentials_updated
             await on_credentials_updated(user_id)
 
+            # Kick off a SILENT baseline sync (inbox + timetable) on a single
+            # background login, so the user's first tap on inbox/timetable is
+            # instant and their historical inbox doesn't spam "new message"
+            # notifications. Fire-and-forget — the dashboard shows immediately.
+            from app.nitris.job_queue import nitris_job_queue, Priority
+            await nitris_job_queue.enqueue(
+                job_type="sync_onboarding",
+                user_id=user_id,
+                priority=Priority.HIGH,
+                dedup_key=f"onboarding:user:{user_id}",
+                payload={},
+            )
+
         await status_msg.edit_text(
             "✅ <b>Registration complete!</b>\n\n"
             "Initial attendance fetched successfully. Rendering your dashboard...",

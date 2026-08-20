@@ -115,8 +115,13 @@ async def prepare_inbox_sync(client, user_id):
     return scraped_messages, detail_cache, existing_by_id
 
 
-async def persist_inbox_sync(user_id, scraped_messages, detail_cache, existing_by_id):
-    """DB write phase for inbox sync. One short transaction, no network I/O."""
+async def persist_inbox_sync(user_id, scraped_messages, detail_cache, existing_by_id, baseline: bool = False):
+    """DB write phase for inbox sync. One short transaction, no network I/O.
+
+    When ``baseline=True`` (first sync right after registration), new messages
+    are inserted SILENTLY — no NEW_MESSAGE_RECEIVED events — so a user's
+    historical inbox backlog doesn't flood them with "new message" alerts.
+    """
     if not scraped_messages:
         return
 
@@ -166,20 +171,21 @@ async def persist_inbox_sync(user_id, scraped_messages, detail_cache, existing_b
                         if detail_data.get("body") is not None:
                             new_msg.body_fetched_at = datetime.now(timezone.utc)
 
-                        await event_repo.create_event(
-                            user_id=user_id,
-                            event_type=EventType.NEW_MESSAGE_RECEIVED,
-                            payload_json={
-                                "message_id": new_msg.id,
-                                "sender": new_msg.sender,
-                                "subject": new_msg.subject,
-                                "body_snippet": (new_msg.body[:150] + "..." if new_msg.body else ""),
-                                "has_attachment": bool(new_msg.attachment_url),
-                            },
-                        )
+                        if not baseline:
+                            await event_repo.create_event(
+                                user_id=user_id,
+                                event_type=EventType.NEW_MESSAGE_RECEIVED,
+                                payload_json={
+                                    "message_id": new_msg.id,
+                                    "sender": new_msg.sender,
+                                    "subject": new_msg.subject,
+                                    "body_snippet": (new_msg.body[:150] + "..." if new_msg.body else ""),
+                                    "has_attachment": bool(new_msg.attachment_url),
+                                },
+                            )
                         logger.info(
-                            "Sync detected new message ID %s for user %s",
-                            new_msg.portal_message_id, user_id,
+                            "Sync inserted message ID %s for user %s (baseline=%s)",
+                            new_msg.portal_message_id, user_id, baseline,
                         )
                 else:
                     if existing.token != msg["token"]:
