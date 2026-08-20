@@ -163,6 +163,9 @@ async def persist_inbox_sync(user_id, scraped_messages, detail_cache, existing_b
                             body=detail_data.get("body"),
                             attachment_url=detail_data.get("attachment_url"),
                         )
+                        if detail_data.get("body") is not None:
+                            new_msg.body_fetched_at = datetime.now(timezone.utc)
+
                         await event_repo.create_event(
                             user_id=user_id,
                             event_type=EventType.NEW_MESSAGE_RECEIVED,
@@ -195,7 +198,9 @@ async def persist_inbox_sync(user_id, scraped_messages, detail_cache, existing_b
                         existing.subject = msg["subject"]
                         existing.sent_on = normalized_scraped_sent_on
                         existing.body = None
+                        existing.body_fetched_at = None
                         existing.attachment_url = None
+                        existing.attachment_cache_id = None
                         existing.is_read = False
                         await event_repo.create_event(
                             user_id=user_id,

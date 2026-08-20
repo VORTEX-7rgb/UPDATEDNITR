@@ -370,11 +370,13 @@ async def handle_inbox_detail_fetch(job: NitrisJob) -> dict:
             async with update_session.begin():
                 if token.startswith("postback:") and real_token:
                     from app.nitris.parser import extract_message_id
+                    from sqlalchemy import func as sa_func
                     portal_id = extract_message_id(real_token)
                     from sqlalchemy import update as sqlalchemy_update
                     update_values = {
                         "token": real_token,
                         "body": detail_data["body"],
+                        "body_fetched_at": sa_func.now(),
                         "attachment_url": detail_data["attachment_url"],
                     }
                     if portal_id:

@@ -7,6 +7,8 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from app.config import config
 from app.bot.telegram import dp, init_qpaper_service, shutdown_qpaper_service
+from app.services.attachment_service import init_attachment_service, shutdown_attachment_service
+from app.db.database import async_session_factory
 from app.workers.sync_worker import (
     run_dispatch_worker,
     init_event_dispatcher,
@@ -53,6 +55,9 @@ async def main():
     # Initialize Question Paper service & start background stale-lock reaper
     await init_qpaper_service(bot)
 
+    # Initialize Global Attachment service & start background stale-lock reaper
+    init_attachment_service(bot, async_session_factory)
+
     # Initialize Event Dispatcher service & start background stale-claim reaper
     await init_event_dispatcher(bot)
 
@@ -85,6 +90,7 @@ async def main():
         logging.info("Stopping background workers & services...")
         await nitris_job_queue.stop()
         await shutdown_qpaper_service()
+        await shutdown_attachment_service()
         await shutdown_event_dispatcher()
         
         scheduler_task.cancel()
@@ -99,5 +105,5 @@ async def main():
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except KeyboardInterrupt:
-        logging.info("Bot stopped by user.")
+    except (KeyboardInterrupt, SystemExit):
+        logging.info("Bot stopped.")

@@ -101,6 +101,34 @@ class Config:
     # Single-flight dedup key prefix for timetable sync jobs.
     TIMETABLE_SYNC_DEDUP_PREFIX = "timetable_sync"
 
+    # ── Phase 7: Inbox Cache-First + Global Attachment Cache config ─────────
+    # Max age (seconds) of a cached notice body before render_single_message
+    # triggers a background re-fetch. 6 hours balances freshness against
+    # NITRIS load — notices rarely change after publication.
+    INBOX_BODY_TTL_SECONDS = int(os.getenv("INBOX_BODY_TTL_SECONDS", str(6 * 3600)))
+
+    # Attachment acquisition staleness — a worker's lock lease expires after
+    # this many seconds. Mirrors QP_CACHE_STALE_SECONDS.
+    ATTACHMENT_CACHE_STALE_SECONDS = int(os.getenv("ATTACHMENT_CACHE_STALE_SECONDS", "300"))  # 5 min
+
+    # Maximum attempts before a failed attachment download transitions to
+    # permanent_failure (avoids infinite retries on corrupt files / deleted portal links).
+    ATTACHMENT_CACHE_PERMANENT_AFTER = int(os.getenv("ATTACHMENT_CACHE_PERMANENT_AFTER", "5"))
+
+    # Concurrency controls for attachment downloads and deliveries
+    ATTACHMENT_MAX_CONCURRENT_ACQUISITIONS = int(os.getenv("ATTACHMENT_MAX_CONCURRENT_ACQUISITIONS", "8"))
+    ATTACHMENT_MAX_CONCURRENT_DELIVERIES = int(os.getenv("ATTACHMENT_MAX_CONCURRENT_DELIVERIES", "25"))
+    ATTACHMENT_WAIT_POLL_INTERVAL = float(os.getenv("ATTACHMENT_WAIT_POLL_INTERVAL", "2.0"))
+    ATTACHMENT_WAIT_TIMEOUT = float(os.getenv("ATTACHMENT_WAIT_TIMEOUT", "60.0"))
+    ATTACHMENT_FLOODWAIT_MAX_RETRIES = int(os.getenv("ATTACHMENT_FLOODWAIT_MAX_RETRIES", "3"))
+    ATTACHMENT_DELIVERY_MAX_RETRIES = int(os.getenv("ATTACHMENT_DELIVERY_MAX_RETRIES", "3"))
+    ATTACHMENT_DELIVERY_RETRY_BASE_DELAY = float(os.getenv("ATTACHMENT_DELIVERY_RETRY_BASE_DELAY", "1.0"))
+
+    # Telegram storage channel for global attachments. Defaults to the QP storage
+    # channel if ATTACHMENT_STORAGE_CHAT_ID is unset (shared media channel).
+    _raw_qp_chat = os.getenv("QP_STORAGE_CHAT_ID")
+    ATTACHMENT_STORAGE_CHAT_ID = int(os.getenv("ATTACHMENT_STORAGE_CHAT_ID", str(_raw_qp_chat))) if _raw_qp_chat else 0
+
 
 config = Config()
 

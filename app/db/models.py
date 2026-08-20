@@ -30,6 +30,28 @@ class QPStatus(str, Enum):
     RETRYABLE_FAILURE = "retryable_failure"
     PERMANENT_FAILURE = "permanent_failure"
 
+
+class AttachmentStatus(str, Enum):
+    """Lifecycle states for an attachment_caches row.
+
+    Mirrors QPStatus state machine. Used by AttachmentService for atomic CAS
+    acquisition + concurrent request collapse + stale-lock recovery.
+
+    State transitions (all atomic via UPDATE...WHERE status=...):
+      [none]                       → fetch_in_progress    (first claim)
+      fetch_in_progress            → available             (download+upload succeeded)
+      fetch_in_progress            → not_available         (NITRIS confirmed 404)
+      fetch_in_progress            → retryable_failure     (transient error)
+      fetch_in_progress            → permanent_failure    (exhausted retries or hard error)
+      retryable_failure            → fetch_in_progress    (re-claim on next request)
+      fetch_in_progress(stale)     → fetch_in_progress    (stale-lock reaper, >5 min)
+    """
+    AVAILABLE = "available"
+    NOT_AVAILABLE = "not_available"
+    FETCH_IN_PROGRESS = "fetch_in_progress"
+    RETRYABLE_FAILURE = "retryable_failure"
+    PERMANENT_FAILURE = "permanent_failure"
+
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.sql import func
@@ -190,7 +212,25 @@ Index("idx_events_event_type", Event.event_type)
 
 
 class InboxMessage(Base):
-    """Secure message headers, body caches, and attachment details scraped from NITRIS."""
+    """Secure message headers, body caches, and attachment details scraped from NITRIS.
+
+    Schema notes (migration 0007):
+      - `body_fetched_at`: when the body was last lazily fetched from NITRIS.
+        Used by the cache-first renderer to decide if the cached body is fresh
+        enough to display without a re-fetch. Null = body has never been fetched.
+      - `attachment_cache_id`: foreign key to the GLOBAL `attachment_caches`
+        table. Per-user inbox metadata (read state, sender, subject, sent_on)
+        stays in this table; the attachment FILE CONTENT (Telegram file_id,
+        file bytes, state machine) lives in `attachment_caches` shared across
+        all students. This enforces multi-tenant isolation: a per-user row
+        can be deleted without affecting the global cache, and a global cache
+        row can be evicted without losing per-user read state.
+
+    Backward compat:
+      - `telegram_file_id` is preserved (will be dropped in a later migration
+        after the backfill into `attachment_caches` is verified in staging).
+        The new code reads file_id from `attachment_caches` exclusively.
+    """
 
     __tablename__ = "inbox_messages"
 
@@ -200,14 +240,21 @@ class InboxMessage(Base):
     )
     portal_message_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     token: Mapped[str] = mapped_column(String(200), nullable=False)
-    
+
     sender: Mapped[str] = mapped_column(String(200), nullable=False)
     subject: Mapped[str] = mapped_column(String(500), nullable=False)
     body: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    
+    body_fetched_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     attachment_url: Mapped[Optional[str]] = mapped_column(String(1000), nullable=True)
+    # DEPRECATED — kept for migration backfill only. New code uses attachment_cache_id.
     telegram_file_id: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
-    
+    attachment_cache_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("attachment_caches.id", ondelete="SET NULL"), nullable=True
+    )
+
     is_read: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
     sent_on: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
@@ -223,6 +270,85 @@ class InboxMessage(Base):
 
 # Token-level stable unique constraint per user
 Index("idx_inbox_user_token", InboxMessage.user_id, InboxMessage.token, unique=True)
+
+
+class AttachmentCache(Base):
+    """Global multi-tenant cache for NITRIS inbox attachments.
+
+    A single row per unique `attachment_path` (the normalized URL path component,
+    with query-string tokens stripped). The SAME attachment referenced by 1,000
+    students' inbox messages maps to ONE row in this table. The cached
+    `telegram_file_id` is the durable Telegram file reference for the bot's
+    private storage channel; forwarding it to any user costs zero NITRIS traffic
+    and zero Telegram uploads.
+
+    Lifecycle state machine (see AttachmentStatus enum — mirrors QPStatus):
+      fetch_in_progress  → available | not_available | retryable_failure | permanent_failure
+      retryable_failure  → fetch_in_progress (re-claim)
+      fetch_in_progress  → fetch_in_progress (stale-lock reaper, >5 min lease expired)
+
+    Atomic CAS state transitions are enforced by AttachmentService via
+    UPDATE...WHERE status=... Compare-And-Swap pattern, never read-modify-write.
+
+    Multi-tenant isolation:
+      - This table contains ONLY file content metadata (path, file_id, hash, size).
+      - It NEVER contains per-user inbox state (read/unread, sender, subject, body).
+      - Per-user state stays in InboxMessage. The FK
+        InboxMessage.attachment_cache_id → AttachmentCache.id is the only link.
+      - On deletion of an AttachmentCache row, InboxMessage.attachment_cache_id
+        is set to NULL via ON DELETE SET NULL — per-user metadata survives.
+    """
+
+    __tablename__ = "attachment_caches"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    # Stable content identity. Normalized NITRIS URL path (query string stripped
+    # so different user tokens don't fragment the cache).
+    attachment_path: Mapped[str] = mapped_column(Text, nullable=False)
+    content_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    portal_filename: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    # Telegram-side cache (the entire purpose of this table)
+    telegram_file_id: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    file_kind: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    file_size_bytes: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    # State machine (mirrors QuestionPaperCache)
+    status: Mapped[str] = mapped_column(
+        String(30), nullable=False,
+        default=AttachmentStatus.FETCH_IN_PROGRESS.value, index=True,
+    )
+    acquired_by: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    acquired_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<AttachmentCache id={self.id} path='{(self.attachment_path or '')[:60]}' "
+            f"status={self.status} cached={bool(self.telegram_file_id)}>"
+        )
+
+
+# Unique content-identity index — this IS the deduplication guarantee
+Index("idx_attachment_caches_path", AttachmentCache.attachment_path, unique=True)
+# Partial index for stale-lock reaper
+Index(
+    "idx_attachment_caches_acquisition",
+    AttachmentCache.status,
+    AttachmentCache.acquired_at,
+    postgresql_where=AttachmentCache.status == AttachmentStatus.FETCH_IN_PROGRESS.value,
+)
+Index("idx_attachment_caches_status", AttachmentCache.status)
 
 
 class QuestionPaperCache(Base):
@@ -428,5 +554,3 @@ Index(
     TimetableEntry.weekday,
     TimetableEntry.period_index,
 )
-
-

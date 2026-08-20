@@ -90,18 +90,39 @@ class InboxRepository:
     async def update_message_body(
         self, message_id: int, body: str, attachment_url: Optional[str]
     ) -> None:
-        """Update a message's body content and attachment link after lazy-loading."""
+        """Update a message's body content, attachment link, and timestamp after lazy-loading."""
         logger.debug("Updating body for InboxMessage ID: %s", message_id)
         stmt = (
             update(InboxMessage)
             .where(InboxMessage.id == message_id)
-            .values(body=body, attachment_url=attachment_url)
+            .values(
+                body=body,
+                attachment_url=attachment_url,
+                body_fetched_at=func.now(),
+            )
+        )
+        await self.session.execute(stmt)
+        await self.session.flush()
+
+    async def link_attachment_cache(
+        self, message_id: int, attachment_cache_id: int
+    ) -> None:
+        """Link an InboxMessage to a global AttachmentCache row."""
+        logger.debug(
+            "Linking InboxMessage ID %s to AttachmentCache ID %s",
+            message_id,
+            attachment_cache_id,
+        )
+        stmt = (
+            update(InboxMessage)
+            .where(InboxMessage.id == message_id)
+            .values(attachment_cache_id=attachment_cache_id)
         )
         await self.session.execute(stmt)
         await self.session.flush()
 
     async def update_telegram_file_id(self, message_id: int, file_id: str) -> None:
-        """Cache the successfully uploaded Telegram file ID for attachments."""
+        """Cache the successfully uploaded Telegram file ID for attachments (legacy)."""
         logger.debug("Caching Telegram file ID for InboxMessage ID: %s", message_id)
         stmt = (
             update(InboxMessage)
