@@ -269,7 +269,10 @@ async def cmd_forgot(message: types.Message, state: FSMContext):
     await state.set_state(Registration.waiting_for_roll)
     await message.answer(
         "🔄 <b>Credential Update / Registration</b>\n\n"
-        "Please enter your NITRIS Roll Number (e.g. <b>125AI0003</b>):",
+        "Please enter your NITRIS Roll Number like this format example - :\n\n"
+        "<blockquote>👑 <b><code>725MN1011</code></b>\n"
+        " 125MM0058\n"
+        " 125EC0063</blockquote>",
         parse_mode=ParseMode.HTML
     )
 
@@ -295,7 +298,14 @@ async def cmd_start(message: types.Message, state: FSMContext):
     else:
         await state.clear()
         await state.set_state(Registration.waiting_for_roll)
-        await message.answer("👋 Welcome to NitrClaw!\n\nPlease enter your NITRIS Roll Number (e.g. 125AI0003):")
+        await message.answer(
+            "👋 <b>Welcome to NitrClaw!</b>\n\n"
+            "Please enter your NITRIS Roll Number like this format example - :\n\n"
+            "<blockquote>👑 <b><code>725MN1011</code></b>\n"
+            "🪑 125MM0058\n"
+            "🐃 125EC0063</blockquote>",
+            parse_mode=ParseMode.HTML
+        )
 
 
 # --- FSM Command Shielding ---
@@ -331,7 +341,10 @@ async def process_roll(message: types.Message, state: FSMContext):
     if not re.match(r"^\d{3}[A-Z]{2}\d{4}$", roll):
         await message.answer(
             "❌ <b>Invalid Roll Number format.</b>\n\n"
-            "The expected format is strictly 9 characters (e.g., <b>125AI0003</b>).\n\n"
+            "The expected format is strictly 9 characters like this format example - :\n\n"
+            "<blockquote>👑 <b><code>725MN1011</code></b>\n"
+            "🪑 125MM0058\n"
+            "🐃 125EC0063</blockquote>\n"
             "Please try entering your roll number again, or send /cancel to abort:",
             parse_mode=ParseMode.HTML
         )
@@ -652,7 +665,10 @@ async def start_credential_update_from_cb(message: types.Message, state: FSMCont
     await state.set_state(Registration.waiting_for_roll)
     await message.answer(
         "🔄 <b>Credential Update / Registration</b>\n\n"
-        "Please enter your NITRIS Roll Number (e.g. <b>125AI0003</b>):",
+        "Please enter your NITRIS Roll Number like this format example - :\n\n"
+        "<blockquote>👑 <b><code>725MN1011</code></b>\n"
+        "🪑 125MM0058\n"
+        "🐃 125EC0063</blockquote>",
         parse_mode=ParseMode.HTML
     )
 

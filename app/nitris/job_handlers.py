@@ -679,7 +679,7 @@ async def handle_timetable_sync(job: NitrisJob) -> dict:
             if result.get("success"):
                 entry_count = result.get("entry_count", 0)
                 synced_at_ist = result.get("synced_at_ist", "")
-                today_weekday = min(datetime.now(IST).weekday(), 5)
+                today_weekday = min(datetime.now(IST).weekday(), 4)
                 await _bot.edit_message_text(
                     chat_id=callback_chat_id,
                     message_id=callback_message_id,
