@@ -36,3 +36,13 @@ class AttendanceParseError(NitrisError):
 class HomeParseError(NitrisError):
     """Could not parse the Home.aspx dashboard or timetable HTML."""
 
+
+class CredentialsQuarantinedError(NitrisError):
+    """A login attempt was refused because the user's credentials are quarantined.
+
+    Raised by the credential quarantine gate when any automatic path tries to
+    log in as a user whose credentials have been marked invalid. It is a
+    per-user fault (like LoginError) and must NEVER trip the global circuit
+    breaker. The user must re-register (/forgot) before logins resume.
+    """
+

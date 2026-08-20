@@ -38,11 +38,12 @@ from app.nitris.job_queue import nitris_job_queue, NitrisJob, Priority
 from app.nitris.client import NitrisClient
 from app.nitris.exceptions import (
     LoginError, SessionExpiredError, AttendanceParseError,
-    AttendanceWorkflowError, NitrisError,
+    AttendanceWorkflowError, NitrisError, CredentialsQuarantinedError,
 )
 from app.services.attendance_service import get_attendance_data
 from app.services.snapshot_service import SnapshotService
 from app.workers.sync_worker import prepare_inbox_sync, persist_inbox_sync
+from app.nitris.auth_gate import on_login_failure
 from app.utils import esc
 
 from aiogram.enums import ParseMode
@@ -109,7 +110,7 @@ async def handle_attendance_refresh(job: NitrisJob) -> dict:
             password = decrypt_password(encrypted_password)
             client = NitrisClient()
             try:
-                await nitris_gateway.login_through_gateway(client, roll_number, password)
+                await nitris_gateway.login_through_gateway(client, roll_number, password, user_id=user_id)
                 data = await get_attendance_data(roll_number, password, client=client)
             finally:
                 await client.close()
@@ -124,9 +125,9 @@ async def handle_attendance_refresh(job: NitrisJob) -> dict:
         )
         return {"success": False, "error": str(e), "data": None}
 
-    except LoginError as e:
+    except (LoginError, CredentialsQuarantinedError) as e:
         # Mark credentials as invalid
-        await _mark_credentials_invalid(user_id, str(e))
+        await on_login_failure(user_id, str(e))
         await _edit_callback_message(
             callback_chat_id, callback_message_id,
             f"❌ <b>Login failed.</b>\n\n"
@@ -205,7 +206,7 @@ async def handle_inbox_refresh(job: NitrisJob) -> dict:
 
             client = NitrisClient()
             try:
-                await nitris_gateway.login_through_gateway(client, roll_number, password)
+                await nitris_gateway.login_through_gateway(client, roll_number, password, user_id=user_id)
                 scraped, detail_cache, existing_by_id = await prepare_inbox_sync(client, user_id)
             finally:
                 await client.close()
@@ -217,8 +218,8 @@ async def handle_inbox_refresh(job: NitrisJob) -> dict:
 
     except NitrisCircuitOpenError as e:
         return {"success": False, "error": str(e)}
-    except LoginError as e:
-        await _mark_credentials_invalid(user_id, str(e))
+    except (LoginError, CredentialsQuarantinedError) as e:
+        await on_login_failure(user_id, str(e))
         return {"success": False, "error": f"Login failed: {e}"}
     except Exception as e:
         logger.error("inbox_refresh job failed: %r", e)
@@ -268,7 +269,7 @@ async def handle_qp_metadata_fetch(job: NitrisJob) -> dict:
             from app.services.examination_service import ExaminationService
             client = NitrisClient()
             try:
-                await nitris_gateway.login_through_gateway(client, roll_number, password)
+                await nitris_gateway.login_through_gateway(client, roll_number, password, user_id=user_id)
                 parsed_records = await ExaminationService.fetch_subject_metadata_from_portal(
                     username=roll_number,
                     password=password,
@@ -288,8 +289,8 @@ async def handle_qp_metadata_fetch(job: NitrisJob) -> dict:
 
     except NitrisCircuitOpenError as e:
         return {"success": False, "error": str(e)}
-    except LoginError as e:
-        await _mark_credentials_invalid(user_id, str(e))
+    except (LoginError, CredentialsQuarantinedError) as e:
+        await on_login_failure(user_id, str(e))
         return {"success": False, "error": f"Login failed: {e}"}
     except Exception as e:
         logger.error("qp_metadata_fetch job failed: %r", e)
@@ -342,7 +343,7 @@ async def handle_inbox_detail_fetch(job: NitrisJob) -> dict:
             password = decrypt_password(encrypted_password)
             client = NitrisClient()
             try:
-                await nitris_gateway.login_through_gateway(client, roll_number, password)
+                await nitris_gateway.login_through_gateway(client, roll_number, password, user_id=user_id)
                 from app.nitris.parser import parse_message_detail_html
 
                 if token.startswith("postback:"):
@@ -357,8 +358,8 @@ async def handle_inbox_detail_fetch(job: NitrisJob) -> dict:
                 # password drops out of scope here
     except NitrisCircuitOpenError as e:
         return {"success": False, "error": str(e)}
-    except LoginError as e:
-        await _mark_credentials_invalid(user_id, str(e))
+    except (LoginError, CredentialsQuarantinedError) as e:
+        await on_login_failure(user_id, str(e))
         return {"success": False, "error": f"Login failed: {e}"}
     except Exception as e:
         logger.error("inbox_detail_fetch job failed: %r", e)
@@ -462,15 +463,15 @@ async def handle_attachment_download(job: NitrisJob) -> dict:
 
             client = NitrisClient()
             try:
-                await nitris_gateway.login_through_gateway(client, roll_number, password)
+                await nitris_gateway.login_through_gateway(client, roll_number, password, user_id=user_id)
                 file_bytes = await client.download_attachment(attachment_url)
             finally:
                 await client.close()
 
     except NitrisCircuitOpenError as e:
         return {"success": False, "error": str(e)}
-    except LoginError as e:
-        await _mark_credentials_invalid(user_id, str(e))
+    except (LoginError, CredentialsQuarantinedError) as e:
+        await on_login_failure(user_id, str(e))
         return {"success": False, "error": f"Login failed: {e}"}
     except Exception as e:
         logger.error("attachment_download NITRIS work failed: %r", e)
@@ -564,7 +565,7 @@ async def handle_qp_search(job: NitrisJob) -> dict:
 
             client = NitrisClient()
             try:
-                await nitris_gateway.login_through_gateway(client, roll_number, password)
+                await nitris_gateway.login_through_gateway(client, roll_number, password, user_id=user_id)
 
                 from app.nitris.examination_parser import parse_question_papers_html
 
@@ -591,8 +592,8 @@ async def handle_qp_search(job: NitrisJob) -> dict:
 
     except NitrisCircuitOpenError as e:
         return {"success": False, "error": str(e)}
-    except LoginError as e:
-        await _mark_credentials_invalid(user_id, str(e))
+    except (LoginError, CredentialsQuarantinedError) as e:
+        await on_login_failure(user_id, str(e))
         return {"success": False, "error": f"Login failed: {e}"}
     except Exception as e:
         logger.error("qp_search NITRIS work failed: %r", e)
@@ -646,33 +647,6 @@ async def _update_sync_state(
     except Exception as e:
         logger.error("Failed to update SyncState for user_id=%d: %r", user_id, e)
 
-
-async def _mark_credentials_invalid(user_id: int, error_msg: str) -> None:
-    """Mark a user's credentials as invalid after a LoginError."""
-    try:
-        from sqlalchemy import text
-        from app.nitris.gateway import CREDENTIAL_COOLDOWN_SECONDS, CREDENTIAL_INVALID_THRESHOLD
-        async with async_session_factory() as session:
-            async with session.begin():
-                await session.execute(text("""
-                    UPDATE users
-                    SET qp_fail_count = qp_fail_count + 1,
-                        qp_cooldown_until = NOW() + INTERVAL '1 hour',
-                        credentials_valid = CASE
-                                              WHEN qp_fail_count + 1 >= 3 THEN FALSE
-                                              ELSE credentials_valid
-                                            END,
-                        updated_at = NOW()
-                    WHERE id = :user_id
-                """), {"user_id": user_id})
-        logger.warning(
-            "Marked credential failure for user_id=%d: %s", user_id, error_msg[:100]
-        )
-    except Exception as e:
-        logger.error("Failed to mark credentials invalid for user_id=%d: %r", user_id, e)
-
-
-# ── Handler: timetable_sync ──────────────────────────────────────────
 
 async def handle_timetable_sync(job: NitrisJob) -> dict:
     """Manual timetable sync from Home.aspx dashboard.

@@ -17,6 +17,7 @@ from app.workers.sync_worker import (
 from app.nitris.gateway import nitris_gateway
 from app.nitris.job_queue import nitris_job_queue
 from app.nitris.job_handlers import init_job_handlers
+from app.nitris.auth_gate import init_auth_gate, init_quarantine
 from app.services.scheduler_service import run_scheduler_loop, init_scheduler
 
 # Windows Asyncio Event Loop Fix for WinError 10054 / 121 / 64
@@ -40,7 +41,13 @@ async def main():
         default=DefaultBotProperties(parse_mode=ParseMode.HTML)
     )
     logging.info("Starting Telegram Bot...")
-    
+
+    # ── Credential quarantine gate (auth_gate) ──────────────────────────
+    # Must be initialized before any handler can send notifications, and the
+    # in-memory gateway guard must be seeded before any login can run.
+    init_auth_gate(bot)
+    await init_quarantine(async_session_factory)
+
     # ── Phase 1+2: Initialize NITRIS Gateway + Job Queue ────────────────
     # Register job handlers (attendance_refresh, inbox_refresh, qp_metadata_fetch, etc.)
     init_job_handlers(bot)

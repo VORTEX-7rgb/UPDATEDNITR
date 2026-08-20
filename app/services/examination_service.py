@@ -222,9 +222,11 @@ class ExaminationService:
 
         local_client = False
         if not client:
-            client = NitrisClient()
-            await client.login(username, password)
-            local_client = True
+            raise RuntimeError(
+                "fetch_subject_metadata_from_portal requires a pre-authenticated "
+                "client (logged in through the gateway); direct login removed to "
+                "enforce the credential-quarantine gate."
+            )
 
         try:
             html = await client.fetch_question_papers(
@@ -266,9 +268,11 @@ class ExaminationService:
         )
         local_client = False
         if not client:
-            client = NitrisClient()
-            await client.login(username, password)
-            local_client = True
+            raise RuntimeError(
+                "download_paper_bytes requires a pre-authenticated client (logged in "
+                "through the gateway); direct login removed to enforce the "
+                "credential-quarantine gate."
+            )
 
         try:
             pdf_bytes = await client.download_question_paper_bytes(

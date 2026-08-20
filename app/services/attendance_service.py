@@ -38,10 +38,13 @@ async def get_attendance_data(
     """
     should_close = False
     if client is None:
-        client = NitrisClient()
-        should_close = True
-        # Login once
-        await client.login(username, password)
+        # Direct-login path removed: callers MUST pass a pre-authenticated client
+        # (logged in through the gateway) so every login stays behind the
+        # credential-quarantine gate.
+        raise RuntimeError(
+            "get_attendance_data requires a pre-authenticated client (logged in "
+            "through the gateway)."
+        )
 
     try:
         relogins_used = 0

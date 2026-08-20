@@ -96,21 +96,10 @@ async def init_qpaper_service(bot: Bot) -> None:
                 rows = (await s.execute(stmt)).all()
             
             if not rows:
-                logger.warning(
-                    "No users with credentials_valid=TRUE — falling back to "
-                    "any registered user as last resort"
-                )
-                stmt = (
-                    select(User.id, User.roll_number, User.encrypted_password)
-                    .order_by(User.id.desc())
-                    .limit(5)
-                )
-                rows = (await s.execute(stmt)).all()
-            
-            if not rows:
                 raise RuntimeError(
-                    "No registered users — cannot acquire QP. "
-                    "Register at least one student before downloading papers."
+                    "No users with credentials_valid=TRUE — cannot acquire QP. "
+                    "Register at least one student with valid credentials before "
+                    "downloading papers."
                 )
             
             candidates = [(r.roll_number, r.id, r.encrypted_password) for r in rows]
@@ -386,7 +375,10 @@ async def process_password(message: types.Message, state: FSMContext):
         async with nitris_gateway.acquire():
             _reg_client = _NitrisClient()
             try:
-                await nitris_gateway.login_through_gateway(_reg_client, roll, password)
+                # Explicit verification path — no user_id, bypasses the quarantine
+                # guard by design (this is the ONLY path that may login while
+                # credentials are quarantined).
+                await nitris_gateway.verify_credentials(_reg_client, roll, password)
                 data = await get_attendance_data(roll, password, client=_reg_client)
             finally:
                 await _reg_client.close()
@@ -459,6 +451,12 @@ async def process_password(message: types.Message, state: FSMContext):
             from app.db.database import async_session_factory
             for module_name in ("attendance", "inbox"):
                 await ensure_schedule_exists(async_session_factory, user_id, module_name)
+
+            # Re-enable logins after a successful explicit verification.
+            # Bumps credentials_version, clears any prior quarantine, and resets
+            # the failure counters + gateway in-memory guard.
+            from app.nitris.auth_gate import on_credentials_updated
+            await on_credentials_updated(user_id)
                 
         await status_msg.edit_text(
             "✅ <b>Registration complete!</b>\n\n"
@@ -1368,6 +1366,14 @@ async def handle_download_attachment(callback: types.CallbackQuery, state: FSMCo
 
         if not user:
             await callback.message.answer("⚠️ You are not registered. Use /start to register.")
+            return
+
+        if not user.credentials_valid:
+            await callback.message.answer(
+                "⚠️ <b>Your NITRIS credentials are invalid.</b>\n\n"
+                "Please use /forgot to update them before downloading attachments.",
+                parse_mode=ParseMode.HTML,
+            )
             return
 
         stmt = select(InboxMessage).where(InboxMessage.id == msg_id, InboxMessage.user_id == user.id)

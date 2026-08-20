@@ -38,12 +38,12 @@ class AttachmentStatus(str, Enum):
     acquisition + concurrent request collapse + stale-lock recovery.
 
     State transitions (all atomic via UPDATE...WHERE status=...):
-      [none]                       → retryable_failure    (row inserted on cold start)
-      retryable_failure            → fetch_in_progress    (claimed for acquisition)
+      [none]                       → retryable_failure    (new row, ready for first claim)
       fetch_in_progress            → available             (download+upload succeeded)
       fetch_in_progress            → not_available         (NITRIS confirmed 404)
       fetch_in_progress            → retryable_failure     (transient error)
       fetch_in_progress            → permanent_failure    (exhausted retries or hard error)
+      retryable_failure            → fetch_in_progress    (re-claim on next request)
       fetch_in_progress(stale)     → fetch_in_progress    (stale-lock reaper, >5 min)
     """
     AVAILABLE = "available"
@@ -72,6 +72,8 @@ class User(Base):
     roll_number: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
     encrypted_password: Mapped[str] = mapped_column(String(500), nullable=False)
     credentials_valid: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    credentials_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    credentials_invalid_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     qp_fail_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     qp_cooldown_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(

@@ -49,7 +49,7 @@ from app.config import config
 from app.db.database import get_db_session, async_session_factory, is_db_connection_error
 from app.nitris.gateway import nitris_gateway, NitrisCircuitOpenError
 from app.nitris.job_queue import nitris_job_queue, Priority
-
+from app.nitris.exceptions import LoginError, CredentialsQuarantinedError
 logger = logging.getLogger(__name__)
 
 
@@ -336,7 +336,8 @@ async def init_scheduler() -> None:
     The sync handlers (sync_attendance, sync_inbox) are registered here
     and use the job_queue's worker pool. They go through the gateway.
     """
-    from app.nitris.job_handlers import _update_sync_state, _mark_credentials_invalid
+    from app.nitris.job_handlers import _update_sync_state
+    from app.nitris.auth_gate import on_login_failure
     from app.db.crypto import decrypt_password
     from app.db.models import User
     from app.nitris.client import NitrisClient
@@ -380,7 +381,7 @@ async def init_scheduler() -> None:
             async with nitris_gateway.acquire():
                 client = NitrisClient()
                 try:
-                    await nitris_gateway.login_through_gateway(client, roll_number, password)
+                    await nitris_gateway.login_through_gateway(client, roll_number, password, user_id=user_id)
                     data = await get_attendance_data(roll_number, password, client=client)
                 finally:
                     await client.close()
@@ -389,6 +390,15 @@ async def init_scheduler() -> None:
                 async_session_factory, schedule_id,
                 success=False, error_msg=str(e), module_name=module_name,
             )
+            return {"success": False, "error": str(e)}
+        except (LoginError, CredentialsQuarantinedError) as e:
+            # One confirmed LoginError → permanent quarantine (no auto-retry).
+            await on_login_failure(user_id, str(e))
+            await update_schedule_after_job(
+                async_session_factory, schedule_id,
+                success=False, error_msg="credentials_quarantined", module_name=module_name,
+            )
+            await _update_sync_state(user_id, success=False, error_msg=str(e))
             return {"success": False, "error": str(e)}
         except Exception as e:
             logger.error("sync_attendance NITRIS fetch failed for user_id=%d: %r", user_id, e)
@@ -459,7 +469,7 @@ async def init_scheduler() -> None:
             async with nitris_gateway.acquire():
                 client = NitrisClient()
                 try:
-                    await nitris_gateway.login_through_gateway(client, roll_number, password)
+                    await nitris_gateway.login_through_gateway(client, roll_number, password, user_id=user_id)
                     scraped, detail_cache, existing_by_id = await prepare_inbox_sync(client, user_id)
                 finally:
                     await client.close()
@@ -467,6 +477,13 @@ async def init_scheduler() -> None:
             await update_schedule_after_job(
                 async_session_factory, schedule_id,
                 success=False, error_msg=str(e), module_name=module_name,
+            )
+            return {"success": False, "error": str(e)}
+        except (LoginError, CredentialsQuarantinedError) as e:
+            await on_login_failure(user_id, str(e))
+            await update_schedule_after_job(
+                async_session_factory, schedule_id,
+                success=False, error_msg="credentials_quarantined", module_name=module_name,
             )
             return {"success": False, "error": str(e)}
         except Exception as e:

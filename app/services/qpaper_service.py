@@ -466,7 +466,7 @@ class QPaperService:
 
                 client = NitrisClient()
                 try:
-                    await nitris_gateway.login_through_gateway(client, roll, password)
+                    await nitris_gateway.login_through_gateway(client, roll, password, user_id=user_id)
                     file_bytes = await client.download_question_paper_bytes(
                         academic_year=ac_year,
                         subject_query=sub_code,
@@ -478,8 +478,8 @@ class QPaperService:
                     last_err = e
                     logger.warning("QP download login failed for roll=%s: %r", roll, e)
                     if user_id:
-                        from app.nitris.job_handlers import _mark_credentials_invalid
-                        await _mark_credentials_invalid(user_id, str(e))
+                        from app.nitris.auth_gate import on_login_failure
+                        await on_login_failure(user_id, str(e))
                     continue
                 except Exception as e:
                     last_err = e

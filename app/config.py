@@ -124,8 +124,9 @@ class Config:
     ATTACHMENT_DELIVERY_MAX_RETRIES = int(os.getenv("ATTACHMENT_DELIVERY_MAX_RETRIES", "3"))
     ATTACHMENT_DELIVERY_RETRY_BASE_DELAY = float(os.getenv("ATTACHMENT_DELIVERY_RETRY_BASE_DELAY", "1.0"))
 
-    # Telegram storage channel for global attachments. Defaults to the QP storage
-    # channel if ATTACHMENT_STORAGE_CHAT_ID is unset (shared media channel).
+    # Telegram storage channel for global attachments. Explicitly setting
+    # ATTACHMENT_STORAGE_CHAT_ID wins; otherwise falls back to the QP storage
+    # channel (shared media channel); otherwise 0 (direct-user fallback uploads).
     _raw_attach_chat = os.getenv("ATTACHMENT_STORAGE_CHAT_ID")
     _raw_qp_chat = os.getenv("QP_STORAGE_CHAT_ID")
     if _raw_attach_chat:

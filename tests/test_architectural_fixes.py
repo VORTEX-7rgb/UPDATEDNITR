@@ -35,7 +35,7 @@ async def test_no_deadlock_at_max_workers():
 
     async def worker():
         async with gw.acquire():
-            await gw.login_through_gateway(mock_client, "125AI0001", "testpass")
+            await gw.login_through_gateway(mock_client, "125AI0001", "testpass", user_id=1)
 
     # Launch 3 workers concurrently (matching max_concurrent)
     # If nested acquire exists, this will hang / timeout.
@@ -53,20 +53,22 @@ async def test_login_pacing_still_enforced():
 
     t0 = time.monotonic()
     async with gw.acquire():
-        await gw.login_through_gateway(mock_client, "125AI0001", "test")
+        await gw.login_through_gateway(mock_client, "125AI0001", "test", user_id=1)
     async with gw.acquire():
-        await gw.login_through_gateway(mock_client, "125AI0002", "test")
+        await gw.login_through_gateway(mock_client, "125AI0002", "test", user_id=2)
     elapsed = time.monotonic() - t0
 
     assert elapsed >= 0.08, f"Expected pacing delay >= 0.08s (target 0.1s), got {elapsed:.3f}s"
 
 
 def test_registration_uses_gateway():
-    """Verify that process_password in telegram.py wraps verification in gateway.acquire()."""
+    """Registration verification uses the SEPARATE explicit path (verify_credentials),
+    not the automatic login_through_gateway (which requires user_id + quarantine guard)."""
     import app.bot.telegram as tg_module
     src = inspect.getsource(tg_module.process_password)
     assert "nitris_gateway.acquire" in src, "process_password must route through nitris_gateway.acquire"
-    assert "login_through_gateway" in src, "process_password must call login_through_gateway"
+    assert "verify_credentials" in src, "process_password must use the explicit verify_credentials path"
+    assert "login_through_gateway" not in src, "registration must NOT use the automatic login_through_gateway path"
 
 
 @pytest.mark.asyncio

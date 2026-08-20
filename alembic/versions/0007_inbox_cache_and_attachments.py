@@ -77,12 +77,12 @@ def upgrade() -> None:
 
             -- State machine — mirrors QuestionPaperCache.
             -- Allowed transitions:
-            --   [none]                → retryable_failure    (row created on cold start)
-            --   retryable_failure     → fetch_in_progress    (claimed for acquisition)
+            --   [none]                → retryable_failure    (new row, ready for first claim)
             --   fetch_in_progress     → available             (download+upload ok)
             --   fetch_in_progress     → not_available         (NITRIS confirmed 404)
             --   fetch_in_progress     → retryable_failure     (transient error)
             --   fetch_in_progress     → permanent_failure     (exhausted retries / hard error)
+            --   retryable_failure     → fetch_in_progress     (re-claim on next request)
             --   fetch_in_progress     → fetch_in_progress     (stale-lock reaper, >5 min)
             status VARCHAR(30) NOT NULL DEFAULT 'retryable_failure',
 

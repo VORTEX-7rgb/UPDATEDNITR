@@ -89,19 +89,17 @@ class FakeSession:
             merged.update(params)
 
         async with self.lock:
-            # 0. INSERT ... ON CONFLICT (attachment_path) DO NOTHING RETURNING id
-            if "INSERT INTO attachment_caches" in sql and "ON CONFLICT" in sql:
+            # 0. INSERT ... ON CONFLICT ... RETURNING id (find-or-create cold path)
+            if "INSERT INTO attachment_caches" in sql:
                 path = merged.get("path")
-                # Check uniqueness
-                for cid, row in self.store.items():
-                    if row.get("attachment_path") == path:
-                        # Conflict -> DO NOTHING
-                        return _FakeResult([])
+                for _row in self.store.values():
+                    if _row.get("attachment_path") == path:
+                        return _FakeResult([])  # conflict → no id returned
                 new_id = max(self.store.keys(), default=0) + 1
                 self.store[new_id] = {
                     "id": new_id,
                     "attachment_path": path,
-                    "status": merged.get("status", AttachmentStatus.RETRYABLE_FAILURE.value),
+                    "status": merged.get("status") or AttachmentStatus.RETRYABLE_FAILURE.value,
                     "attempt_count": 0,
                     "telegram_file_id": None,
                     "file_kind": None,
@@ -184,7 +182,7 @@ class FakeSession:
 
             # 6. SELECT by path
             if "attachment_caches.attachment_path =" in sql:
-                path = merged.get("attachment_path_1") or merged.get("attachment_path") or merged.get("path")
+                path = merged.get("attachment_path_1") or merged.get("attachment_path")
                 for cid, row in self.store.items():
                     if path and row.get("attachment_path") == path:
                         return _FakeResult([cid])
@@ -287,6 +285,7 @@ async def test_attachment_first_acquisition():
         assert res.delivered is True
         assert res.file_kind == "pdf"
         mock_dl.assert_called_once()
+        # Verify uploaded to storage channel (chat 123) and forwarded to user (chat 999)
         assert len(bot.sent_docs) == 2
 
 
@@ -331,48 +330,6 @@ async def test_attachment_concurrent_collapse():
 
 
 @pytest.mark.asyncio
-async def test_attachment_concurrent_cold_start_no_race():
-    """8 parallel cold-start delivers on a brand new path result in 1 row, 1 download, and 0 exceptions."""
-    store = {}
-    lock = asyncio.Lock()
-    bot = FakeBot()
-    svc = AttachmentService(
-        bot=bot,
-        session_factory=lambda: FakeSession(store, lock),
-        storage_chat_id=123,
-        wait_poll_interval=0.01,
-    )
-
-    download_count = 0
-
-    async def fake_download(*args, **kwargs):
-        nonlocal download_count
-        download_count += 1
-        await asyncio.sleep(0.05)
-        return (b"%PDF-1.4 brand new content", "cold_start.pdf", "pdf")
-
-    with patch.object(svc, "_nitris_download", side_effect=fake_download):
-        tasks = [
-            svc.deliver(
-                attachment_url="/docs/brand_new_cold_start.pdf",
-                telegram_id=5000 + i,
-                source_user_id=i + 1,
-                source_roll_number=f"125AI{i:04d}",
-                encrypted_password="enc",
-                subject="Cold Start Notice",
-            )
-            for i in range(8)
-        ]
-        results = await asyncio.gather(*tasks)
-
-        assert download_count == 1
-        assert len(store) == 1
-        assert len(results) == 8
-        for res in results:
-            assert res.delivered is True
-
-
-@pytest.mark.asyncio
 async def test_attachment_stale_reaper():
     """Reaper resets stuck fetch_in_progress rows."""
     stale_time = datetime.now(timezone.utc) - timedelta(seconds=700)
@@ -395,3 +352,49 @@ async def test_attachment_stale_reaper():
 
     await svc._reap_stale_locks()
     assert store[1]["status"] == AttachmentStatus.RETRYABLE_FAILURE.value
+
+
+@pytest.mark.asyncio
+async def test_attachment_concurrent_cold_start_no_race():
+    """N parallel cold-start deliveries for the same NEW path collapse to ONE row.
+
+    Regression test for the find-or-create IntegrityError race: a naive
+    read-then-insert raises on the unique index under concurrency. The
+    ON CONFLICT path must create exactly one row and perform one download.
+    """
+    store = {}
+    lock = asyncio.Lock()
+    bot = FakeBot()
+    svc = AttachmentService(
+        bot=bot,
+        session_factory=lambda: FakeSession(store, lock),
+        storage_chat_id=123,
+        wait_poll_interval=0.02,
+    )
+
+    download_count = 0
+
+    async def fake_download(*args, **kwargs):
+        nonlocal download_count
+        download_count += 1
+        await asyncio.sleep(0.05)
+        return (b"%PDF-1.4 cold start", "notice.pdf", "pdf")
+
+    with patch.object(svc, "_nitris_download", side_effect=fake_download):
+        results = await asyncio.gather(*[
+            svc.deliver(
+                attachment_url="/docs/cold_start.pdf",
+                telegram_id=3000 + i,
+                source_user_id=1,
+                source_roll_number="125AI0001",
+                encrypted_password="enc",
+                subject="Cold Start Notice",
+            )
+            for i in range(8)
+        ])
+
+    assert download_count == 1
+    matching = [v for v in store.values() if v["attachment_path"] == "/docs/cold_start.pdf"]
+    assert len(matching) == 1
+    for res in results:
+        assert res.delivered is True

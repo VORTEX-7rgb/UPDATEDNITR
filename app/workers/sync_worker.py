@@ -213,31 +213,6 @@ async def persist_inbox_sync(user_id, scraped_messages, detail_cache, existing_b
                         )
 
 
-async def sync_messages_for_user(user_id, roll_number, password, bot=None, client=None):
-    """Sync inbox messages for a single user (convenience wrapper).
-
-    Split into two phases so network I/O never overlaps an open DB transaction:
-      1. prepare_inbox_sync - fetch list + detail pages (network only)
-      2. persist_inbox_sync  - one short DB transaction
-    """
-    from app.nitris.client import NitrisClient
-
-    should_close = False
-    if client is None:
-        client = NitrisClient()
-        should_close = True
-        await client.login(roll_number, password)
-
-    try:
-        scraped, detail_cache, existing_by_id = await prepare_inbox_sync(client, user_id)
-        await persist_inbox_sync(user_id, scraped, detail_cache, existing_by_id)
-    except Exception as e:
-        logger.error("Failed to sync messages for User ID %d: %r", user_id, e)
-    finally:
-        if should_close:
-            await client.close()
-
-
 _event_dispatcher = None
 
 

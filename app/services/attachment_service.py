@@ -34,7 +34,7 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional, Callable, Any
+from typing import Optional, Callable, Any, Awaitable
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
@@ -164,7 +164,7 @@ class AttachmentService:
                 canonical_path=canonical_path,
                 subject=subject,
                 file_kind=file_kind,
-                recover_callback=lambda: self._claim_or_wait_and_deliver(
+                recover=lambda: self._claim_or_wait_and_deliver(
                     cache_id=cache_id,
                     attachment_url=attachment_url,
                     canonical_path=canonical_path,
@@ -198,7 +198,14 @@ class AttachmentService:
         )
 
     async def _find_or_create_cache_row(self, canonical_path: str) -> int:
-        """Find existing cache ID or insert a new one atomically using PostgreSQL ON CONFLICT."""
+        """Find existing cache ID or insert a new one atomically (race-safe).
+
+        Concurrent cold-start requests for the same attachment path collapse onto
+        ONE row via ``INSERT ... ON CONFLICT (attachment_path) DO NOTHING
+        RETURNING id``. This avoids the IntegrityError a naive read-then-insert
+        would raise on the unique index ``idx_attachment_caches_path`` when many
+        students tap the same notice attachment simultaneously.
+        """
         async with self.session_factory() as session:
             stmt = select(AttachmentCache.id).where(
                 AttachmentCache.attachment_path == canonical_path
@@ -207,6 +214,7 @@ class AttachmentService:
             if row:
                 return row
 
+        # Fast path missed — atomically insert, tolerating a concurrent insert.
         async with self.session_factory() as session:
             async with session.begin():
                 insert_stmt = sql_text("""
@@ -215,27 +223,27 @@ class AttachmentService:
                     ON CONFLICT (attachment_path) DO NOTHING
                     RETURNING id
                 """)
-                res = await session.execute(
+                row = (await session.execute(
                     insert_stmt,
                     {
                         "path": canonical_path,
                         "status": AttachmentStatus.RETRYABLE_FAILURE.value,
                     },
-                )
-                inserted_id = res.scalar_one_or_none()
-                if inserted_id:
-                    return inserted_id
-
-                # Another worker won the insert race — re-select the winning row
-                stmt = select(AttachmentCache.id).where(
-                    AttachmentCache.attachment_path == canonical_path
-                )
-                row = (await session.execute(stmt)).scalar_one_or_none()
-                if row:
+                )).scalar_one_or_none()
+                if row is not None:
                     return row
-                raise RuntimeError(
-                    f"Failed to find or create attachment cache row for path: {canonical_path}"
-                )
+
+        # Lost the insert race — another worker already created the row. Read it.
+        async with self.session_factory() as session:
+            stmt = select(AttachmentCache.id).where(
+                AttachmentCache.attachment_path == canonical_path
+            )
+            row = (await session.execute(stmt)).scalar_one_or_none()
+            if row:
+                return row
+            raise RuntimeError(
+                f"Failed to find or create attachment cache row for {canonical_path!r}"
+            )
 
     async def _read_cache(self, cache_id: int) -> tuple[str, Optional[str], Optional[str]]:
         """Read (status, telegram_file_id, file_kind) for a cache_id."""
@@ -383,26 +391,34 @@ class AttachmentService:
         source_roll_number: str,
         encrypted_password: str,
     ) -> tuple[bytes, str, str]:
-        """Download attachment from NITRIS strictly within gateway.acquire()."""
+        """Download attachment from NITRIS strictly within gateway.acquire().
+
+        Enforces the credential-quarantine gate: refuses to attempt a login for
+        a quarantined user by loading credentials through auth_gate first.
+        """
         from app.db.crypto import decrypt_password
         from app.nitris.gateway import nitris_gateway
         from app.nitris.client import NitrisClient
         from app.nitris.exceptions import LoginError
+        from app.nitris.auth_gate import load_user_credentials, on_login_failure
 
-        if not encrypted_password or not source_roll_number:
-            raise RuntimeError("Missing user credentials for NITRIS attachment download")
+        # Pre-check: raises CredentialsQuarantinedError for a quarantined user,
+        # and fetches the freshest credentials (ignoring any stale caller-passed
+        # password so a concurrent mark-invalid cannot be bypassed).
+        creds = await load_user_credentials(self.session_factory, source_user_id)
 
         filename = attachment_basename(canonical_path)
 
         async with nitris_gateway.acquire():
-            password = decrypt_password(encrypted_password)
+            password = decrypt_password(creds.encrypted_password)
             client = NitrisClient()
             try:
-                await nitris_gateway.login_through_gateway(client, source_roll_number, password)
+                await nitris_gateway.login_through_gateway(
+                    client, creds.roll_number, password, user_id=source_user_id
+                )
                 file_bytes = await client.download_attachment(attachment_url)
             except LoginError:
-                from app.nitris.job_handlers import _mark_credentials_invalid
-                await _mark_credentials_invalid(source_user_id, "attachment_download_login_failed")
+                await on_login_failure(source_user_id, "attachment_download_login_failed")
                 raise
             finally:
                 await client.close()
@@ -571,15 +587,22 @@ class AttachmentService:
         canonical_path: str,
         subject: str,
         file_kind: Optional[str] = None,
-        recover_callback: Optional[Callable[[], Any]] = None,
+        recover: Optional[Callable[[], Awaitable[AttachmentResult]]] = None,
     ) -> AttachmentResult:
-        """Forward cached Telegram file_id to user with FloodWait budget and invalid file_id auto-recovery."""
-        async with self._get_deliver_sem():
-            caption = f"📎 <b>Attachment:</b> {subject[:60]}" if subject else "📎 <b>Notice Attachment</b>"
-            delay = self.delivery_retry_base_delay
-            fw_attempts = 0
+        """Forward a cached Telegram file_id to a user.
 
-            for attempt in range(self.delivery_max_retries):
+        FloodWait retries are bounded by ``floodwait_max_retries`` and generic
+        retries by ``delivery_max_retries`` (independent budgets). On a rejected
+        file_id the cache row is invalidated and — when a ``recover`` callback is
+        supplied — the attachment is re-acquired and re-delivered in the same
+        request (mirrors QPaperService self-recovery).
+        """
+        caption = f"📎 <b>Attachment:</b> {subject[:60]}" if subject else "📎 <b>Notice Attachment</b>"
+
+        async with self._get_deliver_sem():
+            generic_attempt = 0
+            flood_retries = 0
+            while True:
                 try:
                     await self.bot.send_document(
                         chat_id=telegram_id,
@@ -588,39 +611,53 @@ class AttachmentService:
                     )
                     return AttachmentResult(delivered=True, file_kind=file_kind, cache_id=cache_id)
                 except TelegramRetryAfter as e:
-                    fw_attempts += 1
-                    if fw_attempts > self.floodwait_max_retries:
-                        logger.warning(
-                            "AttachmentService: FloodWait exhausted (%d/%d) for chat %d",
-                            fw_attempts, self.floodwait_max_retries, telegram_id
-                        )
+                    if flood_retries >= self.floodwait_max_retries:
                         return AttachmentResult(
-                            error=f"Telegram rate-limited ({e.retry_after}s). Please retry.",
+                            delivered=False,
+                            file_kind=file_kind,
                             cache_id=cache_id,
+                            error=f"Telegram rate-limited (retry_after={e.retry_after}s). Try again shortly.",
                         )
+                    flood_retries += 1
                     logger.warning(
                         "AttachmentService: FloodWait %ds for chat %d (retry %d/%d)",
-                        e.retry_after, telegram_id, fw_attempts, self.floodwait_max_retries
+                        e.retry_after, telegram_id, flood_retries, self.floodwait_max_retries,
                     )
                     await asyncio.sleep(e.retry_after + 0.5)
                 except TelegramForbiddenError:
                     logger.warning("AttachmentService: bot blocked by user %d", telegram_id)
-                    return AttachmentResult(permanent=True, error="Bot was blocked by user", cache_id=cache_id)
+                    return AttachmentResult(
+                        delivered=False, file_kind=file_kind, cache_id=cache_id,
+                        error="Bot blocked by user — cannot deliver.",
+                    )
                 except TelegramBadRequest as e:
                     err_msg = str(e).lower()
                     if "wrong file identifier" in err_msg or "file_id" in err_msg:
-                        logger.warning("AttachmentService: invalid file_id for cache_id=%d — resetting cache", cache_id)
+                        logger.warning(
+                            "AttachmentService: invalid file_id for cache_id=%d — invalidating and recovering",
+                            cache_id,
+                        )
                         await self._invalidate_file_id(cache_id)
-                        if recover_callback:
-                            logger.info("AttachmentService: executing recovery callback for cache_id=%d", cache_id)
-                            return await recover_callback()
-                    return AttachmentResult(error=f"Telegram delivery failed: {e}", cache_id=cache_id)
+                        if recover is not None:
+                            return await recover()
+                        return AttachmentResult(
+                            delivered=False, file_kind=file_kind, cache_id=cache_id,
+                            error="Stale cached file — please try again.",
+                        )
+                    return AttachmentResult(
+                        delivered=False, file_kind=file_kind, cache_id=cache_id, error=str(e),
+                    )
                 except Exception as e:
-                    logger.error("AttachmentService: send attempt %d failed: %r", attempt + 1, e)
-                    if attempt < self.delivery_max_retries - 1:
-                        await asyncio.sleep(delay)
-                        delay *= 2
-            return AttachmentResult(error="Delivery retry limit reached", cache_id=cache_id)
+                    generic_attempt += 1
+                    if generic_attempt >= self.delivery_max_retries:
+                        return AttachmentResult(
+                            delivered=False, file_kind=file_kind, cache_id=cache_id, error=str(e),
+                        )
+                    logger.error(
+                        "AttachmentService: send attempt %d/%d failed: %r",
+                        generic_attempt, self.delivery_max_retries, e,
+                    )
+                    await asyncio.sleep(self.delivery_retry_base_delay * (2 ** (generic_attempt - 1)))
 
     async def _invalidate_file_id(self, cache_id: int) -> None:
         """Reset cache when Telegram rejects file_id."""

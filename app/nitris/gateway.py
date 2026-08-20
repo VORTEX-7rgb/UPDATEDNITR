@@ -19,12 +19,11 @@ from typing import Optional, AsyncGenerator
 import httpx
 
 from app.config import config
-from app.nitris.exceptions import NitrisError, LoginError, SessionExpiredError
+from app.nitris.exceptions import NitrisError, LoginError, SessionExpiredError, CredentialsQuarantinedError
 
 logger = logging.getLogger(__name__)
 
 CREDENTIAL_COOLDOWN_SECONDS = 3600
-CREDENTIAL_INVALID_THRESHOLD = 3
 
 
 class CircuitState(str, Enum):
@@ -76,6 +75,12 @@ class NitrisGateway:
         self.circuit_recovery_seconds = circuit_recovery_seconds or config.NITRIS_GATEWAY_CIRCUIT_RECOVERY_SECONDS
 
         self._login_lock = asyncio.Lock()
+        # In-memory quarantine guard (defense-in-depth). The DB `credentials_valid`
+        # column is the source of truth; this set lets login_through_gateway()
+        # refuse a quarantined user in O(1) WITHOUT touching the DB inside the
+        # gateway lock. Seeded on startup from the DB and updated on every
+        # quarantine/unquarantine transition.
+        self._quarantined: set[int] = set()
         # asyncio.Condition doubles as the metrics mutex AND the admission
         # controller. Unlike a fixed asyncio.Semaphore (sized once and never
         # resized), the Condition enforces the *current* effective cap, so
@@ -164,10 +169,11 @@ class NitrisGateway:
             # Success path
             await self._record_success(is_login, time.monotonic() - start_time)
 
-        except (LoginError, SessionExpiredError):
+        except (LoginError, SessionExpiredError, CredentialsQuarantinedError):
             # Per-user faults (bad credentials, one student's expired ASP.NET
-            # session) must NOT trip the global circuit breaker. One student's
-            # stale cookie should not take the whole bot down for everyone.
+            # session, a quarantined credential) must NOT trip the global
+            # circuit breaker. One student's bad state must not take the whole
+            # bot down for everyone.
             raise
 
         except NitrisError as exc:
@@ -194,12 +200,26 @@ class NitrisGateway:
                     self.metrics.active_logins -= 1
                 self._state_lock.notify_all()
 
-    async def login_through_gateway(self, client, username: str, password: str) -> None:
-        """Pace a NITRIS login. MUST be called inside an acquire() block.
+    def quarantine(self, user_id: int) -> None:
+        """Add a user to the in-memory quarantine guard."""
+        self._quarantined.add(user_id)
 
-        Eliminates nested semaphore acquisition. Enforces minimum interval
-        between logins and tracks login metrics without re-acquiring the semaphore.
-        """
+    def unquarantine(self, user_id: int) -> None:
+        """Remove a user from the in-memory quarantine guard."""
+        self._quarantined.discard(user_id)
+
+    def is_quarantined(self, user_id: int) -> bool:
+        """True if the user is currently blocked from automatic logins."""
+        return user_id in self._quarantined
+
+    @property
+    def quarantined_user_count(self) -> int:
+        return len(self._quarantined)
+
+    async def _do_login(self, client, username: str, password: str) -> None:
+        """Paced login with metrics tracking. Shared by the automatic login
+        path (login_through_gateway) and the explicit verification path
+        (verify_credentials)."""
         # Enforce minimum interval between logins (pacing)
         async with self._login_lock:
             now = time.monotonic()
@@ -219,6 +239,35 @@ class NitrisGateway:
         finally:
             async with self._state_lock:
                 self.metrics.active_logins -= 1
+
+    async def login_through_gateway(self, client, username: str, password: str, *, user_id: int) -> None:
+        """Automatic login path. MUST be called inside an acquire() block.
+
+        ``user_id`` is REQUIRED — this is the credential-quarantine enforcement
+        point. A quarantined user is refused in O(1) (in-memory, no DB access
+        inside the gateway lock) before any NITRIS login attempt. On a LoginError
+        the user is added to the in-memory guard so even a future handler that
+        forgets the pre-check cannot re-attempt.
+        """
+        if user_id in self._quarantined:
+            raise CredentialsQuarantinedError(
+                f"Credentials quarantined for user_id={user_id}; automatic login refused."
+            )
+        try:
+            await self._do_login(client, username, password)
+        except LoginError:
+            self._quarantined.add(user_id)
+            raise
+
+    async def verify_credentials(self, client, username: str, password: str) -> None:
+        """Explicit user-initiated credential verification (registration / re-registration).
+
+        This is the ONLY login path allowed while credentials are quarantined.
+        It intentionally has no user_id (the user is being created/updated) and
+        does NOT consult the quarantine guard. On failure it raises LoginError;
+        the caller decides whether to retry the user-typed password.
+        """
+        await self._do_login(client, username, password)
 
     async def _record_success(self, is_login: bool, latency: float) -> None:
         async with self._state_lock:

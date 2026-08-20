@@ -75,7 +75,7 @@ async def fetch_timetable_html_via_gateway(
 
         client = NitrisClient()
         try:
-            await nitris_gateway.login_through_gateway(client, roll_number, password)
+            await nitris_gateway.login_through_gateway(client, roll_number, password, user_id=user_id)
             html = await client.fetch_home_html()
             slots = parse_home_page(html).timetable
             return html, slots
@@ -141,8 +141,8 @@ async def sync_user_timetable(
         }
     except LoginError as e:
         # Mark credentials invalid so the user gets the /forgot prompt
-        from app.nitris.job_handlers import _mark_credentials_invalid
-        await _mark_credentials_invalid(user_id, str(e))
+        from app.nitris.auth_gate import on_login_failure
+        await on_login_failure(user_id, str(e))
         return {
             "success": False,
             "error": f"Login failed — credentials may have changed. {e}",
