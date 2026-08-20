@@ -16,7 +16,7 @@ from app.services.qpaper_service import (
     _sniff_kind, _is_permanent_error, _make_caption,
     MAX_CONCURRENT_ACQUISITIONS, MAX_CONCURRENT_DELIVERIES,
 )
-from app.nitris.exceptions import InvalidContextError, AttendanceWorkflowError
+from app.nitris.exceptions import InvalidContextError, AttendanceWorkflowError, PaperNotAvailableError
 
 
 # ── Fakes ──────────────────────────────────────────────────────────
@@ -24,6 +24,7 @@ from app.nitris.exceptions import InvalidContextError, AttendanceWorkflowError
 
 class FakeRecord:
     def __init__(self, **kw):
+        self.not_available_until = None
         for k, v in kw.items():
             setattr(self, k, v)
 
@@ -81,8 +82,18 @@ class FakeSession:
                                          row.get("exam_type"), row.get("portal_postback_target"))])
                 return _FakeResult([])
 
+            if "UPDATE question_paper_caches" in sql and "SET status = :retryable" in sql and "not_available_until = NULL" in sql:
+                cid = params.get("id")
+                row = self.store.get(cid)
+                if row:
+                    row["status"] = params.get("retryable")
+                    row["not_available_until"] = None
+                    row["attempt_count"] = 0
+                    row["updated_at"] = datetime.now(timezone.utc)
+                return _FakeResult([], rowcount=1 if row else 0)
+
             if "UPDATE question_paper_caches" in sql and "SET status = :status" in sql:
-                # Mark available / mark failure
+                # Mark available / mark failure / mark not available
                 cid = params.get("cache_id")
                 row = self.store.get(cid)
                 if row:
@@ -92,6 +103,9 @@ class FakeSession:
                         row["file_kind"] = params.get("kind")
                         row["file_size_bytes"] = params.get("size")
                         row["error_message"] = None
+                    if "ttl" in params:
+                        ttl = int(params["ttl"])
+                        row["not_available_until"] = datetime.now(timezone.utc) + timedelta(seconds=ttl)
                     if "err" in params:
                         row["error_message"] = params["err"]
                     row["acquired_by"] = None
@@ -430,3 +444,111 @@ async def test_permanent_failure_classification():
     assert _is_permanent_error(AttendanceWorkflowError("Paper not available on portal")) is True
     # Transient connection timeout is retryable (not permanent)
     assert _is_permanent_error(TimeoutError("Connection timed out")) is False
+
+
+@pytest.mark.asyncio
+async def test_negative_cache_no_rescrape_within_ttl(qp_service, store, fake_bot):
+    """When a paper is negative-cached with not_available_until in the future,
+    deliver() must return not_available=True with ZERO NITRIS downloads."""
+    future_time = datetime.now(timezone.utc) + timedelta(hours=12)
+    store[8] = {
+        "id": 8, "subject_code": "CS201", "academic_year": "2024-25/Autumn",
+        "exam_type": "mid_sem", "portal_postback_target": "ctl00$cs201",
+        "telegram_file_id": None,
+        "status": QPStatus.PAPER_NOT_AVAILABLE.value,
+        "not_available_until": future_time,
+        "file_kind": None, "file_size_bytes": None,
+        "acquired_by": None, "acquired_at": None, "error_message": None,
+        "attempt_count": 1,
+    }
+
+    async def forbidden_nitris(*args):
+        raise AssertionError("NITRIS was called within negative cache TTL window!")
+    qp_service._nitris_download = forbidden_nitris
+
+    res = await qp_service.deliver(cache_id=8, telegram_id=999)
+    assert res.not_available is True
+    assert res.delivered is False
+    assert len(fake_bot.sent_documents) == 0
+
+
+@pytest.mark.asyncio
+async def test_permanent_negative_cache_no_rescrape(qp_service, store, fake_bot):
+    """When a paper has status='paper_not_available' and not_available_until is None (e.g. lab subjects),
+    deliver() must return not_available=True with ZERO NITRIS downloads."""
+    store[9] = {
+        "id": 9, "subject_code": "CS291", "academic_year": "2024-25/Autumn",
+        "exam_type": "mid_sem", "portal_postback_target": "",
+        "telegram_file_id": None,
+        "status": QPStatus.PAPER_NOT_AVAILABLE.value,
+        "not_available_until": None,
+        "file_kind": None, "file_size_bytes": None,
+        "acquired_by": None, "acquired_at": None, "error_message": None,
+        "attempt_count": 0,
+    }
+
+    async def forbidden_nitris(*args):
+        raise AssertionError("NITRIS was called for permanent negative cache!")
+    qp_service._nitris_download = forbidden_nitris
+
+    res = await qp_service.deliver(cache_id=9, telegram_id=999)
+    assert res.not_available is True
+    assert res.delivered is False
+
+
+@pytest.mark.asyncio
+async def test_negative_cache_ttl_expiry_triggers_recheck(qp_service, store, fake_bot):
+    """When a negative-cached paper's TTL has expired (not_available_until in the past),
+    deliver() must atomically reset the row and re-query NITRIS."""
+    past_time = datetime.now(timezone.utc) - timedelta(hours=1)
+    store[10] = {
+        "id": 10, "subject_code": "EC301", "academic_year": "2024-25/Autumn",
+        "exam_type": "end_sem", "portal_postback_target": "ctl00$ec301",
+        "telegram_file_id": None,
+        "status": QPStatus.PAPER_NOT_AVAILABLE.value,
+        "not_available_until": past_time,
+        "file_kind": None, "file_size_bytes": None,
+        "acquired_by": None, "acquired_at": None, "error_message": None,
+        "attempt_count": 1,
+    }
+
+    nitris_called = False
+    async def fake_nitris(sub, yr, ex, pb):
+        nonlocal nitris_called
+        nitris_called = True
+        return b"%PDF-1.4 newly uploaded exam paper", "pdf"
+    qp_service._nitris_download = fake_nitris
+
+    res = await qp_service.deliver(cache_id=10, telegram_id=888)
+    assert res.delivered is True
+    assert nitris_called is True
+    assert store[10]["status"] == QPStatus.PAPER_AVAILABLE.value
+    assert store[10]["telegram_file_id"] is not None
+
+
+@pytest.mark.asyncio
+async def test_paper_not_available_error_creates_negative_cache(qp_service, store, fake_bot):
+    """When NITRIS download raises PaperNotAvailableError (postback returned form HTML),
+    acquisition must set status='paper_not_available' with 24h TTL."""
+    store[11] = {
+        "id": 11, "subject_code": "ME201", "academic_year": "2024-25/Autumn",
+        "exam_type": "mid_sem", "portal_postback_target": "ctl00$me201",
+        "telegram_file_id": None,
+        "status": QPStatus.RETRYABLE_FAILURE.value,
+        "not_available_until": None,
+        "file_kind": None, "file_size_bytes": None,
+        "acquired_by": None, "acquired_at": None, "error_message": None,
+        "attempt_count": 0,
+    }
+
+    async def fake_nitris_unuploaded(*args):
+        raise PaperNotAvailableError("Server returned form HTML instead of paper bytes. Paper has not been uploaded yet.")
+    qp_service._nitris_download = fake_nitris_unuploaded
+
+    res = await qp_service.deliver(cache_id=11, telegram_id=777)
+    assert res.not_available is True
+    assert res.delivered is False
+    assert store[11]["status"] == QPStatus.PAPER_NOT_AVAILABLE.value
+    assert store[11]["not_available_until"] is not None
+    assert store[11]["not_available_until"] > datetime.now(timezone.utc)
+

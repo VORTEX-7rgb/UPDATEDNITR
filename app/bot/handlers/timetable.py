@@ -62,8 +62,8 @@ def get_not_synced_keyboard() -> types.InlineKeyboardMarkup:
 
 
 def get_day_selector_keyboard(selected_day: int) -> types.InlineKeyboardMarkup:
-    """Day selector bar for viewing weekly timetable (Mon-Fri)."""
-    days = [("Mon", 0), ("Tue", 1), ("Wed", 2), ("Thu", 3), ("Fri", 4)]
+    """Day selector bar for viewing weekly timetable (Mon-Sat)."""
+    days = [("Mon", 0), ("Tue", 1), ("Wed", 2), ("Thu", 3), ("Fri", 4), ("Sat", 5)]
     buttons = []
     for label, day_idx in days:
         text = f"• {label} •" if day_idx == selected_day else label
@@ -71,9 +71,14 @@ def get_day_selector_keyboard(selected_day: int) -> types.InlineKeyboardMarkup:
             types.InlineKeyboardButton(text=text, callback_data=f"tt_day_{day_idx}")
         )
 
+    # 3 buttons per row
+    row1 = buttons[:3]
+    row2 = buttons[3:]
+
     return types.InlineKeyboardMarkup(
         inline_keyboard=[
-            buttons,
+            row1,
+            row2,
             [
                 types.InlineKeyboardButton(text="⏰ Now & Next", callback_data="tt_now_next"),
                 types.InlineKeyboardButton(text="🔄 Sync from NITRIS", callback_data="tt_sync"),
@@ -195,7 +200,7 @@ async def cmd_now_next(message: types.Message):
 @router.message(Command("schedule"), StateFilter("*"))
 async def cmd_timetable(message: types.Message):
     """Command /timetable: Show timetable for today or full weekly schedule."""
-    today_weekday = min(datetime.now(IST).weekday(), 4)  # Cap at Friday (4) if Weekend
+    today_weekday = min(datetime.now(IST).weekday(), 5)  # Cap at Saturday (5) if Sunday
     text, kb = await _handle_day_display(message.from_user.id, today_weekday)
     await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
@@ -239,7 +244,7 @@ async def cb_view_full(callback: types.CallbackQuery):
         await callback.answer()
     except Exception:
         pass
-    today_weekday = min(datetime.now(IST).weekday(), 4)  # Cap at Friday (4) if Weekend
+    today_weekday = min(datetime.now(IST).weekday(), 5)
     text, kb = await _handle_day_display(callback.from_user.id, today_weekday)
     try:
         await callback.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)

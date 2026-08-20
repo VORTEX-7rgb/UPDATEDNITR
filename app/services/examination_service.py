@@ -143,6 +143,11 @@ class ExaminationService:
                 else:
                     if existing.portal_postback_target != r.mid_sem_target:
                         existing.portal_postback_target = r.mid_sem_target
+                    if existing.status == QPStatus.PAPER_NOT_AVAILABLE.value:
+                        existing.status = QPStatus.RETRYABLE_FAILURE.value
+                        existing.not_available_until = None
+                        existing.attempt_count = 0
+                        existing.error_message = None
                     synced_records.append(existing)
             else:
                 existing = await self.get_cached_paper(r.subject_code, academic_year, "mid_sem")
@@ -169,6 +174,11 @@ class ExaminationService:
                 else:
                     if existing.portal_postback_target != r.end_sem_target:
                         existing.portal_postback_target = r.end_sem_target
+                    if existing.status == QPStatus.PAPER_NOT_AVAILABLE.value:
+                        existing.status = QPStatus.RETRYABLE_FAILURE.value
+                        existing.not_available_until = None
+                        existing.attempt_count = 0
+                        existing.error_message = None
                     synced_records.append(existing)
             else:
                 existing = await self.get_cached_paper(r.subject_code, academic_year, "end_sem")

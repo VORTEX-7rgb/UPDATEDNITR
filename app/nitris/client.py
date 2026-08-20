@@ -42,6 +42,7 @@ from app.nitris.exceptions import (
     AttendanceTableMissingError,
     HiddenFieldExtractionError,
     InvalidContextError,
+    PaperNotAvailableError,
 )
 from app.nitris.aspnet import (
     extract_form_fields,
@@ -1010,11 +1011,10 @@ class NitrisClient:
                 f"Resolved URL did not return PDF or ZIP binary bytes (got signature {head2!r})."
             )
 
-        # 5. Server returned form HTML instead of binary — postback failed.
-        #    This typically means the postback target is invalid or expired.
-        if "text/html" in content_type and b"__VIEWSTATE" in resp.content:
-            raise AttendanceWorkflowError(
-                "Server returned form HTML instead of paper bytes. Postback failed."
+        # 5. Server returned form HTML instead of binary — paper not uploaded yet.
+        if ("text/html" in content_type and b"__VIEWSTATE" in resp.content) or (b"__VIEWSTATE" in resp.content and resp.content[:4] not in (b"%PDF", b"PK\x03\x04")):
+            raise PaperNotAvailableError(
+                "Server returned form HTML instead of paper bytes. Paper has not been uploaded yet."
             )
 
         # 6. Last-resort: return whatever bytes we got (could be octet-stream with

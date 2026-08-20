@@ -49,6 +49,7 @@ from app.db.models import QuestionPaperCache, QPStatus
 from app.nitris.client import NitrisClient
 from app.nitris.exceptions import (
     AttendanceWorkflowError, SessionExpiredError, LoginError, InvalidContextError,
+    PaperNotAvailableError,
 )
 from app.utils import esc
 
@@ -59,6 +60,7 @@ MAX_CONCURRENT_ACQUISITIONS = 8       # caps NITRIS load + memory (8 × ~5MB PDF
 MAX_CONCURRENT_DELIVERIES = 25        # under Telegram's ~30/sec bot rate limit
 ACQUIRE_STALE_SECONDS = 300            # 5 min — stale locks become reclaimable
 ACQUIRE_PERMANENT_AFTER = 5           # retryable_failure becomes permanent_failure after N attempts
+NEGATIVE_CACHE_TTL_SECONDS = 86400    # 24h negative cache TTL for papers not yet uploaded
 WAIT_POLL_INTERVAL_SEC = 2.0
 WAIT_TIMEOUT_SEC = 60.0
 FLOODWAIT_MAX_RETRIES = 3
@@ -155,7 +157,10 @@ class QPaperService:
           1. Read cache row (short DB session).
           2. Dispatch on status:
              - paper_available → cached delivery (bounded by delivery semaphore)
-             - paper_not_available → clean "no paper" result
+             - paper_not_available → check TTL:
+                 * not_available_until is None -> permanent (e.g. labs), instant no paper
+                 * not_available_until > now -> TTL active, instant no paper (zero NITRIS calls)
+                 * not_available_until <= now -> TTL expired, reset to retryable_failure and re-check
              - permanent_failure → error result
              - fetch_in_progress → wait + deliver
              - retryable_failure → try to acquire (claim)
@@ -166,17 +171,37 @@ class QPaperService:
         snapshot = await self._read_cache(cache_id)
         if snapshot is None:
             return QPResult(error="Question paper record not found.")
-        status, file_id, file_kind, sub_code, ac_year, ex_type, postback, err_msg = snapshot
+        status, file_id, file_kind, sub_code, ac_year, ex_type, postback, err_msg, not_avail_until = snapshot
 
         if status == QPStatus.PAPER_AVAILABLE.value and file_id:
             return await self._deliver_cached(
                 cache_id, file_id, file_kind, telegram_id, sub_code, ac_year, ex_type, postback
             )
         if status == QPStatus.PAPER_NOT_AVAILABLE.value:
-            return QPResult(not_available=True)
+            if not_avail_until is None:
+                # Permanent negative cache (e.g. labs/1-credit with no portal button)
+                return QPResult(not_available=True)
+            if not_avail_until > _now_utc():
+                # TTL active — zero NITRIS traffic
+                return QPResult(not_available=True)
+            # TTL expired — atomically reset to retryable_failure so we re-acquire
+            async with self.session_factory() as session:
+                async with session.begin():
+                    await session.execute(text("""
+                        UPDATE question_paper_caches
+                        SET status = :retryable,
+                            not_available_until = NULL,
+                            attempt_count = 0,
+                            updated_at = NOW()
+                        WHERE id = :id AND status = :not_avail
+                    """), {
+                        "retryable": QPStatus.RETRYABLE_FAILURE.value,
+                        "not_avail": QPStatus.PAPER_NOT_AVAILABLE.value,
+                        "id": cache_id,
+                    })
         if status == QPStatus.PERMANENT_FAILURE.value:
             return QPResult(permanent=True, error=err_msg or "permanent_failure")
-        # fetch_in_progress OR retryable_failure → try to claim
+        # fetch_in_progress OR retryable_failure (including newly expired TTL) → try to claim
         return await self._claim_or_wait_and_deliver(
             cache_id, telegram_id, sub_code, ac_year, ex_type, postback
         )
@@ -192,6 +217,7 @@ class QPaperService:
                 rec.status, rec.telegram_file_id, rec.file_kind,
                 rec.subject_code, rec.academic_year, rec.exam_type,
                 rec.portal_postback_target, rec.error_message,
+                getattr(rec, "not_available_until", None),
             )
 
     # ── Cached delivery — bounded, FloodWait-aware ───────────────────
@@ -246,6 +272,7 @@ class QPaperService:
                                     "retryable": QPStatus.RETRYABLE_FAILURE.value,
                                     "id": cache_id,
                                     "err": f"Stale file_id: {e}",
+                                    "updated_at": _now_utc(),
                                 })
                         if postback is None:
                             snap = await self._read_cache(cache_id)
@@ -358,6 +385,14 @@ class QPaperService:
                 return await self._deliver_cached(
                     cache_id, file_id, kind, telegram_id, sub_code, ac_year, ex_type
                 )
+            except PaperNotAvailableError as exc:
+                # NITRIS confirms paper is not uploaded yet -> mark paper_not_available with 24h TTL
+                await self._mark_not_available(cache_id, exc, ttl_seconds=NEGATIVE_CACHE_TTL_SECONDS)
+                logger.info(
+                    "QP paper not uploaded cache_id=%d job=%s — caching negatively for %ds",
+                    cache_id, job_id[:8], NEGATIVE_CACHE_TTL_SECONDS,
+                )
+                return QPResult(not_available=True)
             except Exception as exc:
                 # Classify and update cache atomically. NEVER corrupt: the row's
                 # status transitions to retryable_failure or permanent_failure —
@@ -390,7 +425,7 @@ class QPaperService:
             snap = await self._read_cache(cache_id)
             if snap is None:
                 return QPResult(error="Record disappeared during wait.")
-            status, file_id, file_kind, sub_code, ac_year, ex_type, _, err_msg = snap
+            status, file_id, file_kind, sub_code, ac_year, ex_type, _, err_msg, not_avail_until = snap
             if status != last_status:
                 logger.info(
                     "Wait poll cache_id=%d status=%s elapsed=%.1fs",
@@ -586,6 +621,28 @@ class QPaperService:
                     WHERE id = :cache_id AND status = :in_progress
                 """), {
                     "status": new_status,
+                    "err": str(exc)[:1000],
+                    "cache_id": cache_id,
+                    "in_progress": QPStatus.FETCH_IN_PROGRESS.value,
+                })
+
+    async def _mark_not_available(
+        self, cache_id: int, exc: Exception, ttl_seconds: int = NEGATIVE_CACHE_TTL_SECONDS,
+    ) -> None:
+        async with self.session_factory() as session:
+            async with session.begin():
+                await session.execute(text("""
+                    UPDATE question_paper_caches
+                    SET status = :status,
+                        not_available_until = NOW() + make_interval(secs => :ttl),
+                        acquired_by = NULL,
+                        acquired_at = NULL,
+                        error_message = :err,
+                        updated_at = NOW()
+                    WHERE id = :cache_id AND status = :in_progress
+                """), {
+                    "status": QPStatus.PAPER_NOT_AVAILABLE.value,
+                    "ttl": ttl_seconds,
                     "err": str(exc)[:1000],
                     "cache_id": cache_id,
                     "in_progress": QPStatus.FETCH_IN_PROGRESS.value,

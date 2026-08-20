@@ -46,3 +46,8 @@ class CredentialsQuarantinedError(NitrisError):
     breaker. The user must re-register (/forgot) before logins resume.
     """
 
+
+class PaperNotAvailableError(NitrisError):
+    """The requested question paper exists in the catalog but has not been uploaded to the portal yet."""
+
+
