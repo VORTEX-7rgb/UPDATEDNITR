@@ -68,3 +68,31 @@ async def test_broadcast_one_floodwait_then_ok(monkeypatch):
     bot.send_message = AsyncMock(side_effect=[_retry_after(), MagicMock()])
     assert await _send_broadcast_one(bot, 1, "hello") == "ok"
     assert bot.send_message.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_broadcast_one_pin_ok():
+    bot = MagicMock()
+    sent = MagicMock()
+    sent.message_id = 123
+    bot.send_message = AsyncMock(return_value=sent)
+    bot.pin_chat_message = AsyncMock()
+
+    assert await _send_broadcast_one(bot, 1, "hello", pin=True) == "ok"
+    bot.pin_chat_message.assert_awaited_once_with(
+        chat_id=1, message_id=123, disable_notification=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_broadcast_one_pin_fails_but_delivered():
+    bot = MagicMock()
+    sent = MagicMock()
+    sent.message_id = 123
+    bot.send_message = AsyncMock(return_value=sent)
+    bot.pin_chat_message = AsyncMock(
+        side_effect=TelegramAPIError(method="pinChatMessage", message="Bad Request")
+    )
+
+    # Message is still delivered; only the pin failed.
+    assert await _send_broadcast_one(bot, 1, "hello", pin=True) == "pin_failed"

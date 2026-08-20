@@ -177,16 +177,36 @@ BROADCAST_MAX_LEN = 4000        # Telegram hard limit is 4096; leave headroom
 BROADCAST_PROGRESS_EVERY = 250  # edit status message every N sends
 
 
-async def _send_broadcast_one(bot, telegram_id: int, text: str) -> str:
-    """Send one plain-text broadcast message.
+async def _send_broadcast_one(bot, telegram_id: int, text: str, pin: bool = False) -> str:
+    """Send one plain-text broadcast message, optionally pinning it in the user's chat.
 
-    Returns a status string: 'ok' | 'blocked' | 'inactive' | 'failed'.
-    Mirrors the FloodWait/blocked/deactivated handling already used by
-    EventDispatcherService._send_with_retry, but for plain text.
+    Returns a status string:
+      'ok'         — sent (and pinned, when requested)
+      'pin_failed' — sent, but the pin call errored (message still delivered)
+      'blocked'    — user blocked the bot
+      'inactive'   — chat not found / deactivated
+      'failed'     — send failed after retries
+
+    Pinning works in private 1-on-1 chats WITHOUT admin rights (the "must be
+    admin" rule only applies to groups/channels), so a pin failure is rare and
+    is never treated as a delivery failure.
     """
     for attempt in range(BROADCAST_MAX_RETRIES):
         try:
-            await bot.send_message(chat_id=telegram_id, text=text)
+            sent = await bot.send_message(chat_id=telegram_id, text=text)
+            if pin:
+                try:
+                    await bot.pin_chat_message(
+                        chat_id=telegram_id,
+                        message_id=sent.message_id,
+                        disable_notification=True,
+                    )
+                except TelegramAPIError as e:
+                    logger.warning("Broadcast pin failed for %d: %r", telegram_id, e)
+                    return "pin_failed"
+                except Exception as e:
+                    logger.warning("Broadcast pin failed (unexpected) for %d: %r", telegram_id, e)
+                    return "pin_failed"
             return "ok"
         except TelegramRetryAfter as e:
             if attempt + 1 >= BROADCAST_MAX_RETRIES:
@@ -209,19 +229,23 @@ async def _send_broadcast_one(bot, telegram_id: int, text: str) -> str:
 async def _run_broadcast(
     bot, telegram_ids: list[int], text: str,
     status_chat_id: int, status_message_id: int,
+    pin: bool = False,
 ) -> None:
     """Background worker: fan out the broadcast and report a final summary.
 
     Runs sequentially (no event-loop flooding), closes over no DB session,
     and never raises — so a failure in one send can't kill the whole run.
     """
-    sent = blocked = inactive = failed = 0
+    sent = blocked = inactive = failed = pin_failed = 0
     total = len(telegram_ids)
 
     for idx, tid in enumerate(telegram_ids, start=1):
-        status = await _send_broadcast_one(bot, tid, text)
+        status = await _send_broadcast_one(bot, tid, text, pin=pin)
         if status == "ok":
             sent += 1
+        elif status == "pin_failed":
+            sent += 1
+            pin_failed += 1
         elif status == "blocked":
             blocked += 1
         elif status == "inactive":
@@ -246,13 +270,22 @@ async def _run_broadcast(
         # Gentle pacing under Telegram's global ~30 msg/s bot limit.
         await asyncio.sleep(BROADCAST_PACING_SECONDS)
 
-    summary = (
-        f"✅ <b>Broadcast complete</b>\n\n"
-        f"📨 Delivered: <b>{sent}</b>/{total}\n"
-        f"🚫 Blocked the bot: <b>{blocked}</b>\n"
-        f"👤 Inactive/deleted: <b>{inactive}</b>\n"
-        f"❌ Failed: <b>{failed}</b>"
-    )
+    summary_lines = [
+        f"✅ <b>Broadcast complete</b>",
+        "",
+        f"📨 Delivered: <b>{sent}</b>/{total}",
+    ]
+    if pin:
+        summary_lines.append(f"📌 Pinned: <b>{sent - pin_failed}</b>")
+        if pin_failed:
+            summary_lines.append(f"⚠️ Delivered but not pinned: <b>{pin_failed}</b>")
+    summary_lines += [
+        f"🚫 Blocked the bot: <b>{blocked}</b>",
+        f"👤 Inactive/deleted: <b>{inactive}</b>",
+        f"❌ Failed: <b>{failed}</b>",
+    ]
+    summary = "\n".join(summary_lines)
+
     try:
         await bot.edit_message_text(
             chat_id=status_chat_id, message_id=status_message_id,
@@ -265,17 +298,17 @@ async def _run_broadcast(
             logger.error("Failed to deliver broadcast summary to admin %d: %r", status_chat_id, e)
 
 
-@router.message(Command("broadcast"), StateFilter("*"))
-async def cmd_broadcast(message: types.Message):
-    """Admin command: send a plain-text message to all registered users."""
+async def _broadcast_common(message: types.Message, pin: bool, command_name: str) -> None:
+    """Shared logic for /broadcast and /broadcastpin (admin-gated)."""
     if not is_admin(message.from_user.id):
         return
 
     args = message.text.strip().split(maxsplit=1)
     if len(args) < 2 or not args[1].strip():
+        pin_desc = " and pins it in their chat" if pin else ""
         await message.answer(
-            "Usage: <code>/broadcast &lt;message text&gt;</code>\n\n"
-            "Sends the message to <b>ALL</b> registered users as plain text.\n"
+            f"Usage: <code>/{command_name} &lt;message text&gt;</code>\n\n"
+            f"Sends the message to <b>ALL</b> registered users{pin_desc} as plain text.\n"
             "Runs in the background and reports a summary when done.",
             parse_mode=ParseMode.HTML,
         )
@@ -294,8 +327,9 @@ async def cmd_broadcast(message: types.Message):
         await message.answer("⚠️ No registered users to broadcast to.")
         return
 
+    action = "Broadcast + Pin" if pin else "Broadcast"
     status_msg = await message.answer(
-        f"📣 <b>Broadcast started</b>\n\n"
+        f"📣 <b>{action} started</b>\n\n"
         f"👥 Target: <b>{len(telegram_ids)}</b> users\n"
         f"⏳ Running in background — this message updates with progress.",
         parse_mode=ParseMode.HTML,
@@ -305,5 +339,18 @@ async def cmd_broadcast(message: types.Message):
         _run_broadcast(
             message.bot, telegram_ids, text,
             status_msg.chat.id, status_msg.message_id,
+            pin=pin,
         )
     )
+
+
+@router.message(Command("broadcast"), StateFilter("*"))
+async def cmd_broadcast(message: types.Message):
+    """Admin command: send a plain-text message to all registered users."""
+    await _broadcast_common(message, pin=False, command_name="broadcast")
+
+
+@router.message(Command("broadcastpin"), StateFilter("*"))
+async def cmd_broadcastpin(message: types.Message):
+    """Admin command: send + pin a plain-text message in every user's chat."""
+    await _broadcast_common(message, pin=True, command_name="broadcastpin")
