@@ -316,12 +316,17 @@ class NitrisJobQueue:
                 )
                 new_payload = dict(job.payload)
                 new_payload["_retry_attempt"] = attempt_count + 1
+                # Mark the job so `finally` keeps the single-flight dedup entry
+                # alive across the backoff window - identical requests arriving
+                # during that window must JOIN this retry, not race a duplicate.
+                job._retry_scheduled = True
                 asyncio.create_task(self._schedule_retry(
                     job.job_type, job.user_id, job.priority, job.dedup_key,
                     new_payload, backoff, job.future,
                 ))
         finally:
-            self._cleanup_dedup(job.dedup_key)
+            if not getattr(job, "_retry_scheduled", False):
+                self._cleanup_dedup(job.dedup_key)
             try:
                 queue.task_done()
             except ValueError:
@@ -332,27 +337,35 @@ class NitrisJobQueue:
         dedup_key: Optional[str], payload: dict, backoff: float,
         original_future: Optional[asyncio.Future],
     ) -> None:
-        """Sleep for backoff seconds, then re-enqueue the job."""
-        await asyncio.sleep(backoff)
+        """Sleep for backoff seconds, then re-enqueue the job.
+
+        Owns the single-flight dedup entry for the whole backoff+execution
+        window and releases it when the chain settles (result, exception, or
+        enqueue rejection).
+        """
         try:
-            retry_future = await self.enqueue(
-                job_type=job_type,
-                user_id=user_id,
-                priority=Priority(priority),
-                dedup_key=dedup_key,
-                payload=payload,
-            )
+            await asyncio.sleep(backoff)
             try:
-                result = await retry_future
-                if original_future and not original_future.done():
-                    original_future.set_result(result)
+                retry_future = await self.enqueue(
+                    job_type=job_type,
+                    user_id=user_id,
+                    priority=Priority(priority),
+                    dedup_key=dedup_key,
+                    payload=payload,
+                )
+                try:
+                    result = await retry_future
+                    if original_future and not original_future.done():
+                        original_future.set_result(result)
+                except Exception as e:
+                    if original_future and not original_future.done():
+                        original_future.set_exception(e)
             except Exception as e:
+                logger.error("Retry enqueue failed for %s: %r", job_type, e)
                 if original_future and not original_future.done():
                     original_future.set_exception(e)
-        except Exception as e:
-            logger.error("Retry enqueue failed for %s: %r", job_type, e)
-            if original_future and not original_future.done():
-                original_future.set_exception(e)
+        finally:
+            self._cleanup_dedup(dedup_key)
 
     def cancel_dedup(self, dedup_key: str) -> bool:
         """Phase 7.3: Cancel an in-flight job by dedup_key. Returns True if
