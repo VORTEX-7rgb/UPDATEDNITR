@@ -91,33 +91,55 @@ async def test_render_single_message_cached():
 
 
 @pytest.mark.asyncio
-async def test_render_single_message_stale_fetches():
-    """Stale cached body (> TTL) triggers background fetch with dedup_key."""
+async def test_render_single_message_old_body_served_cached():
+    """CACHE-FIRST FOREVER: an old stored body is served as-is — no time-based
+    refetching. Freshness comes from sync edit-detection + Refresh Now."""
     user = FakeRecord(id=10, roll_number="125AI0001")
-    stale_msg = FakeRecord(
+    old_msg = FakeRecord(
         id=100,
         user_id=10,
         sender="Prof Smith",
         subject="Exam Notice",
         sent_on=datetime(2026, 8, 20, 10, 0, tzinfo=timezone.utc),
         body="Old body",
-        body_fetched_at=datetime.now(timezone.utc) - timedelta(hours=7),  # > 6h TTL
+        body_fetched_at=datetime.now(timezone.utc) - timedelta(days=3),  # very old
         attachment_url=None,
         is_read=True,
     )
 
     event = FakeEvent()
-    fake_session = AsyncMock()
+
+    with patch("app.nitris.job_queue.nitris_job_queue.enqueue") as mock_enqueue:
+        await render_single_message(event, user, old_msg)
+        mock_enqueue.assert_not_called()
+        assert len(event.answers) == 1
+        assert "Old body" in event.answers[0]
+
+
+@pytest.mark.asyncio
+async def test_render_single_message_missing_body_fetches():
+    """body=None (true first-ever open) triggers exactly one deduplicated fetch."""
+    from datetime import datetime as _dt
+
+    user = FakeRecord(id=10, roll_number="125AI0001")
+    never_fetched = FakeRecord(
+        id=101,
+        user_id=10,
+        sender="Prof Smith",
+        subject="Backlog Notice",
+        sent_on=datetime(2026, 8, 20, 10, 0, tzinfo=timezone.utc),
+        body=None,
+        body_fetched_at=None,
+        attachment_url=None,
+        is_read=True,
+    )
+
+    event = FakeEvent()
     future = asyncio.Future()
     future.set_result({"success": True})
 
-    with patch("app.nitris.job_queue.nitris_job_queue.enqueue", return_value=future) as mock_enqueue, \
-         patch("app.bot.telegram.select"):
-        fake_result = MagicMock()
-        fake_result.scalar_one_or_none.return_value = stale_msg
-        fake_session.execute = AsyncMock(return_value=fake_result)
-
-        await render_single_message(event, user, stale_msg, fake_session)
+    with patch("app.nitris.job_queue.nitris_job_queue.enqueue", return_value=future) as mock_enqueue:
+        await render_single_message(event, user, never_fetched)
         mock_enqueue.assert_called_once()
         call_kwargs = mock_enqueue.call_args.kwargs
-        assert call_kwargs["dedup_key"] == "inbox_detail:user:10:msg:100"
+        assert call_kwargs["dedup_key"] == "inbox_detail:user:10:msg:101"

@@ -60,16 +60,14 @@ async def render_single_message(event, user: User, msg: InboxMessage, session=No
         except Exception as e:
             logger.warning("Failed marking message id=%s read: %r", msg.id, e)
 
-    # ── TTL check on cached body ──────────────────────────
-    need_fetch = False
-    if msg.body is None:
-        need_fetch = True
-    elif getattr(msg, "body_fetched_at", None) is None:
-        need_fetch = True
-    else:
-        age_seconds = (datetime.now(timezone.utc) - msg.body_fetched_at).total_seconds()
-        if age_seconds > config.INBOX_BODY_TTL_SECONDS:
-            need_fetch = True
+    # ── CACHE-FIRST FOREVER ───────────────────────────────
+    # A stored body is served as-is, permanently. Freshness is guaranteed by:
+    #   1. Background sync edit-detection (persist_inbox_sync nulls body when
+    #      subject/sent_on change -> next open refetches), and
+    #   2. The explicit "Refresh Now" button (full portal sync).
+    # Time-based refetching was removed: notices are effectively immutable and
+    # the old 30-min TTL cost a full NITRIS login per tap per message.
+    need_fetch = msg.body is None
 
     if need_fetch:
         if isinstance(event, types.CallbackQuery):
