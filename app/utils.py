@@ -3,7 +3,30 @@
 import html
 import posixpath
 import urllib.parse
+from datetime import datetime
 from typing import Any
+
+from app.config import IST
+
+
+def current_academic_year(now: datetime | None = None) -> str:
+    """Derive the CURRENT NITR academic year string, e.g. '2026-27'.
+
+    NITR convention (mirrors NitrisClient._current_semester_type):
+      * July–December  -> Autumn semester of academic year <Y>-<Y+1>
+      * January–June   -> Spring semester of academic year <Y-1>-<Y>
+
+    Never hardcode years at call sites — this keeps searches aligned with the
+    real calendar as time passes.
+    """
+    if now is None:
+        now = datetime.now(IST)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=IST)
+    else:
+        now = now.astimezone(IST)
+    start = now.year if now.month >= 7 else now.year - 1
+    return f"{start}-{(start + 1) % 100:02d}"
 
 
 def esc(val: Any) -> str:

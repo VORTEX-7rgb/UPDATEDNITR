@@ -704,10 +704,15 @@ async def handle_qp_search(job: NitrisJob) -> dict:
 
                 from app.nitris.examination_parser import parse_question_papers_html
 
+                # Derive the current academic year from the calendar - searching a
+                # hardcoded year silently returns nothing once semesters roll over.
+                from app.utils import current_academic_year
+                ay = current_academic_year()
+
                 search_records = []
                 try:
                     html_autumn = await client.fetch_question_papers(
-                        academic_year="2024-25/Autumn", subject_query=query
+                        academic_year=f"{ay}/Autumn", subject_query=query
                     )
                     search_records.extend(parse_question_papers_html(html_autumn))
                 except Exception as e_autumn:
@@ -715,7 +720,7 @@ async def handle_qp_search(job: NitrisJob) -> dict:
 
                 try:
                     html_spring = await client.fetch_question_papers(
-                        academic_year="2024-25/Spring", subject_query=query
+                        academic_year=f"{ay}/Spring", subject_query=query
                     )
                     search_records.extend(parse_question_papers_html(html_spring))
                 except Exception as e_spring:

@@ -127,7 +127,8 @@ async def handle_year_selected(callback: types.CallbackQuery, state: FSMContext)
     telegram_id = callback.from_user.id
     data = callback.data[6:]
     subject_code, year_code = data.rsplit("_", 1)
-    full_year_str = YEAR_MAP.get(year_code, "2025-26/Spring")
+    from app.utils import current_academic_year
+    full_year_str = YEAR_MAP.get(year_code) or current_academic_year()
 
     try:
         await callback.answer("⏳ Locating question papers...")
