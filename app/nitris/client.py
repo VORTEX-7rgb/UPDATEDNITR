@@ -66,7 +66,10 @@ class NitrisClient:
 
     def __init__(self) -> None:
         self.base_url = config.NITRIS_BASE_URL
-        self._debug = os.getenv("DEBUG_ATTENDANCE", "").lower() in ("1", "true")
+        # Single documented switch is DEBUG=true (.env). DEBUG_ATTENDANCE remains
+        # as a legacy explicit override. Snapshots contain student PII — keep off
+        # in production.
+        self._debug = config.DEBUG or os.getenv("DEBUG_ATTENDANCE", "").lower() in ("1", "true")
         limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
         self.client = httpx.AsyncClient(
             base_url=self.base_url,
