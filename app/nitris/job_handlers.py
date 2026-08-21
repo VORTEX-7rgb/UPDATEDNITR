@@ -112,7 +112,7 @@ async def handle_attendance_refresh(job: NitrisJob) -> dict:
             client = NitrisClient()
             try:
                 await nitris_gateway.login_through_gateway(client, roll_number, password, user_id=user_id)
-                data = await get_attendance_data(roll_number, password, client=client, user_id=user_id)
+                data = await get_attendance_data(roll_number, password, client=client)
             finally:
                 await client.close()
                 # password drops out of scope here
