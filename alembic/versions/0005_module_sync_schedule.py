@@ -20,8 +20,8 @@ depends_on: Union[str, Sequence[str], None] = None
 def upgrade() -> None:
     op.execute("""
         CREATE TABLE IF NOT EXISTS module_sync_schedule (
-            id SERIAL PRIMARY KEY,
-            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             module_name VARCHAR(100) NOT NULL,
             last_synced_at TIMESTAMPTZ,
             next_sync_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),

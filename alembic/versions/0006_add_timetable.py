@@ -38,8 +38,8 @@ depends_on: Union[str, Sequence[str], None] = None
 def upgrade() -> None:
     op.execute("""
         CREATE TABLE IF NOT EXISTS timetable_entries (
-            id              SERIAL PRIMARY KEY,
-            user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            id              BIGSERIAL PRIMARY KEY,
+            user_id         BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             weekday         SMALLINT NOT NULL CHECK (weekday BETWEEN 0 AND 6),
             period_index    SMALLINT NOT NULL CHECK (period_index BETWEEN 1 AND 12),
             start_time      TIME NOT NULL,
