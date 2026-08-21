@@ -163,6 +163,27 @@ async def on_credentials_updated(user_id: int) -> None:
                     """),
                     {"user_id": user_id},
                 )
+                # Re-arm any auto-sync schedules that reached the terminal
+                # 'disabled' state (5 consecutive failures). Without this, a user
+                # who fixes their password via /forgot would still never have
+                # attendance/inbox sync again, because the claim query filters
+                # last_status = 'disabled'. Reset only auto-sync modules; the
+                # manual timetable schedule is left untouched.
+                await session.execute(
+                    text("""
+                        UPDATE module_sync_schedule
+                        SET last_status = 'pending',
+                            consecutive_failures = 0,
+                            last_error = NULL,
+                            scheduler_claimed_at = NULL,
+                            next_sync_at = NOW(),
+                            updated_at = NOW()
+                        WHERE user_id = :user_id
+                          AND module_name IN ('attendance', 'inbox')
+                          AND last_status = 'disabled'
+                    """),
+                    {"user_id": user_id},
+                )
     except Exception as e:
         logger.error("on_credentials_updated DB update failed for user_id=%d: %r", user_id, e)
         return

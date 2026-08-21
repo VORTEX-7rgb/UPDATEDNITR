@@ -11,7 +11,7 @@ from app.nitris.constants import (
     TIMETABLE_HEADING_TEXT, TIMETABLE_TABLE_CSS_CLASS,
     TIMETABLE_TITLE_RE, TIMETABLE_ROOM_RE, TIMETABLE_TIME_RE,
 )
-from app.nitris.exceptions import AttendanceParseError, HomeParseError
+from app.nitris.exceptions import AttendanceParseError, HomeParseError, InboxParseError
 
 logger = logging.getLogger(__name__)
 
@@ -517,6 +517,22 @@ def extract_message_id(token: str) -> Optional[int]:
     except Exception:
         return None
 
+def _content_portal_id(sender: str, subject: str, sent_on: datetime) -> int:
+    """Deterministic, collision-resistant portal_message_id from message identity.
+
+    Used as the fallback when a portal token's numeric ID cannot be decoded
+    (token format changed) or for historical messages whose ASP.NET postback
+    token is unstable. 60-bit SHA-256 digest fits the BigInteger column and
+    requires two messages with byte-identical (sender, subject, sent_on) to
+    collide.
+    """
+    import hashlib
+    digest = hashlib.sha256(
+        f"{sender}|{subject}|{sent_on.isoformat()}".encode("utf-8")
+    ).hexdigest()
+    return int(digest[:15], 16)
+
+
 def parse_messages_list_html(html: str) -> list[dict]:
     """Parse AllMessages.aspx page HTML and return raw list of message headers.
     
@@ -557,9 +573,6 @@ def parse_messages_list_html(html: str) -> list[dict]:
         sender = desc_el.get_text(strip=True) if desc_el else ""
         time_str = time_el.get_text(strip=True) if time_el else ""
         
-        # Parse portal ID
-        portal_id = extract_message_id(token) or 0
-            
         # Parse date
         try:
             sent_on_date = datetime.strptime(time_str, "%d %b %Y")
@@ -569,6 +582,12 @@ def parse_messages_list_html(html: str) -> list[dict]:
                 sent_on_date = parsedate_to_datetime(time_str)
             except Exception:
                 sent_on_date = datetime.now()
+
+        # Parse portal ID - fall back to a content hash when the token's numeric
+        # ID cannot be decoded (never 0, which would collide across messages).
+        portal_id = extract_message_id(token)
+        if portal_id is None:
+            portal_id = _content_portal_id(sender, subject, sent_on_date)
                 
         dropdown_messages.append({
             "portal_message_id": portal_id,
@@ -580,6 +599,18 @@ def parse_messages_list_html(html: str) -> list[dict]:
         
     # 2. Parse the GridView table
     table = soup.find(id=MESSAGES_TABLE_ID)
+
+    # If neither the GridView nor the notification dropdown rendered, this is
+    # not the expected messages page (NITRIS markup changed or an unexpected
+    # page). Raise so the sync marks a failure and backs off instead of
+    # silently treating it as an empty inbox (which would stop new-message
+    # delivery with no error signal).
+    if table is None and not dropdown_items:
+        raise InboxParseError(
+            "No message container found (neither the messages GridView nor the "
+            "notification dropdown) - NITRIS messages markup may have changed."
+        )
+
     if not table:
         # If table is not found, we fallback to dropdown notification items only!
         return dropdown_messages
@@ -656,9 +687,8 @@ def parse_messages_list_html(html: str) -> list[dict]:
         else:
             # Older historical message: use the postback target as token!
             token = f"postback:{postback_target}"
-            # Generate deterministic portal message ID
-            h = hashlib.sha256(f"{sender}:{subject}:{sent_on_date.isoformat()}".encode("utf-8")).hexdigest()
-            portal_id = int(h[:8], 16)
+            # Generate deterministic portal message ID (collision-resistant, 60-bit)
+            portal_id = _content_portal_id(sender, subject, sent_on_date)
             
         grid_messages.append({
             "portal_message_id": portal_id,
@@ -668,7 +698,20 @@ def parse_messages_list_html(html: str) -> list[dict]:
             "sent_on": sent_on_date
         })
         
-    return grid_messages if grid_messages else dropdown_messages
+    # Dedupe by portal_message_id. Two distinct historical messages with
+    # identical (sender, subject, date) hash to the same ID, and the DB enforces
+    # UNIQUE(user_id, portal_message_id). Keeping the first avoids a constraint
+    # violation that would roll back the whole sync.
+    result = grid_messages if grid_messages else dropdown_messages
+    seen: set = set()
+    deduped = []
+    for m in result:
+        pid = m["portal_message_id"]
+        if pid in seen:
+            continue
+        seen.add(pid)
+        deduped.append(m)
+    return deduped
 
 
 

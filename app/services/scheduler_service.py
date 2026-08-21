@@ -425,6 +425,11 @@ async def init_scheduler() -> None:
         except Exception as e:
             logger.error("Failed to save attendance snapshot for user_id=%d: %r", user_id, e)
             await _update_sync_state(user_id, success=False, error_msg=str(e))
+            await update_schedule_after_job(
+                async_session_factory, schedule_id,
+                success=False, error_msg=str(e), module_name=module_name,
+            )
+            return {"success": False, "error": str(e)}
 
         await update_schedule_after_job(
             async_session_factory, schedule_id,

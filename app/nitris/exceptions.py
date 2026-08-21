@@ -37,6 +37,16 @@ class HomeParseError(NitrisError):
     """Could not parse the Home.aspx dashboard or timetable HTML."""
 
 
+class InboxParseError(NitrisError):
+    """Could not parse the messages list - NITRIS markup likely changed.
+
+    Raised when the messages page contains neither the messages GridView nor the
+    notification dropdown, meaning the page structure changed (or an unexpected
+    page was returned). Treated as a per-user fault (does NOT trip the global
+    circuit breaker) so one student's parse failure never blocks the whole bot.
+    """
+
+
 class CredentialsQuarantinedError(NitrisError):
     """A login attempt was refused because the user's credentials are quarantined.
 

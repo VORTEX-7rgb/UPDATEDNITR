@@ -19,7 +19,7 @@ from typing import Optional, AsyncGenerator
 import httpx
 
 from app.config import config
-from app.nitris.exceptions import NitrisError, LoginError, SessionExpiredError, CredentialsQuarantinedError
+from app.nitris.exceptions import NitrisError, LoginError, SessionExpiredError, CredentialsQuarantinedError, InboxParseError
 
 logger = logging.getLogger(__name__)
 
@@ -169,7 +169,7 @@ class NitrisGateway:
             # Success path
             await self._record_success(is_login, time.monotonic() - start_time)
 
-        except (LoginError, SessionExpiredError, CredentialsQuarantinedError):
+        except (LoginError, SessionExpiredError, CredentialsQuarantinedError, InboxParseError):
             # Per-user faults (bad credentials, one student's expired ASP.NET
             # session, a quarantined credential) must NOT trip the global
             # circuit breaker. One student's bad state must not take the whole
