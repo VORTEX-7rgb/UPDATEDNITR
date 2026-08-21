@@ -131,8 +131,27 @@ async def persist_inbox_sync(user_id, scraped_messages, detail_cache, existing_b
 
     async with get_db_session() as session:
         async with session.begin():
+            # Serialize concurrent per-user inbox persistence at the DB level.
+            # pg_advisory_xact_lock blocks until any competing transaction for
+            # this user commits, then holds until OUR transaction commits - it is
+            # auto-released on commit/rollback, so no lock can leak on exceptions.
+            from sqlalchemy import text
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+                {"key": f"inbox:user:{user_id}"},
+            )
+
             inbox_repo = InboxRepository(session)
             event_repo = EventRepository(session)
+
+            # Re-read current DB state INSIDE the lock. The passed-in
+            # existing_by_id was computed during prepare_inbox_sync (before this
+            # lock); a concurrent sync may have committed the same messages since
+            # then, so re-derive the authoritative map here to avoid a spurious
+            # unique-constraint violation.
+            portal_ids = [m["portal_message_id"] for m in scraped_messages]
+            current = await inbox_repo.get_by_portal_message_ids(user_id, portal_ids)
+            existing_by_id = {m.portal_message_id: m for m in current}
 
             for msg in scraped_messages:
                 normalized_scraped_sent_on = normalize_to_utc(msg["sent_on"])

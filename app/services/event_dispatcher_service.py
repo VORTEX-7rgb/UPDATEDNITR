@@ -107,6 +107,7 @@ async def claim_events(
                            OR claimed_at < NOW() - make_interval(secs => :stale_secs))
                     ORDER BY id ASC
                     LIMIT :batch
+                    FOR UPDATE SKIP LOCKED
                 )
                 RETURNING id, user_id, event_type, payload_json, attempt_count
             """)

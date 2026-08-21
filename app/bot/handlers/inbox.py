@@ -85,7 +85,11 @@ async def render_single_message(event, user: User, msg: InboxMessage, session) -
                     )
                     return
 
-                stmt = select(InboxMessage).where(InboxMessage.id == msg.id)
+                stmt = (
+                    select(InboxMessage)
+                    .where(InboxMessage.id == msg.id)
+                    .execution_options(populate_existing=True)
+                )
                 res = await session.execute(stmt)
                 msg = res.scalar_one_or_none()
 

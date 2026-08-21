@@ -9,6 +9,7 @@ from aiogram import types
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from app.utils import esc
+from app.config import IST
 
 
 def format_attendance_message(data) -> str:
@@ -70,7 +71,7 @@ def format_dashboard_text(user, unread_count: int = 0) -> str:
                 status_text += f"\n<i>Error: {esc(sync_state.last_error[:100])}</i>"
 
         if sync_state.last_sync:
-            last_synced_str = sync_state.last_sync.strftime("%d %b %H:%M")
+            last_synced_str = sync_state.last_sync.astimezone(IST).strftime("%d %b %H:%M")
 
     unread_label = f"🔴 {esc(unread_count)} New Messages" if unread_count > 0 else "0"
     msg = (

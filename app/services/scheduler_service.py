@@ -114,6 +114,7 @@ async def claim_due_schedule_rows(
                       )
                     ORDER BY next_sync_at ASC
                     LIMIT :batch
+                    FOR UPDATE SKIP LOCKED
                 )
                 RETURNING id, user_id, module_name, consecutive_failures
             """)

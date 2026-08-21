@@ -19,6 +19,7 @@ from app.db.database import get_db_session
 from app.db.repositories.user_repository import UserRepository
 from app.services.snapshot_service import SnapshotService
 from app.db.models import User, SyncState
+from app.config import IST
 
 from app.bot.fsm import Registration, Deregistration, InboxSearch
 from app.bot.common import format_dashboard_text, get_dashboard_keyboard
@@ -217,7 +218,8 @@ async def process_password(message: types.Message, state: FSMContext):
                 await snapshot_service.create_snapshot_if_changed(
                     user_id=user_id,
                     module_name="attendance",
-                    attendance_result=data
+                    attendance_result=data,
+                    baseline=True,
                 )
 
                 stmt = select(SyncState).where(SyncState.user_id == user_id)
@@ -226,8 +228,8 @@ async def process_password(message: types.Message, state: FSMContext):
                 if not sync_state:
                     sync_state = SyncState(user_id=user_id, failure_count=0)
                     session.add(sync_state)
-                sync_state.last_sync = datetime.now(timezone.utc)
-                sync_state.last_success = datetime.now(timezone.utc)
+                sync_state.last_sync = datetime.now(IST)
+                sync_state.last_success = datetime.now(IST)
                 sync_state.last_error = None
                 sync_state.failure_count = 0
 

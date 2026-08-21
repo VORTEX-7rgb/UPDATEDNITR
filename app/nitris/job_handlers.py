@@ -26,7 +26,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from app.bot.telegram import format_attendance_message
-from app.config import config
+from app.config import config, IST
 from app.db.crypto import decrypt_password
 from app.db.database import get_db_session, async_session_factory
 from app.db.models import User, SyncState, InboxMessage, Snapshot
@@ -723,9 +723,9 @@ async def _update_sync_state(
                     state = SyncState(user_id=user_id, failure_count=0)
                     session.add(state)
 
-                state.last_sync = datetime.now(timezone.utc)
+                state.last_sync = datetime.now(IST)
                 if success:
-                    state.last_success = datetime.now(timezone.utc)
+                    state.last_success = datetime.now(IST)
                     state.last_error = None
                     state.failure_count = 0
                 else:

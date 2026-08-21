@@ -48,6 +48,7 @@ def _setup(monkeypatch):
 
     fake_session = MagicMock()
     fake_session.begin.return_value = _AsyncCM()
+    fake_session.execute = AsyncMock()
 
     @asynccontextmanager
     async def _fake_get_db_session():
@@ -60,6 +61,7 @@ def _setup(monkeypatch):
         id=1, portal_message_id="p1", sender="Dean Academic",
         subject="Exam Notice", body="hello", attachment_url=None,
     ))
+    fake_inbox_repo.get_by_portal_message_ids = AsyncMock(return_value=[])
     monkeypatch.setattr(
         "app.db.repositories.inbox_repository.InboxRepository",
         lambda session: fake_inbox_repo,

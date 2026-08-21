@@ -37,7 +37,8 @@ class EventService:
             return default
 
     async def detect_and_store_changes(
-        self, user_id: int, previous_snapshot: Optional[Snapshot], new_snapshot: Snapshot
+        self, user_id: int, previous_snapshot: Optional[Snapshot], new_snapshot: Snapshot,
+        baseline: bool = False,
     ) -> list[Event]:
         """Detect and store differences between snapshots inside the Event Catalog.
         
@@ -51,6 +52,12 @@ class EventService:
 
         # Case 1: First sync (No previous snapshot)
         if not previous_snapshot:
+            if baseline:
+                logger.info(
+                    "First snapshot (baseline) for user_id=%s; suppressing NEW_SUBJECT_ADDED events.",
+                    user_id,
+                )
+                return events_created
             logger.info("First snapshot detected for user_id=%s. Logging all records as new subjects.", user_id)
             for rec in new_records:
                 payload = {

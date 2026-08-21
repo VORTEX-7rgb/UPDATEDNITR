@@ -4,6 +4,7 @@ import json
 import hashlib
 import logging
 from typing import Optional, Tuple
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Snapshot
@@ -23,7 +24,8 @@ class SnapshotService:
         self.event_service = EventService(session)
 
     async def create_snapshot_if_changed(
-        self, user_id: int, module_name: str, attendance_result: AttendanceResult
+        self, user_id: int, module_name: str, attendance_result: AttendanceResult,
+        baseline: bool = False,
     ) -> Tuple[bool, Optional[Snapshot], Snapshot]:
         """Verify, hash, and persist snapshot data if state changes are detected.
         
@@ -40,6 +42,16 @@ class SnapshotService:
         # 2. Generate SHA-256 hash of the sorted JSON payload
         snapshot_hash = hashlib.sha256(deterministic_json.encode("utf-8")).hexdigest()
         
+        # Serialize concurrent first-snapshot creation per (user, module). A plain
+        # FOR UPDATE on get_latest_snapshot cannot lock a row that does not exist
+        # yet, so two concurrent FIRST syncs would both see "no prior snapshot" and
+        # both insert + both fire events. This transaction-scoped advisory lock
+        # closes that window (auto-released on commit/rollback).
+        await self.session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+            {"key": f"snapshot:{user_id}:{module_name}"},
+        )
+
         # 3. Retrieve the single latest snapshot for comparisons, using a write lock
         latest_snapshot = await self.snapshot_repo.get_latest_snapshot(user_id, module_name, for_update=True)
         
@@ -75,6 +87,7 @@ class SnapshotService:
             user_id=user_id,
             previous_snapshot=previous_snapshot,
             new_snapshot=new_snapshot,
+            baseline=baseline,
         )
 
         return True, previous_snapshot, new_snapshot
