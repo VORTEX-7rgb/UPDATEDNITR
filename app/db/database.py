@@ -18,8 +18,8 @@ engine = create_async_engine(
     config.DATABASE_URL,
     echo=False,  # Set to True to log SQL statements during debugging
     pool_pre_ping=True,  # Prevent using stale/dropped connections
-    pool_size=10,  # Maintain a stable connection pool size
-    max_overflow=20,
+    pool_size=config.DB_POOL_SIZE,          # env-tunable (launch: 20)
+    max_overflow=config.DB_MAX_OVERFLOW,    # env-tunable (launch: 30)
     pool_recycle=1800,  # Recycle connections older than 30 minutes to prevent stale sockets
 )
 

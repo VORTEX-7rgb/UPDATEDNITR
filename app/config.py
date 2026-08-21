@@ -22,6 +22,11 @@ class Config:
     BOT_TOKEN = os.getenv("BOT_TOKEN", "")
     NITRIS_BASE_URL = os.getenv("NITRIS_BASE_URL", "https://eapplication.nitrkl.ac.in")
     DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:5432/collegeclaw")
+    # Postgres pool sizing (per process). Defaults preserve the historical
+    # 10+20. Launch tuning: 20+30 (~50 conns) leaves headroom under PG's
+    # default max_connections=100.
+    DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "10"))
+    DB_MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "20"))
     ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "")
 
     # Question-paper storage channel — a PRIVATE Telegram channel/supergroup where
