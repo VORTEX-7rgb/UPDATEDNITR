@@ -167,7 +167,13 @@ class NitrisGateway:
             yield
 
             # Success path
-            await self._record_success(is_login, time.monotonic() - start_time)
+            duration = time.monotonic() - start_time
+            await self._record_success(is_login, duration)
+            try:
+                from app.observability import metrics as _metrics
+                await _metrics.record_gateway_op(duration, is_login=is_login)
+            except Exception:
+                pass
 
         except (LoginError, SessionExpiredError, CredentialsQuarantinedError, InboxParseError):
             # Per-user faults (bad credentials, one student's expired ASP.NET
