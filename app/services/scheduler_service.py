@@ -178,21 +178,21 @@ async def update_schedule_after_job(
     else:
         # Exponential backoff: 1x, 2x, 4x, 6x (capped)
         async with session_factory() as session:
-            row = (await session.execute(
-                text("SELECT consecutive_failures FROM module_sync_schedule WHERE id = :id"),
-                {"id": schedule_id},
-            )).first()
-            failures = row[0] + 1 if row else 1
-
-            backoff_multiplier = min(2 ** (failures - 1), 6)
-            backoff_seconds = ttl_seconds * backoff_multiplier
-            # Cap backoff at 24 hours
-            backoff_seconds = min(backoff_seconds, 24 * 3600)
-
-            # After 5 consecutive failures, disable this module for this user
-            new_status = "disabled" if failures >= 5 else "failure"
-
             async with session.begin():
+                row = (await session.execute(
+                    text("SELECT consecutive_failures FROM module_sync_schedule WHERE id = :id"),
+                    {"id": schedule_id},
+                )).first()
+                failures = row[0] + 1 if row else 1
+
+                backoff_multiplier = min(2 ** (failures - 1), 6)
+                backoff_seconds = ttl_seconds * backoff_multiplier
+                # Cap backoff at 24 hours
+                backoff_seconds = min(backoff_seconds, 24 * 3600)
+
+                # After 5 consecutive failures, disable this module for this user
+                new_status = "disabled" if failures >= 5 else "failure"
+
                 await session.execute(text("""
                     UPDATE module_sync_schedule
                     SET next_sync_at = NOW() + make_interval(secs => :backoff),

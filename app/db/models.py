@@ -270,8 +270,9 @@ class InboxMessage(Base):
         return f"<InboxMessage id={self.id} user_id={self.user_id} sender='{self.sender}' subject='{self.subject[:20]}...' is_read={self.is_read}>"
 
 
-# Token-level stable unique constraint per user
-Index("idx_inbox_user_token", InboxMessage.user_id, InboxMessage.token, unique=True)
+# Stable unique constraint per user + message, plus non-unique token lookup index
+Index("idx_inbox_user_portal_msg_id", InboxMessage.user_id, InboxMessage.portal_message_id, unique=True)
+Index("ix_inbox_messages_user_token", InboxMessage.user_id, InboxMessage.token)
 
 
 class AttachmentCache(Base):
