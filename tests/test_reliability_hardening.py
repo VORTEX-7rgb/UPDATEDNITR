@@ -25,23 +25,37 @@ os.environ["DATABASE_URL"] = "postgresql+asyncpg://postgres:postgres@localhost:5
 
 
 def test_phase6_and_lane_configs_present():
-    """All Phase 6 admission control, retry, and lane split configs exist."""
-    from app.config import config
+    """All Phase 6 admission control, retry, and lane split configs exist.
 
-    assert hasattr(config, "REGISTRATION_MAX_CONCURRENT")
-    assert config.REGISTRATION_MAX_CONCURRENT == 4
-    assert hasattr(config, "QP_METADATA_MAX_CONCURRENT")
-    assert config.QP_METADATA_MAX_CONCURRENT == 3
-    assert hasattr(config, "JOB_MAX_RETRIES")
-    assert config.JOB_MAX_RETRIES == 3
-    assert hasattr(config, "JOB_RETRY_BASE_DELAY")
-    assert config.JOB_RETRY_BASE_DELAY == 2.0
-    assert hasattr(config, "NITRIS_INTERACTIVE_WORKERS")
-    assert config.NITRIS_INTERACTIVE_WORKERS == 4
-    assert hasattr(config, "NITRIS_JOB_WORKERS")
-    assert config.NITRIS_JOB_WORKERS >= 10
-    assert hasattr(config, "SCHEDULER_MAX_QUEUE_DEPTH")
-    assert config.SCHEDULER_MAX_QUEUE_DEPTH == 50
+    Code DEFAULTS are asserted on the ``Config`` class (class attributes are
+    set before any env merging), while the dotenv-loaded singleton is only
+    sanity-checked — so legitimate .env launch tuning can never break this
+    test.
+    """
+    from app.config import Config, config
+
+    # ── Code defaults (env-independent) ─────────────────────────────────
+    assert Config.REGISTRATION_MAX_CONCURRENT == 4
+    assert Config.QP_METADATA_MAX_CONCURRENT == 3
+    assert Config.JOB_MAX_RETRIES == 3
+    assert Config.JOB_RETRY_BASE_DELAY == 2.0
+    assert Config.NITRIS_INTERACTIVE_WORKERS == 4
+    assert Config.NITRIS_JOB_WORKERS == 15
+    assert Config.SCHEDULER_MAX_QUEUE_DEPTH == 50
+    # Pool sizing knobs added for launch hardening
+    assert Config.DB_POOL_SIZE == 10
+    assert Config.DB_MAX_OVERFLOW == 20
+
+    # ── Loaded instance: present and sane under ANY environment ─────────
+    assert isinstance(config.REGISTRATION_MAX_CONCURRENT, int) and config.REGISTRATION_MAX_CONCURRENT >= 1
+    assert isinstance(config.QP_METADATA_MAX_CONCURRENT, int) and config.QP_METADATA_MAX_CONCURRENT >= 1
+    assert isinstance(config.JOB_MAX_RETRIES, int) and config.JOB_MAX_RETRIES >= 1
+    assert isinstance(config.JOB_RETRY_BASE_DELAY, (int, float)) and config.JOB_RETRY_BASE_DELAY > 0
+    assert isinstance(config.NITRIS_INTERACTIVE_WORKERS, int) and config.NITRIS_INTERACTIVE_WORKERS >= 1
+    assert isinstance(config.NITRIS_JOB_WORKERS, int) and config.NITRIS_JOB_WORKERS >= 1
+    assert isinstance(config.SCHEDULER_MAX_QUEUE_DEPTH, int) and config.SCHEDULER_MAX_QUEUE_DEPTH >= 10
+    assert isinstance(config.DB_POOL_SIZE, int) and config.DB_POOL_SIZE >= 1
+    assert isinstance(config.DB_MAX_OVERFLOW, int) and config.DB_MAX_OVERFLOW >= 0
 
 
 @pytest.mark.asyncio
