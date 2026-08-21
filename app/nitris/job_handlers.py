@@ -112,7 +112,7 @@ async def handle_attendance_refresh(job: NitrisJob) -> dict:
             client = NitrisClient()
             try:
                 await nitris_gateway.login_through_gateway(client, roll_number, password, user_id=user_id)
-                data = await get_attendance_data(roll_number, password, client=client)
+                data = await get_attendance_data(roll_number, password, client=client, user_id=user_id)
             finally:
                 await client.close()
                 # password drops out of scope here
@@ -258,6 +258,8 @@ async def handle_sync_onboarding(job: NitrisJob) -> dict:
     # ── Phase 2: ONE login, then scrape inbox + timetable — INSIDE gateway ──
     scraped = detail_cache = existing_by_id = None
     slots = None
+    inbox_scrape_error: Optional[str] = None
+    timetable_scrape_error: Optional[str] = None
     try:
         async with nitris_gateway.acquire():
             password = decrypt_password(encrypted_password)
@@ -269,6 +271,7 @@ async def handle_sync_onboarding(job: NitrisJob) -> dict:
                 try:
                     scraped, detail_cache, existing_by_id = await prepare_inbox_sync(client, user_id)
                 except Exception as e:
+                    inbox_scrape_error = str(e)
                     logger.warning("sync_onboarding inbox scrape failed for user_id=%d: %r", user_id, e)
 
                 # Timetable scrape (Home.aspx) — best-effort, independent.
@@ -277,9 +280,11 @@ async def handle_sync_onboarding(job: NitrisJob) -> dict:
                     home_html = await client.fetch_home_html()
                     slots = parse_home_page(home_html).timetable
                 except Exception as e:
+                    timetable_scrape_error = str(e)
                     logger.warning("sync_onboarding timetable scrape failed for user_id=%d: %r", user_id, e)
             finally:
                 await client.close()
+                # password drops out of scope here
     except NitrisCircuitOpenError as e:
         return {"success": False, "error": str(e)}
     except (LoginError, CredentialsQuarantinedError) as e:
@@ -289,15 +294,18 @@ async def handle_sync_onboarding(job: NitrisJob) -> dict:
         logger.error("sync_onboarding NITRIS work failed for user_id=%d: %r", user_id, e)
         return {"success": False, "error": str(e)}
 
-    # ── Phase 3: persist — OUTSIDE gateway ──
+    # ── Phase 3: persist each module independently — OUTSIDE gateway ──
+    inbox_persist_error: Optional[str] = None
     if scraped is not None:
         try:
             await persist_inbox_sync(
                 user_id, scraped, detail_cache or {}, existing_by_id or {}, baseline=True,
             )
         except Exception as e:
+            inbox_persist_error = str(e)
             logger.error("sync_onboarding inbox persist failed for user_id=%d: %r", user_id, e)
 
+    timetable_persist_error: Optional[str] = None
     if slots is not None:
         try:
             from app.db.repositories.timetable_repository import TimetableRepository
@@ -308,9 +316,49 @@ async def handle_sync_onboarding(job: NitrisJob) -> dict:
                     repo = TimetableRepository(session)
                     await repo.replace_user_timetable(user_id=user_id, slots=slots, synced_at=synced_at)
         except Exception as e:
+            timetable_persist_error = str(e)
             logger.error("sync_onboarding timetable persist failed for user_id=%d: %r", user_id, e)
 
-    return {"success": True}
+    # ── Phase 4: enqueue retry jobs for failed modules (best-effort) ──
+    if inbox_scrape_error or inbox_persist_error:
+        try:
+            await nitris_job_queue.enqueue(
+                job_type="inbox_refresh",
+                user_id=user_id,
+                priority=Priority.LOW,
+                dedup_key=f"onboarding_retry_inbox:user:{user_id}",
+                payload={},
+            )
+            logger.info("sync_onboarding enqueued inbox retry for user_id=%d", user_id)
+        except Exception as e:
+            logger.warning("Failed to enqueue inbox retry: %r", e)
+
+    if timetable_scrape_error or timetable_persist_error:
+        try:
+            await nitris_job_queue.enqueue(
+                job_type="timetable_sync",
+                user_id=user_id,
+                priority=Priority.LOW,
+                dedup_key=f"onboarding_retry_timetable:user:{user_id}",
+                payload={},
+            )
+            logger.info("sync_onboarding enqueued timetable retry for user_id=%d", user_id)
+        except Exception as e:
+            logger.warning("Failed to enqueue timetable retry: %r", e)
+
+    return {
+        "success": True,
+        "modules": {
+            "inbox": {
+                "scrape_error": inbox_scrape_error,
+                "persist_error": inbox_persist_error,
+            },
+            "timetable": {
+                "scrape_error": timetable_scrape_error,
+                "persist_error": timetable_persist_error,
+            },
+        },
+    }
 
 
 # ── Handler: qp_metadata_fetch ──────────────────────────────────────

@@ -72,10 +72,19 @@ async def wait_for_db_recovery(worker_name: str) -> None:
 async def prepare_inbox_sync(client, user_id):
     """Network phase for inbox sync. No open DB transaction, no DB writes.
 
+    Phase 4 perf redesign:
+      - Detail fetches are now PARALLEL with bounded concurrency (default 5).
+        15 messages × 4s sequential = 60s → 15/5 × 4s = 12s. ~5x speedup.
+      - SessionExpiredError PROPAGATES (caller must re-login, not swallow).
+      - Other transient errors fall back to body=None but mark the row for
+        re-fetch on next user open (handled in persist_inbox_sync).
+
     Returns (scraped_messages, detail_cache, existing_by_portal_id).
     """
     from app.nitris.parser import parse_messages_list_html, parse_message_detail_html
     from app.db.repositories.inbox_repository import InboxRepository
+    from app.config import config
+    from app.nitris.exceptions import SessionExpiredError
 
     # 1. Fetch + parse the raw messages list (network, no DB session held)
     list_html = await client.fetch_messages_list()
@@ -94,23 +103,46 @@ async def prepare_inbox_sync(client, user_id):
         existing = await inbox_repo.get_by_portal_message_ids(user_id, portal_ids)
     existing_by_id = {m.portal_message_id: m for m in existing}
 
-    # 3. Pre-fetch detail pages for NEW non-historical messages over HTTP,
-    #    outside any DB transaction (fixes pool starvation).
-    detail_cache = {}
-    for msg in scraped_messages:
-        if msg["portal_message_id"] in existing_by_id:
-            continue
-        if msg["token"].startswith("postback:"):
-            continue  # historical message: header only, no detail fetch
-        try:
-            detail_html = await client.fetch_message_detail(msg["token"])
-            detail_cache[msg["portal_message_id"]] = parse_message_detail_html(detail_html)
-        except Exception as e:
-            logger.warning(
-                "Failed to fetch message detail for portal_id=%s (user_id=%s): %r",
-                msg["portal_message_id"], user_id, e,
-            )
-            detail_cache[msg["portal_message_id"]] = {"body": None, "attachment_url": None}
+    # 3. Pre-fetch detail pages for NEW non-historical messages IN PARALLEL.
+    #    Bounded by INBOX_DETAIL_FETCH_CONCURRENCY (default 5) to avoid tripping
+    #    the NITRIS circuit breaker with too many simultaneous requests.
+    new_messages_to_fetch = [
+        m for m in scraped_messages
+        if m["portal_message_id"] not in existing_by_id
+        and not m["token"].startswith("postback:")
+    ]
+
+    if not new_messages_to_fetch:
+        return scraped_messages, {}, existing_by_id
+
+    detail_sem = asyncio.Semaphore(config.INBOX_DETAIL_FETCH_CONCURRENCY)
+    fetch_errors: dict[int, str] = {}
+
+    async def _fetch_one_detail(msg: dict) -> tuple[int, dict]:
+        """Fetch a single message detail. Returns (portal_id, detail_dict).
+        SessionExpiredError propagates so caller can re-login. Other errors
+        return body=None so the message can still be persisted with header only."""
+        async with detail_sem:
+            try:
+                detail_html = await client.fetch_message_detail(msg["token"])
+                return (msg["portal_message_id"], parse_message_detail_html(detail_html))
+            except SessionExpiredError:
+                # Propagate — caller must re-login, not silently swallow
+                raise
+            except Exception as e:
+                logger.warning(
+                    "Failed to fetch message detail for portal_id=%s (user_id=%s): %r",
+                    msg["portal_message_id"], user_id, e,
+                )
+                fetch_errors[msg["portal_message_id"]] = str(e)
+                return (msg["portal_message_id"], {"body": None, "attachment_url": None})
+
+    # gather() with return_exceptions=False so SessionExpiredError propagates
+    # immediately and aborts the whole sync (the caller will re-login).
+    results = await asyncio.gather(*[_fetch_one_detail(m) for m in new_messages_to_fetch])
+    detail_cache = dict(results)
+
+    prepare_inbox_sync.last_fetch_errors = fetch_errors  # type: ignore[attr-defined]
 
     return scraped_messages, detail_cache, existing_by_id
 
@@ -189,6 +221,23 @@ async def persist_inbox_sync(user_id, scraped_messages, detail_cache, existing_b
                         )
                         if detail_data.get("body") is not None:
                             new_msg.body_fetched_at = datetime.now(timezone.utc)
+                        else:
+                            # Phase 4: detail fetch failed for this message.
+                            # Set body_fetched_at to a STALE timestamp so the
+                            # lazy-fetch TTL in render_single_message triggers
+                            # a re-fetch on next user open. Without this, the
+                            # message permanently shows "(No content)" until
+                            # the next full sync (which may be hours away).
+                            from app.config import config
+                            from datetime import timedelta
+                            stale_ts = datetime.now(timezone.utc) - timedelta(
+                                seconds=config.INBOX_BODY_TTL_SECONDS * 2
+                            )
+                            new_msg.body_fetched_at = stale_ts
+                            logger.info(
+                                "Marked portal_id=%s for re-fetch on next open (detail fetch failed)",
+                                msg["portal_message_id"],
+                            )
 
                         if not baseline:
                             await event_repo.create_event(

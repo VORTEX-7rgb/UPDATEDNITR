@@ -153,50 +153,77 @@ async def process_password(message: types.Message, state: FSMContext):
 
     await state.set_state(Registration.verifying)
 
-    try:
-        # Route registration verification through the NITRIS gateway.
-        from app.nitris.gateway import nitris_gateway, NitrisCircuitOpenError
-        from app.nitris.client import NitrisClient as _NitrisClient
+    # ── Phase 6.2: Registration admission control ─────────────────────
+    # Cap concurrent registrations to prevent gateway saturation during spikes
+    # (e.g. campus launch). Latecomers wait briefly; if the queue is too long,
+    # we ask them to retry. This NEVER blocks existing users' interactive taps
+    # because registrations go to the BACKGROUND lane (LOW priority).
+    import asyncio as _asyncio
+    from app.config import config as _cfg
+    if not hasattr(process_password, "_sem"):
+        process_password._sem = _asyncio.Semaphore(_cfg.REGISTRATION_MAX_CONCURRENT)  # type: ignore[attr-defined]
 
-        async with nitris_gateway.acquire():
-            _reg_client = _NitrisClient()
-            try:
-                # Explicit verification path — no user_id, bypasses the quarantine
-                # guard by design (this is the ONLY path that may login while
-                # credentials are quarantined).
-                await nitris_gateway.verify_credentials(_reg_client, roll, password)
-                data = await get_attendance_data(roll, password, client=_reg_client)
-            finally:
-                await _reg_client.close()
-    except NitrisCircuitOpenError as e:
-        logger.warning("Registration blocked — NITRIS circuit open: %s", e)
-        await state.set_state(Registration.waiting_for_password)
+    try:
+        # Try to acquire the semaphore with a 30s timeout. If we can't, ask the
+        # user to retry shortly — don't let them wait forever.
+        await _asyncio.wait_for(process_password._sem.acquire(), timeout=30.0)  # type: ignore[attr-defined]
+    except _asyncio.TimeoutError:
         await status_msg.edit_text(
-            "⚠️ <b>NITRIS is temporarily unavailable.</b>\n\n"
-            "The system is protecting the portal from overload. "
-            "Please try registering again in ~60 seconds.",
-            parse_mode=ParseMode.HTML
+            "⚠️ <b>Too many simultaneous registrations.</b>\n\n"
+            "Please try again in a moment — the NITRIS portal is being hit hard right now.",
+            parse_mode=ParseMode.HTML,
         )
-        return
-    except LoginError as e:
-        logger.error("Login verification failed for %s: %s", roll, e)
         await state.set_state(Registration.waiting_for_password)
-        await status_msg.edit_text(
-            f"❌ <b>Login failed: Invalid credentials.</b>\n\n"
-            f"Please enter your NITRIS password again (or send /cancel to abort):",
-            parse_mode=ParseMode.HTML
-        )
         return
-    except Exception as e:
-        logger.error("Portal error during verification for %s: %r", roll, e)
-        await state.set_state(Registration.waiting_for_password)
-        await status_msg.edit_text(
-            f"❌ <b>Portal connection issue.</b>\n\n"
-            f"Could not reach or parse the NITRIS portal: {html.escape(str(e))}\n\n"
-            f"Please check portal availability and enter your password again, or send /cancel to abort:",
-            parse_mode=ParseMode.HTML
-        )
-        return
+
+    try:
+        try:
+            # Route registration verification through the NITRIS gateway.
+            from app.nitris.gateway import nitris_gateway, NitrisCircuitOpenError
+            from app.nitris.client import NitrisClient as _NitrisClient
+
+            async with nitris_gateway.acquire():
+                _reg_client = _NitrisClient()
+                try:
+                    # Explicit verification path — no user_id, bypasses the quarantine
+                    # guard by design (this is the ONLY path that may login while
+                    # credentials are quarantined).
+                    await nitris_gateway.verify_credentials(_reg_client, roll, password)
+                    data = await get_attendance_data(roll, password, client=_reg_client)
+                finally:
+                    await _reg_client.close()
+        except NitrisCircuitOpenError as e:
+            logger.warning("Registration blocked — NITRIS circuit open: %s", e)
+            await state.set_state(Registration.waiting_for_password)
+            await status_msg.edit_text(
+                "⚠️ <b>NITRIS is temporarily unavailable.</b>\n\n"
+                "The system is protecting the portal from overload. "
+                "Please try registering again in ~60 seconds.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+        except LoginError as e:
+            logger.error("Login verification failed for %s: %s", roll, e)
+            await state.set_state(Registration.waiting_for_password)
+            await status_msg.edit_text(
+                f"❌ <b>Login failed: Invalid credentials.</b>\n\n"
+                f"Please enter your NITRIS password again (or send /cancel to abort):",
+                parse_mode=ParseMode.HTML
+            )
+            return
+        except Exception as e:
+            logger.error("Portal error during verification for %s: %r", roll, e)
+            await state.set_state(Registration.waiting_for_password)
+            await status_msg.edit_text(
+                f"❌ <b>Portal connection issue.</b>\n\n"
+                f"Could not reach or parse the NITRIS portal: {html.escape(str(e))}\n\n"
+                f"Please check portal availability and enter your password again, or send /cancel to abort:",
+                parse_mode=ParseMode.HTML
+            )
+            return
+    finally:
+        # Phase 6.2: Always release the admission-control semaphore, even on exception
+        process_password._sem.release()  # type: ignore[attr-defined]
 
     is_new_user = False
 
@@ -249,11 +276,13 @@ async def process_password(message: types.Message, state: FSMContext):
             # background login, so the user's first tap on inbox/timetable is
             # instant and their historical inbox doesn't spam "new message"
             # notifications. Fire-and-forget — the dashboard shows immediately.
+            # Enqueue at LOW priority so it NEVER blocks an interactive
+            # user tap on /attendance or /inbox (their own or another user's).
             from app.nitris.job_queue import nitris_job_queue, Priority
             await nitris_job_queue.enqueue(
                 job_type="sync_onboarding",
                 user_id=user_id,
-                priority=Priority.HIGH,
+                priority=Priority.LOW,
                 dedup_key=f"onboarding:user:{user_id}",
                 payload={},
             )
@@ -345,6 +374,21 @@ async def process_delete_confirm(message: types.Message, state: FSMContext):
 async def handle_dashboard_callbacks(callback: types.CallbackQuery, state: FSMContext):
     telegram_id = callback.from_user.id
 
+    # ── ACK THE CALLBACK FIRST ─────────────────────────────────────────
+    # Telegram's button spinner disappears immediately (<50ms). Then we do
+    # the DB query in the background.
+    ack_text = {
+        "db_attendance": "⏳ Requesting attendance...",
+        "db_update": "🔄 Opening credential update...",
+        "db_deregister": "⚠️ Opening deregistration...",
+        "db_papers": "📚 Loading papers...",
+    }.get(callback.data, "")
+    try:
+        await callback.answer(ack_text)
+    except Exception as e:
+        logger.warning("Failed to answer dashboard callback: %r", e)
+
+    # ── NOW do the DB work (after spinner is gone) ────────────────────
     async with get_db_session() as session:
         stmt = select(User).options(selectinload(User.sync_state)).where(User.telegram_id == telegram_id)
         result = await session.execute(stmt)
@@ -352,34 +396,18 @@ async def handle_dashboard_callbacks(callback: types.CallbackQuery, state: FSMCo
 
     if not user:
         try:
-            await callback.answer("⚠️ You are not registered. Use /start to register.", show_alert=True)
-        except Exception as e:
-            logger.warning("Failed to answer unregistered callback: %r", e)
+            await callback.message.answer("⚠️ You are not registered. Use /start to register.")
+        except Exception:
+            pass
         return
 
     if callback.data == "db_attendance":
-        try:
-            await callback.answer("⏳ Requesting attendance...")
-        except Exception as e:
-            logger.warning("Failed to answer db_attendance callback: %r", e)
         await fetch_attendance_for_callback(callback, user)
     elif callback.data == "db_update":
-        try:
-            await callback.answer()
-        except Exception as e:
-            logger.warning("Failed to answer db_update callback: %r", e)
         await start_credential_update_from_cb(callback.message, state)
     elif callback.data == "db_deregister":
-        try:
-            await callback.answer()
-        except Exception as e:
-            logger.warning("Failed to answer db_deregister callback: %r", e)
         await start_deregistration_flow(callback.message, state)
     elif callback.data == "db_papers":
-        try:
-            await callback.answer()
-        except Exception as e:
-            logger.warning("Failed to answer db_papers callback: %r", e)
         await cmd_papers(callback.message, state, explicit_telegram_id=telegram_id)
 
 

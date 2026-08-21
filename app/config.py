@@ -52,10 +52,43 @@ class Config:
     NITRIS_GATEWAY_CIRCUIT_RECOVERY_SECONDS = float(os.getenv("NITRIS_GATEWAY_CIRCUIT_RECOVERY_SECONDS", "60"))
 
     # ── NITRIS Job Queue config (Phase 2) ───────────────────────────────────
-    # Number of worker coroutines pulling from the priority queue.
-    # Each worker goes through the gateway, so effective concurrency is
-    # min(NITRIS_JOB_WORKERS, NITRIS_GATEWAY_MAX_CONCURRENT).
-    NITRIS_JOB_WORKERS = int(os.getenv("NITRIS_JOB_WORKERS", "6"))
+    # Total worker coroutines pulling from the priority queue.
+    # Split into INTERACTIVE + BACKGROUND lanes:
+    #   - Interactive workers drain HIGH-priority jobs only (user button taps)
+    #   - Background workers drain MEDIUM/LOW only (periodic syncs)
+    # HIGH-priority user taps never wait behind long background syncs.
+    NITRIS_JOB_WORKERS = int(os.getenv("NITRIS_JOB_WORKERS", "15"))
+    NITRIS_INTERACTIVE_WORKERS = int(os.getenv("NITRIS_INTERACTIVE_WORKERS", "4"))
+    # Derived: background workers = max(1, TOTAL - INTERACTIVE)
+
+    # Hard queue bound — enqueue() rejects when queue exceeds this. Prevents
+    # unbounded memory growth if NITRIS is down and jobs pile up.
+    NITRIS_JOB_QUEUE_MAX_DEPTH = int(os.getenv("NITRIS_JOB_QUEUE_MAX_DEPTH", "200"))
+
+    # Inbox detail fetch concurrency (Phase 4). Bounded to avoid tripping the
+    # circuit breaker. 5 simultaneous detail fetches per inbox sync.
+    INBOX_DETAIL_FETCH_CONCURRENCY = int(os.getenv("INBOX_DETAIL_FETCH_CONCURRENCY", "5"))
+
+    # Reduced from 6h → 30min. With parallel detail fetches,
+    # re-fetching bodies is cheap. Fresher data > fewer requests.
+    INBOX_BODY_TTL_SECONDS = int(os.getenv("INBOX_BODY_TTL_SECONDS", str(30 * 60)))
+
+    # ── Phase 6: Admission control ──────────────────────────────────────────
+    # Max concurrent user-initiated registrations (each does a NITRIS login +
+    # attendance fetch + DB writes). Without this cap, a registration spike
+    # (e.g. campus launch) can saturate the gateway and starve existing users'
+    # interactive /attendance taps.
+    REGISTRATION_MAX_CONCURRENT = int(os.getenv("REGISTRATION_MAX_CONCURRENT", "4"))
+
+    # Max concurrent QP metadata fetches (each does a NITRIS login). Without
+    # this cap, a /papers batch download could starve interactive taps.
+    QP_METADATA_MAX_CONCURRENT = int(os.getenv("QP_METADATA_MAX_CONCURRENT", "3"))
+
+    # Job-level retry config (Phase 6.4). When a job fails with a transient
+    # error, the queue re-enqueues it with exponential backoff up to this
+    # many attempts before giving up.
+    JOB_MAX_RETRIES = int(os.getenv("JOB_MAX_RETRIES", "3"))
+    JOB_RETRY_BASE_DELAY = float(os.getenv("JOB_RETRY_BASE_DELAY", "2.0"))
 
     # ── Per-module TTL scheduler config (Phase 5) ───────────────────────────
     # Authoritative per-module sync intervals (in seconds).
@@ -102,11 +135,6 @@ class Config:
     TIMETABLE_SYNC_DEDUP_PREFIX = "timetable_sync"
 
     # ── Phase 7: Inbox Cache-First + Global Attachment Cache config ─────────
-    # Max age (seconds) of a cached notice body before render_single_message
-    # triggers a background re-fetch. 6 hours balances freshness against
-    # NITRIS load — notices rarely change after publication.
-    INBOX_BODY_TTL_SECONDS = int(os.getenv("INBOX_BODY_TTL_SECONDS", str(6 * 3600)))
-
     # Attachment acquisition staleness — a worker's lock lease expires after
     # this many seconds. Mirrors QP_CACHE_STALE_SECONDS.
     ATTACHMENT_CACHE_STALE_SECONDS = int(os.getenv("ATTACHMENT_CACHE_STALE_SECONDS", "300"))  # 5 min
@@ -138,4 +166,3 @@ class Config:
 
 
 config = Config()
-

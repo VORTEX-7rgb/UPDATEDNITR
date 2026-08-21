@@ -37,9 +37,20 @@ async def cmd_status(message: types.Message):
     from sqlalchemy import text as sql_text
 
     gw = nitris_gateway.get_metrics()
-    queue_depth = nitris_job_queue.get_queue_depth()
-    dedup_count = nitris_job_queue.get_active_dedup_count()
+    q_stats = nitris_job_queue.get_stats()
+    queue_depth = q_stats.get("queue_depth", 0)
+    interactive_depth = q_stats.get("interactive_queue_depth", 0)
+    bg_depth = q_stats.get("background_queue_depth", 0)
+    dedup_count = q_stats.get("active_dedup_count", 0)
     cooldown_stats = operation_cooldown.get_stats()
+
+    try:
+        from app.observability import metrics as obs_metrics
+        obs_data = await obs_metrics.snapshot()
+        gw_lat = obs_data.get("gateway_latency", {})
+        gw_lat_str = f"{gw_lat.get('avg_ms', 0)}ms (p95: {gw_lat.get('p95_ms', 0)}ms)" if gw_lat.get("count", 0) > 0 else "n/a"
+    except Exception:
+        gw_lat_str = "n/a"
 
     try:
         async with get_db_session() as session:
@@ -88,11 +99,13 @@ async def cmd_status(message: types.Message):
         f"  Concurrency: {gw.get('current_max_concurrent', '?')}/{gw.get('configured_max_concurrent', '?')}\n"
         f"  Login interval: {gw.get('current_login_interval', '?')}s\n"
         f"  Active: {gw.get('active_requests', 0)} requests, {gw.get('active_logins', 0)} logins\n"
+        f"  Latency (avg/p95): {gw_lat_str}\n"
         f"  Errors: {gw.get('consecutive_errors', 0)} consecutive, {gw.get('total_errors', 0)} total\n"
         f"  Total requests: {gw.get('total_requests', 0)} (logins: {gw.get('total_logins', 0)})\n"
         f"  Last error: <code>{esc(str(gw.get('last_error') or 'none'))}</code>\n\n"
         f"📋 <b>Job Queue</b>\n"
-        f"  Pending: {queue_depth}\n"
+        f"  Total Pending: {queue_depth} (Interactive: {interactive_depth}, Background: {bg_depth})\n"
+        f"  Workers: {q_stats.get('interactive_workers', '?')} interactive, {q_stats.get('background_workers', '?')} background\n"
         f"  Active single-flight dedups: {dedup_count}\n"
         f"  Active cooldowns: {cooldown_stats.get('active_cooldowns', 0)}\n"
         f"  Handlers: {', '.join(nitris_job_queue.get_registered_handlers())}\n\n"
