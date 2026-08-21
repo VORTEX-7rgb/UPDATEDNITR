@@ -289,6 +289,15 @@ async def handle_paper_download(callback: types.CallbackQuery, state: FSMContext
     telegram_id = callback.from_user.id
     cache_id = int(callback.data.split("_")[-1])
 
+    # Resolve the requesting student so cold acquisitions run under THEIR OWN
+    # NITRIS account (own-creds-first policy; pool is fallback only).
+    requester_user_id = None
+    async with get_db_session() as session:
+        user_repo = UserRepository(session)
+        user = await user_repo.get_by_telegram_id(telegram_id)
+        if user:
+            requester_user_id = user.id
+
     # Check if paper is already available in cache for instant delivery
     snap = await qpaper_registry.qpaper_service._read_cache(cache_id)
     is_cached = snap and snap[0] == "paper_available" and snap[1]
@@ -298,7 +307,9 @@ async def handle_paper_download(callback: types.CallbackQuery, state: FSMContext
             await callback.answer("🚀 Delivering cached paper...")
         except Exception:
             pass
-        result: QPResult = await qpaper_registry.qpaper_service.deliver(cache_id, telegram_id)
+        result: QPResult = await qpaper_registry.qpaper_service.deliver(
+            cache_id, telegram_id, requester_user_id=requester_user_id,
+        )
         if not result.delivered:
             status_msg = await callback.message.answer("⚠️ Processing paper...")
             await _present_qp_result(status_msg, result)
@@ -310,7 +321,9 @@ async def handle_paper_download(callback: types.CallbackQuery, state: FSMContext
         pass
 
     status_msg = await callback.message.answer("⏳ Acquiring paper from NITRIS portal...")
-    result: QPResult = await qpaper_registry.qpaper_service.deliver(cache_id, telegram_id)
+    result: QPResult = await qpaper_registry.qpaper_service.deliver(
+        cache_id, telegram_id, requester_user_id=requester_user_id,
+    )
     await _present_qp_result(status_msg, result)
 
 
@@ -479,7 +492,9 @@ async def handle_qp_download_all_year(callback: types.CallbackQuery, state: FSMC
     errors: list[str] = []
 
     for i, cache_id in enumerate(cache_ids_to_deliver, start=1):
-        result: QPResult = await qpaper_registry.qpaper_service.deliver(cache_id, telegram_id)
+        result: QPResult = await qpaper_registry.qpaper_service.deliver(
+            cache_id, telegram_id, requester_user_id=user_id,
+        )
         if result.delivered:
             succeeded += 1
         elif result.not_available:

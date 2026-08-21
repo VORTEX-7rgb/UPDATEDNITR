@@ -45,7 +45,7 @@ from aiogram.types import BufferedInputFile
 from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramAPIError
 
 from app.config import config
-from app.db.models import QuestionPaperCache, QPStatus
+from app.db.models import QuestionPaperCache, QPStatus, User
 from app.nitris.client import NitrisClient
 from app.nitris.exceptions import (
     AttendanceWorkflowError, SessionExpiredError, LoginError, InvalidContextError,
@@ -150,17 +150,26 @@ class QPaperService:
 
     # ── Public entry point ──────────────────────────────────────────
 
-    async def deliver(self, cache_id: int, telegram_id: int) -> QPResult:
+    async def deliver(self, cache_id: int, telegram_id: int, requester_user_id: Optional[int] = None) -> QPResult:
         """Deliver a paper to a Telegram user. Called by the bot QP handler.
+
+        Args:
+            cache_id: question_paper_caches row id.
+            telegram_id: chat to deliver to.
+            requester_user_id: internal user id of the requesting student. When
+                supplied, THEIR OWN NITRIS credentials are used for cold
+                acquisitions (own-account attribution, no cross-tenant logins);
+                the shared healthy-user pool remains only as fallback when the
+                requester's credentials are missing/quarantined/fail.
 
         Flow:
           1. Read cache row (short DB session).
           2. Dispatch on status:
              - paper_available → cached delivery (bounded by delivery semaphore)
              - paper_not_available → check TTL:
-                 * not_available_until is None -> permanent (e.g. labs), instant no paper
-                 * not_available_until > now -> TTL active, instant no paper (zero NITRIS calls)
-                 * not_available_until <= now -> TTL expired, reset to retryable_failure and re-check
+                  * not_available_until is None -> permanent (e.g. labs), instant no paper
+                  * not_available_until > now -> TTL active, instant no paper (zero NITRIS calls)
+                  * not_available_until <= now -> TTL expired, reset to retryable_failure and re-check
              - permanent_failure → error result
              - fetch_in_progress → wait + deliver
              - retryable_failure → try to acquire (claim)
@@ -175,7 +184,8 @@ class QPaperService:
 
         if status == QPStatus.PAPER_AVAILABLE.value and file_id:
             return await self._deliver_cached(
-                cache_id, file_id, file_kind, telegram_id, sub_code, ac_year, ex_type, postback
+                cache_id, file_id, file_kind, telegram_id, sub_code, ac_year, ex_type, postback,
+                requester_user_id=requester_user_id,
             )
         if status == QPStatus.PAPER_NOT_AVAILABLE.value:
             if not_avail_until is None:
@@ -203,7 +213,8 @@ class QPaperService:
             return QPResult(permanent=True, error=err_msg or "permanent_failure")
         # fetch_in_progress OR retryable_failure (including newly expired TTL) → try to claim
         return await self._claim_or_wait_and_deliver(
-            cache_id, telegram_id, sub_code, ac_year, ex_type, postback
+            cache_id, telegram_id, sub_code, ac_year, ex_type, postback,
+            requester_user_id=requester_user_id,
         )
 
     # ── Cache read (short transaction) ──────────────────────────────
@@ -226,6 +237,7 @@ class QPaperService:
         self, cache_id: int, file_id: str, file_kind: Optional[str],
         telegram_id: int, sub_code: str, ac_year: str, ex_type: str,
         postback: Optional[str] = None,
+        requester_user_id: Optional[int] = None,
     ) -> QPResult:
         """Forward cached telegram_file_id to user. Bounded by delivery semaphore.
         If file_id is invalid (e.g. from an old bot token), auto-recovers by re-acquiring."""
@@ -278,7 +290,8 @@ class QPaperService:
                             snap = await self._read_cache(cache_id)
                             postback = snap[6] if snap else ""
                         return await self._claim_or_wait_and_deliver(
-                            cache_id, telegram_id, sub_code, ac_year, ex_type, postback
+                            cache_id, telegram_id, sub_code, ac_year, ex_type, postback,
+                            requester_user_id=requester_user_id,
                         )
                     if "chat not found" in msg or "deactivated" in msg:
                         return QPResult(error="User account unavailable.")
@@ -293,6 +306,7 @@ class QPaperService:
     async def _claim_or_wait_and_deliver(
         self, cache_id: int, telegram_id: int,
         sub_code: str, ac_year: str, ex_type: str, postback: str,
+        requester_user_id: Optional[int] = None,
     ) -> QPResult:
         """Attempt to atomically claim the row for acquisition. If someone else
         has it, wait + deliver when their acquisition completes."""
@@ -301,10 +315,13 @@ class QPaperService:
         claimed = await self._claim_for_acquisition(cache_id, job_id)
         if claimed:
             return await self._acquire_and_deliver(
-                cache_id, telegram_id, job_id, sub_code, ac_year, ex_type, postback
+                cache_id, telegram_id, job_id, sub_code, ac_year, ex_type, postback,
+                requester_user_id=requester_user_id,
             )
         # Lost the race — wait for the other worker
-        return await self._wait_and_deliver(cache_id, telegram_id)
+        return await self._wait_and_deliver(
+            cache_id, telegram_id, requester_user_id=requester_user_id,
+        )
 
     async def _claim_for_acquisition(self, cache_id: int, job_id: str) -> bool:
         """Atomic compare-and-swap: claim the row for acquisition.
@@ -355,13 +372,16 @@ class QPaperService:
     async def _acquire_and_deliver(
         self, cache_id: int, telegram_id: int, job_id: str,
         sub_code: str, ac_year: str, ex_type: str, postback: str,
+        requester_user_id: Optional[int] = None,
     ) -> QPResult:
         """Slow path — NITRIS download + Telegram upload. NO DB session held."""
         async with self._acquire_sem:
             try:
-                # 1. Download from NITRIS (slow — no DB session open)
+                # 1. Download from NITRIS (slow — no DB session open).
+                #    requester_user_id passed positionally so test doubles
+                #    accepting *args remain compatible.
                 file_bytes, kind = await self._nitris_download(
-                    sub_code, ac_year, ex_type, postback
+                    sub_code, ac_year, ex_type, postback, requester_user_id,
                 )
                 # 2. Upload to storage channel OR (fallback) to the user's chat.
                 #    When falling back to user's chat, the upload ALSO serves as
@@ -415,7 +435,10 @@ class QPaperService:
                     return QPResult(permanent=True, error=str(exc))
                 return QPResult(error=f"Acquisition failed (will retry): {exc}")
 
-    async def _wait_and_deliver(self, cache_id: int, telegram_id: int) -> QPResult:
+    async def _wait_and_deliver(
+        self, cache_id: int, telegram_id: int,
+        requester_user_id: Optional[int] = None,
+    ) -> QPResult:
         """Poll cache status until terminal or timeout. Used when another worker
         has the row in fetch_in_progress state."""
         start = time.monotonic()
@@ -436,6 +459,7 @@ class QPaperService:
                 return await self._deliver_cached(
                     cache_id, file_id, file_kind, telegram_id,
                     sub_code, ac_year, ex_type,
+                    requester_user_id=requester_user_id,
                 )
             if status == QPStatus.PAPER_NOT_AVAILABLE.value:
                 return QPResult(not_available=True)
@@ -444,7 +468,8 @@ class QPaperService:
             if status == QPStatus.RETRYABLE_FAILURE.value:
                 # The acquiring worker failed — try to re-claim
                 return await self._claim_or_wait_and_deliver(
-                    cache_id, telegram_id, sub_code, ac_year, ex_type, snap[6]
+                    cache_id, telegram_id, sub_code, ac_year, ex_type, snap[6],
+                    requester_user_id=requester_user_id,
                 )
             # fetch_in_progress — keep polling
         return QPResult(
@@ -456,14 +481,31 @@ class QPaperService:
 
     async def _nitris_download(
         self, sub_code: str, ac_year: str, ex_type: str, postback_target: str,
+        requester_user_id: Optional[int] = None,
     ) -> Tuple[bytes, str]:
         """Login to NITRIS, submit the postback target, fetch raw paper bytes.
-        Returns (bytes, kind) where kind is 'pdf' or 'zip'."""
+        Returns (bytes, kind) where kind is 'pdf' or 'zip'.
+
+        CREDENTIAL POLICY (own-first): the requesting student's OWN account is
+        used whenever available, so downloads are attributed to them in the
+        portal and a failed login quarantines the right person. The shared
+        healthy-user pool is only a fallback for when the requester's
+        credentials are missing/quarantined/failing.
+        """
         raw_creds = await self.creds_provider()
         if isinstance(raw_creds, list):
-            candidates = raw_creds
+            candidates = list(raw_creds)
         else:
             candidates = [raw_creds]
+
+        if requester_user_id is not None:
+            own = await self._load_own_credentials(requester_user_id)
+            if own is not None:
+                # Prepend own creds; de-dup against the pool by user_id.
+                candidates = [own] + [
+                    c for c in candidates
+                    if not (isinstance(c, (list, tuple)) and len(c) >= 3 and c[1] == own[1])
+                ]
 
         if not candidates:
             raise RuntimeError("No candidate credentials available to download paper")
@@ -523,6 +565,36 @@ class QPaperService:
                     await client.close()
 
         raise last_err or RuntimeError("All candidate credentials failed to download paper")
+
+    async def _load_own_credentials(self, user_id: int) -> Optional[Tuple[str, int, str]]:
+        """Short-session read of a user's OWN credentials.
+
+        Returns (roll_number, user_id, encrypted_password) or None if the user
+        is missing or quarantined. Never raises — a lookup failure just means
+        the pool fallback is used.
+        """
+        try:
+            from sqlalchemy import select as sa_select
+            async with self.session_factory() as session:
+                row = (
+                    await session.execute(
+                        sa_select(
+                            User.roll_number, User.id, User.encrypted_password,
+                        ).where(
+                            User.id == user_id,
+                            User.credentials_valid == True,  # noqa: E712
+                        )
+                    )
+                ).first()
+            if row is None:
+                return None
+            return (row[0], row[1], row[2])
+        except Exception as e:
+            logger.warning(
+                "Could not load own credentials for user_id=%s — using pool fallback: %r",
+                user_id, e,
+            )
+            return None
 
     async def _telegram_upload(
         self, file_bytes: bytes, kind: str,

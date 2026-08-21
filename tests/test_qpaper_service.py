@@ -272,7 +272,7 @@ async def test_first_acquisition_pdf(qp_service, store, fake_bot):
     }
 
     # Emulate NITRIS returning PDF bytes
-    async def fake_nitris(sub, yr, ex, pb):
+    async def fake_nitris(sub, yr, ex, pb, requester_user_id=None):
         return b"%PDF-1.4 simulated pdf contents...", "pdf"
     qp_service._nitris_download = fake_nitris
 
@@ -307,7 +307,7 @@ async def test_first_acquisition_zip(qp_service, store, fake_bot):
     }
 
     zip_bytes = b"PK\x03\x04\x14\x00simulated zip contents..."
-    async def fake_nitris(sub, yr, ex, pb):
+    async def fake_nitris(sub, yr, ex, pb, requester_user_id=None):
         return zip_bytes, _sniff_kind(zip_bytes)
     qp_service._nitris_download = fake_nitris
 
@@ -332,7 +332,7 @@ async def test_concurrent_same_paper_collapse(qp_service, store, fake_bot):
     }
 
     nitris_calls = 0
-    async def counting_nitris(sub, yr, ex, pb):
+    async def counting_nitris(sub, yr, ex, pb, requester_user_id=None):
         nonlocal nitris_calls
         nitris_calls += 1
         await asyncio.sleep(0.1)  # simulate network delay
@@ -513,7 +513,7 @@ async def test_negative_cache_ttl_expiry_triggers_recheck(qp_service, store, fak
     }
 
     nitris_called = False
-    async def fake_nitris(sub, yr, ex, pb):
+    async def fake_nitris(sub, yr, ex, pb, requester_user_id=None):
         nonlocal nitris_called
         nitris_called = True
         return b"%PDF-1.4 newly uploaded exam paper", "pdf"
@@ -551,4 +551,133 @@ async def test_paper_not_available_error_creates_negative_cache(qp_service, stor
     assert store[11]["status"] == QPStatus.PAPER_NOT_AVAILABLE.value
     assert store[11]["not_available_until"] is not None
     assert store[11]["not_available_until"] > datetime.now(timezone.utc)
+
+
+# ── Own-creds-first policy (launch-hardening) ───────────────────────
+
+
+@pytest.mark.asyncio
+async def test_own_creds_tried_before_pool(qp_service, store, fake_bot, monkeypatch):
+    """Cold acquisition must use the REQUESTER's own NITRIS credentials first;
+    the shared pool is only a fallback. Guards against cross-tenant logins."""
+    from contextlib import asynccontextmanager
+
+    login_order: list[str] = []
+
+    async def fake_provider():
+        return [("POOLROLL", 42, b"pool-enc")]
+
+    qp_service.creds_provider = fake_provider
+
+    async def fake_own(user_id):
+        assert user_id == 7
+        return ("OWNROLL", 7, b"own-enc")
+
+    qp_service._load_own_credentials = fake_own
+
+    class FakeGateway:
+        @asynccontextmanager
+        async def acquire(self, is_login=False):
+            yield
+
+        async def login_through_gateway(self, client, username, password, *, user_id):
+            login_order.append(username)
+
+    class FakeNitrisClient:
+        async def close(self):
+            pass
+
+        async def download_question_paper_bytes(self, academic_year, subject_query, event_target):
+            return b"%PDF-1.4 paper"
+
+    monkeypatch.setattr("app.nitris.gateway.nitris_gateway", FakeGateway())
+    monkeypatch.setattr("app.services.qpaper_service.NitrisClient", FakeNitrisClient)
+    monkeypatch.setattr(
+        "app.db.crypto.decrypt_password",
+        lambda enc: enc.decode() if isinstance(enc, bytes) else enc,
+    )
+
+    store[20] = {
+        "id": 20, "subject_code": "CS2001", "academic_year": "2024-25/Autumn",
+        "exam_type": "mid_sem", "portal_postback_target": "ctl00$cs2001",
+        "telegram_file_id": None,
+        "status": QPStatus.RETRYABLE_FAILURE.value,
+        "not_available_until": None,
+        "file_kind": None, "file_size_bytes": None,
+        "acquired_by": None, "acquired_at": None, "error_message": None,
+        "attempt_count": 0,
+    }
+
+    res = await qp_service.deliver(cache_id=20, telegram_id=555, requester_user_id=7)
+    assert res.delivered is True
+    # Own account used; pool candidate never needed.
+    assert login_order == ["OWNROLL"]
+
+
+@pytest.mark.asyncio
+async def test_pool_fallback_when_own_login_fails(qp_service, store, fake_bot, monkeypatch):
+    """If the requester's own login fails (LoginError), acquisition falls back
+    to the shared pool so the user still gets their paper."""
+    from contextlib import asynccontextmanager
+
+    from app.nitris.exceptions import LoginError
+
+    login_order: list[str] = []
+
+    async def fake_provider():
+        return [("POOLROLL", 42, b"pool-enc")]
+
+    qp_service.creds_provider = fake_provider
+
+    async def fake_own(user_id):
+        return ("OWNROLL", 7, b"own-enc")
+
+    qp_service._load_own_credentials = fake_own
+
+    quarantined: set[int] = set()
+
+    class FakeGateway:
+        def __init__(self):
+            self._quarantined = quarantined
+
+        @asynccontextmanager
+        async def acquire(self, is_login=False):
+            yield
+
+        async def login_through_gateway(self, client, username, password, *, user_id):
+            if username == "OWNROLL":
+                self._quarantined.add(user_id)
+                raise LoginError("Invalid credentials.")
+            login_order.append(username)
+
+    class FakeNitrisClient:
+        async def close(self):
+            pass
+
+        async def download_question_paper_bytes(self, academic_year, subject_query, event_target):
+            return b"%PDF-1.4 paper"
+
+    monkeypatch.setattr("app.nitris.gateway.nitris_gateway", FakeGateway())
+    monkeypatch.setattr("app.services.qpaper_service.NitrisClient", FakeNitrisClient)
+    monkeypatch.setattr(
+        "app.db.crypto.decrypt_password",
+        lambda enc: enc.decode() if isinstance(enc, bytes) else enc,
+    )
+
+    store[21] = {
+        "id": 21, "subject_code": "CS2001", "academic_year": "2024-25/Autumn",
+        "exam_type": "mid_sem", "portal_postback_target": "ctl00$cs2001b",
+        "telegram_file_id": None,
+        "status": QPStatus.RETRYABLE_FAILURE.value,
+        "not_available_until": None,
+        "file_kind": None, "file_size_bytes": None,
+        "acquired_by": None, "acquired_at": None, "error_message": None,
+        "attempt_count": 0,
+    }
+
+    res = await qp_service.deliver(cache_id=21, telegram_id=556, requester_user_id=7)
+    assert res.delivered is True
+    # Pool candidate served the request after the requester's own login failed.
+    assert login_order == ["POOLROLL"]
+    assert store[21]["status"] == QPStatus.PAPER_AVAILABLE.value
 
