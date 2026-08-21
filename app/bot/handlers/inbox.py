@@ -28,24 +28,37 @@ router = Router(name="inbox_router")
 
 # --- NITRIS Inbox Handlers ---
 
-async def render_single_message(event, user: User, msg: InboxMessage, session) -> None:
+async def render_single_message(event, user: User, msg: InboxMessage, session=None) -> None:
     """Helper to load notice body (with lazy fetching if needed) and render single notice detail card.
 
     Cache-first with TTL architecture:
-      1. Mark the message as read (if not already).
+      1. Mark the message as read (if not already) — short dedicated session.
       2. Check if the cached body is fresh enough:
-         - If msg.body is None → never fetched → fetch (lazy).
-         - If msg.body_fetched_at is None → fetch (defensive — old rows).
-         - If (now - body_fetched_at) > INBOX_BODY_TTL_SECONDS → stale → fetch.
-         - Otherwise → render cached body instantly (zero NITRIS traffic).
+          - If msg.body is None → never fetched → fetch (lazy).
+          - If msg.body_fetched_at is None → fetch (defensive — old rows).
+          - If (now - body_fetched_at) > INBOX_BODY_TTL_SECONDS → stale → fetch.
+          - Otherwise → render cached body instantly (zero NITRIS traffic).
       3. On fetch, enqueue an inbox_detail_fetch job with a PER-USER-PER-MSG
          dedup_key so concurrent opens collapse into a single NITRIS fetch.
+
+    SESSION POLICY (lease-boundary discipline):
+      ``session`` is accepted for backward compatibility but is NEVER used and
+      NEVER held across the NITRIS fetch. Mark-as-read runs in a short local
+      transaction; the fetch job persists the body itself and its return
+      payload is applied directly to the in-memory row for rendering. Callers
+      MUST close their own sessions before invoking this helper.
     """
+    del session  # legacy parameter — intentionally unused
+
+    # ── Short transaction: mark read (no network I/O inside this block) ──
     if not msg.is_read:
-        from app.db.repositories.inbox_repository import InboxRepository
-        inbox_repo = InboxRepository(session)
-        await inbox_repo.mark_as_read(msg.id)
-        await session.commit()
+        try:
+            async with get_db_session() as mark_session:
+                async with mark_session.begin():
+                    from app.db.repositories.inbox_repository import InboxRepository
+                    await InboxRepository(mark_session).mark_as_read(msg.id)
+        except Exception as e:
+            logger.warning("Failed marking message id=%s read: %r", msg.id, e)
 
     # ── TTL check on cached body ──────────────────────────
     need_fetch = False
@@ -85,13 +98,17 @@ async def render_single_message(event, user: User, msg: InboxMessage, session) -
                     )
                     return
 
-                stmt = (
-                    select(InboxMessage)
-                    .where(InboxMessage.id == msg.id)
-                    .execution_options(populate_existing=True)
-                )
-                res = await session.execute(stmt)
-                msg = res.scalar_one_or_none()
+                # Apply fetched fields straight onto the in-memory row for
+                # rendering. The job handler already persisted exactly these
+                # values, so this mirrors DB state with zero extra round-trips
+                # — and no session was ever held across the fetch above.
+                fetched_body = result.get("body")
+                if fetched_body is not None:
+                    msg.body = fetched_body
+                    msg.body_fetched_at = datetime.now(timezone.utc)
+                fetched_attachment = result.get("attachment_url")
+                if fetched_attachment:
+                    msg.attachment_url = fetched_attachment
 
                 try:
                     await status_msg.delete()
@@ -512,7 +529,9 @@ async def handle_message_detail(callback: types.CallbackQuery, state: FSMContext
             await callback.message.answer("❌ Message not found.")
             return
 
-        await render_single_message(callback, user, msg, session)
+    # Session closed BEFORE rendering/fetching (lease boundary) — render opens
+    # only its own short sessions.
+    await render_single_message(callback, user, msg)
 
 
 @router.callback_query(F.data.startswith("dl_"))
@@ -849,12 +868,12 @@ async def cmd_latest(message: types.Message) -> None:
         inbox_repo = InboxRepository(session)
         messages = await inbox_repo.get_latest_messages(user.id, offset=0, limit=1)
 
-        if not messages:
-            await message.answer("📩 Your inbox is currently empty. Run a sync first!")
-            return
+    if not messages:
+        await message.answer("📩 Your inbox is currently empty. Run a sync first!")
+        return
 
-        msg = messages[0]
-        await render_single_message(message, user, msg, session)
+    # Session closed BEFORE rendering/fetching (lease boundary).
+    await render_single_message(message, user, messages[0])
 
 
 @router.callback_query(F.data == "inbox_latest")
@@ -878,12 +897,12 @@ async def handle_inbox_latest(callback: types.CallbackQuery, state: FSMContext) 
         inbox_repo = InboxRepository(session)
         messages = await inbox_repo.get_latest_messages(user.id, offset=0, limit=1)
 
-        if not messages:
-            await callback.message.answer("📩 Your inbox is currently empty.")
-            return
+    if not messages:
+        await callback.message.answer("📩 Your inbox is currently empty.")
+        return
 
-        msg = messages[0]
-        await render_single_message(callback, user, msg, session)
+    # Session closed BEFORE rendering/fetching (lease boundary).
+    await render_single_message(callback, user, messages[0])
 
 
 async def render_search_results(message: types.Message, query: str, results: list) -> None:
