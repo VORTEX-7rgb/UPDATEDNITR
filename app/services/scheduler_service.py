@@ -383,7 +383,7 @@ async def init_scheduler() -> None:
                 client = NitrisClient()
                 try:
                     await nitris_gateway.login_through_gateway(client, roll_number, password, user_id=user_id)
-                    data = await get_attendance_data(roll_number, password, client=client)
+                    data = await get_attendance_data(roll_number, password, client=client, user_id=user_id)
                 finally:
                     await client.close()
         except NitrisCircuitOpenError as e:
