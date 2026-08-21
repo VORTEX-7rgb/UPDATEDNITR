@@ -59,6 +59,7 @@ async def fetch_attendance_for_callback(callback: types.CallbackQuery, user: Use
             job_type="attendance_refresh",
             user_id=user.id,
             priority=Priority.HIGH,
+            dedup_key=f"attendance_refresh:user:{user.id}",
             payload={
                 "callback_chat_id": status_msg.chat.id,
                 "callback_message_id": status_msg.message_id,
@@ -144,6 +145,7 @@ async def cmd_attendance(message: types.Message):
             job_type="attendance_refresh",
             user_id=user.id,
             priority=Priority.HIGH,
+            dedup_key=f"attendance_refresh:user:{user.id}",
             payload={
                 "callback_chat_id": status_msg.chat.id,
                 "callback_message_id": status_msg.message_id,
