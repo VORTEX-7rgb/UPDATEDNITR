@@ -52,6 +52,14 @@ from app.nitris.job_queue import nitris_job_queue, Priority
 from app.nitris.exceptions import LoginError, CredentialsQuarantinedError
 logger = logging.getLogger(__name__)
 
+# module_name -> registered job_type whitelist. Anything NOT in this map is
+# never enqueued — a missing handler otherwise leaves the schedule row stuck in
+# a claimed state until stale-reclaim, looping every SCHEDULER_CLAIM_STALE_SECONDS.
+SUPPORTED_MODULE_JOBS = {
+    "attendance": "sync_attendance",
+    "inbox": "sync_inbox",
+}
+
 
 async def wait_for_db_recovery(worker_name: str) -> None:
     """Blocks until the database connection is healthy."""
@@ -290,8 +298,20 @@ async def run_scheduler_loop(bot=None) -> None:
                 user_id = row["user_id"]
                 module_name = row["module_name"]
 
-                # Map module_name to job_type
-                job_type = f"sync_{module_name}"
+                # Whitelist check — never enqueue a job type without a handler.
+                job_type = SUPPORTED_MODULE_JOBS.get(module_name)
+                if job_type is None:
+                    logger.error(
+                        "Scheduler: no registered job handler for module '%s' "
+                        "(schedule_id=%d) — releasing claim and backing off",
+                        module_name, schedule_id,
+                    )
+                    await update_schedule_after_job(
+                        async_session_factory, schedule_id,
+                        success=False, error_msg=f"unsupported_module:{module_name}",
+                        module_name=module_name,
+                    )
+                    continue
 
                 try:
                     await nitris_job_queue.enqueue(
@@ -308,8 +328,8 @@ async def run_scheduler_loop(bot=None) -> None:
                         job_type, user_id, schedule_id,
                     )
                 except NitrisCircuitOpenError:
-                    # Circuit opened mid-batch — release the claim so it
-                    # can be retried next cycle
+                    # Circuit opened mid-batch — release the claim so it can be
+                    # retried next cycle instead of sitting stale.
                     logger.warning(
                         "Circuit opened during enqueue — releasing schedule_id=%d",
                         schedule_id,
@@ -317,6 +337,20 @@ async def run_scheduler_loop(bot=None) -> None:
                     await update_schedule_after_job(
                         async_session_factory, schedule_id,
                         success=False, error_msg="circuit_open_during_enqueue",
+                        module_name=module_name,
+                    )
+                    break  # Stop enqueuing this cycle
+                except RuntimeError:
+                    # Queue hit its hard depth bound (enqueue raises RuntimeError).
+                    # Release the claim for retry next cycle rather than letting
+                    # it sit claimed until SCHEDULER_CLAIM_STALE_SECONDS elapses.
+                    logger.warning(
+                        "Job queue full during enqueue — releasing schedule_id=%d",
+                        schedule_id,
+                    )
+                    await update_schedule_after_job(
+                        async_session_factory, schedule_id,
+                        success=False, error_msg="job_queue_full_during_enqueue",
                         module_name=module_name,
                     )
                     break  # Stop enqueuing this cycle
