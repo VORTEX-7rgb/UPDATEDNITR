@@ -110,7 +110,7 @@ async def verification_shield(message: types.Message):
 
 # --- FSM State Input Handlers ---
 
-@router.message(Registration.waiting_for_roll)
+@router.message(Registration.waiting_for_roll, F.text)
 async def process_roll(message: types.Message, state: FSMContext):
     roll = message.text.strip().upper()
 
@@ -128,7 +128,7 @@ async def process_roll(message: types.Message, state: FSMContext):
     await state.set_state(Registration.waiting_for_password)
 
 
-@router.message(Registration.waiting_for_password)
+@router.message(Registration.waiting_for_password, F.text)
 async def process_password(message: types.Message, state: FSMContext):
     password = message.text.strip()
     telegram_id = message.from_user.id
@@ -324,6 +324,25 @@ async def process_password(message: types.Message, state: FSMContext):
                 "Admin new-user notification failed (registration succeeded for roll=%s): %r",
                 roll, notify_err,
             )
+
+
+@router.message(Registration.waiting_for_roll, ~F.text)
+@router.message(Registration.waiting_for_password, ~F.text)
+async def fsm_registration_needs_text(message: types.Message):
+    """Non-text input (photo/sticker/voice) during registration — prompt instead of crashing."""
+    await message.answer(
+        "⚠️ Please send your input as a <b>text message</b> — photos, stickers and "
+        "files are not accepted here.\n\nSend /cancel to abort the process.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(Deregistration.waiting_for_confirm, ~F.text)
+async def fsm_deregister_needs_text(message: types.Message):
+    await message.answer(
+        "⚠️ Please type <b>DELETE</b> as plain text to confirm, or press Cancel.",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 @router.message(Deregistration.waiting_for_confirm)

@@ -710,7 +710,7 @@ async def handle_search_prompt(callback: types.CallbackQuery, state: FSMContext)
     )
 
 
-@router.message(InboxSearch.waiting_for_query)
+@router.message(InboxSearch.waiting_for_query, F.text)
 async def process_search_query(message: types.Message, state: FSMContext) -> None:
     query = message.text.strip()
     telegram_id = message.from_user.id
@@ -730,6 +730,14 @@ async def process_search_query(message: types.Message, state: FSMContext) -> Non
         results = await inbox_repo.search_messages(user.id, query, limit=5)
 
     await render_search_results(message, query, results)
+
+
+@router.message(InboxSearch.waiting_for_query, ~F.text)
+async def search_needs_text(message: types.Message) -> None:
+    await message.answer(
+        "⚠️ Please send your search as a <b>text message</b>.\n\nSend /cancel to abort.",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 @router.message(Command("inbox"), StateFilter(None))

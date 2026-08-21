@@ -585,7 +585,7 @@ async def handle_qp_search_prompt(callback: types.CallbackQuery, state: FSMConte
     await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode=ParseMode.HTML)
 
 
-@router.message(QuestionPaperFlow.waiting_for_search_query)
+@router.message(QuestionPaperFlow.waiting_for_search_query, F.text)
 async def process_qp_search_query(message: types.Message, state: FSMContext) -> None:
     """Processes search queries via the job queue."""
     query = message.text.strip()
@@ -730,3 +730,11 @@ async def process_qp_search_query(message: types.Message, state: FSMContext) -> 
     builder.row(types.InlineKeyboardButton(text="🏠 Back to Menu", callback_data="qp_back_subjects"))
 
     await message.answer(text, reply_markup=builder.as_markup(), parse_mode=ParseMode.HTML)
+
+
+@router.message(QuestionPaperFlow.waiting_for_search_query, ~F.text)
+async def qp_search_needs_text(message: types.Message) -> None:
+    await message.answer(
+        "⚠️ Please send your search as a <b>text message</b>.\n\nSend /cancel to abort.",
+        parse_mode=ParseMode.HTML,
+    )
