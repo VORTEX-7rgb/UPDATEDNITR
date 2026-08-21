@@ -1,6 +1,8 @@
 """Database engine, sessionmaker, and session context management."""
 
+import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
@@ -42,6 +44,31 @@ def is_db_connection_error(e: Exception) -> bool:
     return False
 
 
+# ── Debounced pool disposal ─────────────────────────────────────────────────
+# During a DB blip, MANY concurrent tasks can hit connection errors at once.
+# Disposing the whole engine pool from each of them tears down connections
+# other tasks are still using and multiplies the churn. The dispose now runs
+# at most once per debounce window, under a lock.
+_POOL_DISPOSE_DEBOUNCE_SECONDS = 60.0
+_last_pool_dispose = 0.0
+_dispose_lock = asyncio.Lock()
+
+
+async def _dispose_engine_debounced() -> None:
+    global _last_pool_dispose
+    async with _dispose_lock:
+        now = time.monotonic()
+        if now - _last_pool_dispose < _POOL_DISPOSE_DEBOUNCE_SECONDS:
+            logger.debug("Pool disposal skipped (debounced).")
+            return
+        _last_pool_dispose = now
+    try:
+        await engine.dispose()
+        logger.info("Database connection pool disposed successfully.")
+    except Exception as dispose_err:
+        logger.error("Failed to dispose engine connection pool: %s", dispose_err)
+
+
 @asynccontextmanager
 async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
     """Provide a transactional async database session context manager.
@@ -58,11 +85,7 @@ async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
                 "Database connection lost or reset encountered: %s. Disposing engine connection pool.",
                 str(e)
             )
-            try:
-                await engine.dispose()
-                logger.info("Database connection pool disposed successfully.")
-            except Exception as dispose_err:
-                logger.error("Failed to dispose engine connection pool: %s", dispose_err)
+            await _dispose_engine_debounced()
         else:
             logger.error("Database session error encountered, rolling back: %s", e)
             
