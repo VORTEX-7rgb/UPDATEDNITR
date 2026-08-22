@@ -744,22 +744,44 @@ class NitrisClient:
         return "Spring"
 
     @staticmethod
+    def _current_ay_start_year(now: Optional[datetime] = None) -> int:
+        """PERF (Smart Year Targeting): the START year of the CURRENT academic
+        year per the NITR calendar — July–Dec → Y-(Y+1), Jan–June → (Y-1)-Y.
+        E.g. Aug 2026 → 2026 ("2026-27"); Mar 2026 → 2025 ("2025-26")."""
+        now = now or datetime.now(config.IST)
+        return now.year if now.month >= 7 else now.year - 1
+
+    @staticmethod
     def _get_sorted_academic_years(
         options: list[tuple[str, str]],
+        current_start_year: Optional[int] = None,
     ) -> list[tuple[str, str]]:
-        """Extract and sort all valid 4-digit academic years from options.
+        """Extract and order academic-year candidates from dropdown options.
 
-        Returns list sorted by year DESCENDING (latest first) so the most recent
-        academic year is tried first.
+        PERF (Smart Year Targeting): the CURRENT academic year (computed from
+        today's date) is tried FIRST — a future placeholder year listed above
+        it in the portal's descending dropdown no longer costs us a wasted
+        probe postback. Remaining years follow in descending order as before.
+
+        The year/session HINT cache (see fetch_attendance) is applied ON TOP of
+        this ordering by the caller, so a stored hint still wins overall.
         """
+        if current_start_year is None:
+            current_start_year = NitrisClient._current_ay_start_year()
+
         valid_years = []
         for value, text in options:
             match = re.search(r"(\d{4})", text)
             if match:
                 valid_years.append((int(match.group(1)), value, text))
 
-        valid_years.sort(key=lambda x: x[0], reverse=True)
-        return [(item[1], item[2]) for item in valid_years]
+        current = [x for x in valid_years if x[0] == current_start_year]
+        rest = sorted(
+            (x for x in valid_years if x[0] != current_start_year),
+            key=lambda x: x[0],
+            reverse=True,
+        )
+        return [(item[1], item[2]) for item in current + rest]
 
     @staticmethod
     def _get_prioritized_sessions(

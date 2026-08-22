@@ -165,3 +165,43 @@ def test_p3_probe_hint_prioritization():
     assert [v for v, _ in _prioritize(opts, "v3")] == ["v3", "v2", "v1"]
     assert _prioritize(opts, None) is opts                      # no hint → untouched
     assert [v for v, _ in _prioritize(opts, "nope")] == ["v2", "v1", "v3"]
+
+
+# ── Smart Academic Year Targeting ────────────────────────────────────────────
+
+
+def test_smart_year_active_year_beats_future_placeholder():
+    """A future placeholder year listed above the active one must NOT be
+    probed first — computed current AY jumps the descending sort."""
+    from datetime import datetime
+    from app.nitris.client import NitrisClient
+
+    opts = [("9", "2027-28"), ("8", "2026-27"), ("7", "2025-26")]
+    out = NitrisClient._get_sorted_academic_years(opts, current_start_year=2026)
+    assert out[0][1] == "2026-27"
+    # Remaining years keep their newest-first fallback order.
+    assert [t for _, t in out] == ["2026-27", "2027-28", "2025-26"]
+
+
+def test_smart_year_calendar_rule():
+    """Jul–Dec → Y-(Y+1); Jan–Jun → (Y-1)-Y."""
+    from datetime import datetime
+    from app.nitris.client import NitrisClient as C
+
+    assert C._current_ay_start_year(datetime(2026, 8, 22)) == 2026   # Autumn 2026
+    assert C._current_ay_start_year(datetime(2026, 12, 31)) == 2026
+    assert C._current_ay_start_year(datetime(2026, 3, 15)) == 2025   # Spring of 25-26
+    assert C._current_ay_start_year(datetime(2027, 1, 1)) == 2026    # Jan flips cleanly
+    assert C._current_ay_start_year(datetime(2026, 6, 30)) == 2025
+    assert C._current_ay_start_year(datetime(2026, 7, 1)) == 2026    # July boundary
+
+
+def test_smart_year_composes_with_hint_cache():
+    """Hint cache still wins overall: hint reorders AFTER smart targeting."""
+    from datetime import datetime
+    from app.nitris.client import NitrisClient, _prioritize
+
+    opts = [("9", "2027-28"), ("8", "2026-27"), ("7", "2025-26")]
+    ordered = NitrisClient._get_sorted_academic_years(opts, current_start_year=2026)
+    final = _prioritize(ordered, "7")          # stored hint for this student
+    assert [t for _, t in final] == ["2025-26", "2026-27", "2027-28"]
