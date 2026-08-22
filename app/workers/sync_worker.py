@@ -240,17 +240,20 @@ async def persist_inbox_sync(user_id, scraped_messages, detail_cache, existing_b
                             )
 
                         if not baseline:
-                            await event_repo.create_event(
-                                user_id=user_id,
-                                event_type=EventType.NEW_MESSAGE_RECEIVED,
-                                payload_json={
-                                    "message_id": new_msg.id,
-                                    "sender": new_msg.sender,
-                                    "subject": new_msg.subject,
-                                    "body_snippet": (new_msg.body[:150] + "..." if new_msg.body else ""),
-                                    "has_attachment": bool(new_msg.attachment_url),
-                                },
-                            )
+                            if not await event_repo.has_message_event(
+                                user_id, EventType.NEW_MESSAGE_RECEIVED, new_msg.id
+                            ):
+                                await event_repo.create_event(
+                                    user_id=user_id,
+                                    event_type=EventType.NEW_MESSAGE_RECEIVED,
+                                    payload_json={
+                                        "message_id": new_msg.id,
+                                        "sender": new_msg.sender,
+                                        "subject": new_msg.subject,
+                                        "body_snippet": (new_msg.body[:150] + "..." if new_msg.body else ""),
+                                        "has_attachment": bool(new_msg.attachment_url),
+                                    },
+                                )
                         logger.info(
                             "Sync inserted message ID %s for user %s (baseline=%s)",
                             new_msg.portal_message_id, user_id, baseline,
@@ -276,15 +279,18 @@ async def persist_inbox_sync(user_id, scraped_messages, detail_cache, existing_b
                         existing.attachment_url = None
                         existing.attachment_cache_id = None
                         existing.is_read = False
-                        await event_repo.create_event(
-                            user_id=user_id,
-                            event_type=EventType.MESSAGE_UPDATED,
-                            payload_json={
-                                "message_id": existing.id,
-                                "sender": existing.sender,
-                                "subject": existing.subject,
-                            },
-                        )
+                        if not await event_repo.has_message_event(
+                            user_id, EventType.MESSAGE_UPDATED, existing.id
+                        ):
+                            await event_repo.create_event(
+                                user_id=user_id,
+                                event_type=EventType.MESSAGE_UPDATED,
+                                payload_json={
+                                    "message_id": existing.id,
+                                    "sender": existing.sender,
+                                    "subject": existing.subject,
+                                },
+                            )
 
 
 _event_dispatcher = None

@@ -540,6 +540,50 @@ def _content_portal_id(sender: str, subject: str, sent_on: datetime) -> int:
     return int(digest[:15], 16)
 
 
+def _parse_inbox_sent_on(date_str: str) -> datetime:
+    """Parse notice date string deterministically across multiple date formats.
+
+    NEVER returns datetime.now() on failure, because unstable timestamps
+    cause _content_portal_id to generate different IDs on every sync cycle,
+    resulting in duplicate message insertions and notification spam.
+    """
+    if not date_str or not date_str.strip():
+        return datetime(2000, 1, 1, 0, 0, 0)
+
+    clean_str = date_str.strip()
+
+    formats = (
+        "%d %b %Y",
+        "%d-%b-%Y",
+        "%d %B %Y",
+        "%d/%m/%Y",
+        "%d-%m-%Y",
+        "%Y-%m-%d",
+        "%d/%m/%Y %I:%M:%S %p",
+        "%d/%m/%Y %H:%M:%S",
+        "%d-%m-%Y %I:%M:%S %p",
+        "%d-%m-%Y %H:%M:%S",
+        "%d %b %Y %I:%M %p",
+        "%d %b %Y %H:%M",
+    )
+    for fmt in formats:
+        try:
+            return datetime.strptime(clean_str, fmt)
+        except ValueError:
+            pass
+
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(clean_str)
+        if dt:
+            return dt.replace(tzinfo=None) if dt.tzinfo else dt
+    except Exception:
+        pass
+
+    # Deterministic fallback: fixed epoch timestamp
+    return datetime(2000, 1, 1, 0, 0, 0)
+
+
 def parse_messages_list_html(html: str) -> list[dict]:
     """Parse AllMessages.aspx page HTML and return raw list of message headers.
     
@@ -580,15 +624,8 @@ def parse_messages_list_html(html: str) -> list[dict]:
         sender = desc_el.get_text(strip=True) if desc_el else ""
         time_str = time_el.get_text(strip=True) if time_el else ""
         
-        # Parse date
-        try:
-            sent_on_date = datetime.strptime(time_str, "%d %b %Y")
-        except Exception:
-            try:
-                from email.utils import parsedate_to_datetime
-                sent_on_date = parsedate_to_datetime(time_str)
-            except Exception:
-                sent_on_date = datetime.now()
+        # Parse date deterministically (never datetime.now())
+        sent_on_date = _parse_inbox_sent_on(time_str)
 
         # Parse portal ID - fall back to a content hash when the token's numeric
         # ID cannot be decoded (never 0, which would collide across messages).
@@ -663,15 +700,8 @@ def parse_messages_list_html(html: str) -> list[dict]:
             continue
         postback_target = match.group(1)
         
-        # Parse Sent On date
-        try:
-            sent_on_date = datetime.strptime(sent_on_str, "%d %b %Y")
-        except Exception:
-            try:
-                from email.utils import parsedate_to_datetime
-                sent_on_date = parsedate_to_datetime(sent_on_str)
-            except Exception:
-                sent_on_date = datetime.now()
+        # Parse Sent On date deterministically (never datetime.now())
+        sent_on_date = _parse_inbox_sent_on(sent_on_str)
                 
         # 3. Match row against dropdown messages to get direct token
         matched_token = None

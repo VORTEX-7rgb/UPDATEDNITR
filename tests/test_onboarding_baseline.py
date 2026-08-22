@@ -69,6 +69,7 @@ def _setup(monkeypatch):
 
     fake_event_repo = MagicMock()
     fake_event_repo.create_event = AsyncMock()
+    fake_event_repo.has_message_event = AsyncMock(return_value=False)
     monkeypatch.setattr(sw, "EventRepository", lambda session: fake_event_repo)
 
     return fake_event_repo

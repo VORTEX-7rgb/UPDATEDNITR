@@ -126,6 +126,7 @@ async def test_persist_inbox_sync_stale_timestamp_on_failed_detail():
 
         with patch("app.db.repositories.inbox_repository.InboxRepository.get_by_portal_message_ids", return_value=[]), \
              patch("app.db.repositories.inbox_repository.InboxRepository.create_message", return_value=created_message), \
+             patch("app.db.repositories.event_repository.EventRepository.has_message_event", new_callable=AsyncMock, return_value=False), \
              patch("app.db.repositories.event_repository.EventRepository.create_event", return_value=None):
             
             await persist_inbox_sync(1, scraped, detail_cache, existing_by_id, baseline=False)
