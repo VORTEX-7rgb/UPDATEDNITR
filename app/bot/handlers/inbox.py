@@ -17,9 +17,12 @@ from app.config import config
 from app.db.database import get_db_session
 from app.db.models import User, InboxMessage
 from app.utils import esc, safe_truncate
+from app.ui import copy, theme
+from app.ui.surface import show, Surface
 
 from app.bot.fsm import InboxSearch
-from app.bot.common import format_dashboard_text, get_dashboard_keyboard
+from app.bot.common import get_dashboard_keyboard
+from app.ui.alive import render_dashboard
 
 logger = logging.getLogger(__name__)
 
@@ -68,15 +71,28 @@ async def render_single_message(event, user: User, msg: InboxMessage, session=No
     # Time-based refetching was removed: notices are effectively immutable and
     # the old 30-min TTL cost a full NITRIS login per tap per message.
     need_fetch = msg.body is None
+    surf = None  # becomes the single bubble driving this interaction
 
     if need_fetch:
+        # EDIT WHAT YOU TAPPED: the tapped bubble becomes the progress surface,
+        # then the notice card. No stray spinner bubbles, ever.
         if isinstance(event, types.CallbackQuery):
-            status_msg = await event.message.answer("⏳ Fetching notice body from NITRIS portal...")
+            surf = Surface(await show(event.message, "⚡ <i>Opening notice…</i>"))
         else:
-            status_msg = await event.answer("⏳ Fetching notice body from NITRIS portal...")
+            surf = Surface(await event.answer("⚡ <i>Opening notice…</i>", parse_mode=ParseMode.HTML))
+
+        surf.poke_later(4.0, copy.slow_note("fetching the notice"))
 
         from app.nitris.job_queue import nitris_job_queue, Priority
         from app.nitris.gateway import NitrisCircuitOpenError
+
+        def _fail_kb():
+            from aiogram.utils.keyboard import InlineKeyboardBuilder
+            from app.ui.theme import btn, home_button
+            b = InlineKeyboardBuilder()
+            b.row(btn("📬 Inbox Menu", "db_inbox"))
+            b.row(home_button())
+            return b.as_markup()
 
         try:
             future = await nitris_job_queue.enqueue(
@@ -91,8 +107,10 @@ async def render_single_message(event, user: User, msg: InboxMessage, session=No
                 result = await asyncio.wait_for(future, timeout=120.0)
                 if not result.get("success"):
                     error = result.get("error", "Unknown error")
-                    await status_msg.edit_text(
-                        f"❌ Failed to fetch message detail from NITRIS: {html.escape(str(error)[:200])}"
+                    await surf.final(
+                        f"🦀 <b>Couldn't open that notice.</b>\n\n"
+                        f"<i>{html.escape(str(error)[:200])}</i>",
+                        _fail_kb(),
                     )
                     return
 
@@ -108,26 +126,16 @@ async def render_single_message(event, user: User, msg: InboxMessage, session=No
                 if fetched_attachment:
                     msg.attachment_url = fetched_attachment
 
-                try:
-                    await status_msg.delete()
-                except Exception:
-                    pass
-
             except asyncio.TimeoutError:
-                await status_msg.edit_text(
-                    "⏳ <b>Fetch is taking longer than expected.</b>\n\n"
-                    "NITRIS may be slow. Please try again in a moment.",
-                    parse_mode=ParseMode.HTML,
+                await surf.final(
+                    "⏳ <b>Still fetching in the background.</b>\n\n"
+                    "<i>NITRIS is slow right now — tap it again in a moment.</i>",
+                    _fail_kb(),
                 )
                 return
 
         except NitrisCircuitOpenError:
-            await status_msg.edit_text(
-                "⚠️ <b>NITRIS is temporarily unavailable.</b>\n\n"
-                "The system is protecting the portal from overload. "
-                "Please try again in ~60 seconds.",
-                parse_mode=ParseMode.HTML,
-            )
+            await surf.final(copy.CIRCUIT_DOWN, _fail_kb())
             return
 
     sent_str = msg.sent_on.strftime("%d %b %Y")
@@ -141,12 +149,13 @@ async def render_single_message(event, user: User, msg: InboxMessage, session=No
 
     card_text = (
         f"📩 <b>NITRIS Notice</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"👤 <b>From:</b> {esc(msg.sender)}\n"
-        f"📅 <b>Date:</b> {sent_str}\n"
-        f"📌 <b>Subject:</b> {esc(msg.subject)}\n"
-        f"━━━━━━━━━━━━━━━━━━━\n\n"
-        f"{body_text}\n"
+        + theme.quote(
+            f"👤 <b>From:</b> {esc(msg.sender)}\n"
+            f"📅 <b>Date:</b> {sent_str}\n"
+            f"📌 <b>Subject:</b> {esc(msg.subject)}\n"
+            "━━━━━━━━━━━━━━━━━━━\n"
+            f"{body_text}"
+        )
     )
 
     builder = InlineKeyboardBuilder()
@@ -157,19 +166,15 @@ async def render_single_message(event, user: User, msg: InboxMessage, session=No
         types.InlineKeyboardButton(text="📬 Inbox Menu", callback_data="db_inbox"),
         types.InlineKeyboardButton(text="🏠 Dashboard", callback_data="inbox_back_dashboard")
     )
+    markup = builder.as_markup()
 
-    if isinstance(event, types.CallbackQuery):
-        await event.message.answer(
-            card_text,
-            reply_markup=builder.as_markup(),
-            parse_mode=ParseMode.HTML
-        )
+    if surf is not None:
+        # Same bubble that showed the progress state becomes the notice card.
+        await surf.final(card_text, markup)
+    elif isinstance(event, types.CallbackQuery):
+        await show(event.message, card_text, markup)
     else:
-        await event.answer(
-            card_text,
-            reply_markup=builder.as_markup(),
-            parse_mode=ParseMode.HTML
-        )
+        await event.answer(card_text, reply_markup=markup, parse_mode=ParseMode.HTML)
 
 
 @router.callback_query(F.data == "db_inbox")
@@ -316,6 +321,11 @@ async def handle_inbox_refresh(callback: types.CallbackQuery, state: FSMContext)
             parse_mode=ParseMode.HTML,
         )
 
+    # ONE bubble drives the whole refresh: cached list -> (slow poke) -> fresh list.
+    from app.ui.surface import Surface
+    surf = Surface(status_msg)
+    surf.poke_later(4.0, copy.slow_note("refreshing your inbox"))
+
     from app.nitris.job_queue import nitris_job_queue, Priority
     from app.nitris.gateway import NitrisCircuitOpenError
 
@@ -334,55 +344,46 @@ async def handle_inbox_refresh(callback: types.CallbackQuery, state: FSMContext)
         try:
             result = await asyncio.wait_for(future, timeout=120.0)
             if result.get("success"):
-                try:
-                    await status_msg.delete()
-                except Exception:
-                    pass
-                await _render_inbox_list_message(status_msg, user.id, page=1)
+                await _render_inbox_list_into(surf, user.id, page=1)
             else:
                 error = result.get("error", "Unknown error")
-                if "circuit" in error.lower() or "open" in error.lower():
-                    await status_msg.edit_text(
-                        refreshing_text.replace(
-                            "🔄 <i>Refreshing from NITRIS in background...</i>",
-                            "⚠️ <b>NITRIS temporarily unavailable.</b> Showing cached inbox.",
-                        ),
-                        reply_markup=_inbox_refreshing_keyboard(),
-                        parse_mode=ParseMode.HTML,
+                if (
+                    "circuit" in error.lower()
+                    or "unavailable" in error.lower()
+                    or "open" in error.lower()
+                ):
+                    await surf.final(
+                        _render_inbox_list_text(cached_messages, page=1, refreshing=False)
+                        + "\n\n💀 <b>NITRIS temporarily unavailable.</b> Showing cached inbox.",
+                        _inbox_refreshing_keyboard(),
                     )
                 else:
-                    await status_msg.edit_text(
+                    await surf.final(
                         f"⚠️ <b>Refresh failed:</b> {html.escape(str(error)[:200])}\n\n"
                         + _render_inbox_list_text(cached_messages, page=1, refreshing=False),
-                        reply_markup=_inbox_refreshing_keyboard(),
-                        parse_mode=ParseMode.HTML,
+                        _inbox_refreshing_keyboard(),
                     )
         except asyncio.TimeoutError:
-            await status_msg.edit_text(
+            await surf.final(
                 refreshing_text.replace(
                     "🔄 <i>Refreshing from NITRIS in background...</i>",
                     "⏳ <i>Refresh still running in background. Your inbox will update shortly.</i>",
                 ),
-                reply_markup=_inbox_refreshing_keyboard(),
-                parse_mode=ParseMode.HTML,
+                _inbox_refreshing_keyboard(),
             )
 
     except NitrisCircuitOpenError:
-        await status_msg.edit_text(
-            refreshing_text.replace(
-                "🔄 <i>Refreshing from NITRIS in background...</i>",
-                "⚠️ <b>NITRIS temporarily unavailable.</b> Showing cached inbox.",
-            ),
-            reply_markup=_inbox_refreshing_keyboard(),
-            parse_mode=ParseMode.HTML,
+        await surf.final(
+            _render_inbox_list_text(cached_messages, page=1, refreshing=False)
+            + "\n\n💀 <b>NITRIS temporarily unavailable.</b> Showing cached inbox.",
+            _inbox_refreshing_keyboard(),
         )
     except Exception as e:
         logger.error("Failed live inbox refresh for telegram_id %s: %r", telegram_id, e)
-        await status_msg.edit_text(
+        await surf.final(
             f"❌ Refresh failed: {html.escape(str(e))}\n\n"
             + _render_inbox_list_text(cached_messages, page=1, refreshing=False),
-            reply_markup=_inbox_refreshing_keyboard(),
-            parse_mode=ParseMode.HTML,
+            _inbox_refreshing_keyboard(),
         )
 
 
@@ -414,8 +415,8 @@ def _inbox_refreshing_keyboard() -> types.InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-async def _render_inbox_list_message(message, user_id: int, page: int = 1) -> None:
-    """Edit/send message to show the inbox list page. Used after a refresh completes."""
+async def _render_inbox_list_into(surf, user_id: int, page: int = 1) -> None:
+    """Terminal render of the inbox list INTO the refresh surface (no new bubble)."""
     async with get_db_session() as session:
         from app.db.repositories.inbox_repository import InboxRepository
         inbox_repo = InboxRepository(session)
@@ -424,14 +425,8 @@ async def _render_inbox_list_message(message, user_id: int, page: int = 1) -> No
         messages = await inbox_repo.get_latest_messages(user_id, offset=offset, limit=limit + 1)
 
     if not messages:
-        try:
-            await message.answer(
-                "📩 <b>Your NITRIS Inbox</b>\n\nYour inbox is currently empty.",
-                reply_markup=_inbox_refreshing_keyboard(),
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception:
-            pass
+        from app.ui import copy as ui_copy
+        await surf.final(ui_copy.INBOX_EMPTY_STALE, _inbox_refreshing_keyboard())
         return
 
     has_next = len(messages) > limit
@@ -463,10 +458,7 @@ async def _render_inbox_list_message(message, user_id: int, page: int = 1) -> No
         types.InlineKeyboardButton(text="🏠 Back to Dashboard", callback_data="inbox_back_dashboard")
     )
 
-    try:
-        await message.answer(text, reply_markup=builder.as_markup(), parse_mode=ParseMode.HTML)
-    except Exception:
-        pass
+    await surf.final(text, builder.as_markup())
 
 
 @router.callback_query(F.data == "inbox_back_dashboard")
@@ -490,12 +482,10 @@ async def handle_inbox_back_dashboard(callback: types.CallbackQuery, state: FSMC
 
     if user:
         await state.clear()
-        text = format_dashboard_text(user, unread_count)
-        await callback.message.edit_text(
-            text,
-            reply_markup=get_dashboard_keyboard(unread_count),
-            parse_mode=ParseMode.HTML
-        )
+        # Text-only dashboard (PNG photo card removed by design decision).
+        text = await render_dashboard(session, user, unread_count)
+        kb = get_dashboard_keyboard(unread_count)
+        await show(callback.message, text, kb)
     else:
         await callback.message.answer("⚠️ You are not registered. Please use /start to register.")
 

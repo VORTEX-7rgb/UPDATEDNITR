@@ -82,16 +82,6 @@ class FakeSession:
                                          row.get("exam_type"), row.get("portal_postback_target"))])
                 return _FakeResult([])
 
-            if "UPDATE question_paper_caches" in sql and "SET status = :retryable" in sql and "not_available_until = NULL" in sql:
-                cid = params.get("id")
-                row = self.store.get(cid)
-                if row:
-                    row["status"] = params.get("retryable")
-                    row["not_available_until"] = None
-                    row["attempt_count"] = 0
-                    row["updated_at"] = datetime.now(timezone.utc)
-                return _FakeResult([], rowcount=1 if row else 0)
-
             if "UPDATE question_paper_caches" in sql and "SET status = :status" in sql:
                 # Mark available / mark failure / mark not available
                 cid = params.get("cache_id")
@@ -447,9 +437,11 @@ async def test_permanent_failure_classification():
 
 
 @pytest.mark.asyncio
-async def test_negative_cache_no_rescrape_within_ttl(qp_service, store, fake_bot):
-    """When a paper is negative-cached with not_available_until in the future,
-    deliver() must return not_available=True with ZERO NITRIS downloads."""
+async def test_negative_cache_future_stamp_is_still_terminal(qp_service, store, fake_bot):
+    """PERMANENT negatives: even a row carrying a legacy FUTURE-dated
+    not_available_until stamp gets an instant no-paper answer with ZERO NITRIS
+    downloads. Stamps no longer mean 're-check me later' — once NITRIS says no
+    paper, that answer is final."""
     future_time = datetime.now(timezone.utc) + timedelta(hours=12)
     store[8] = {
         "id": 8, "subject_code": "CS201", "academic_year": "2024-25/Autumn",
@@ -463,12 +455,16 @@ async def test_negative_cache_no_rescrape_within_ttl(qp_service, store, fake_bot
     }
 
     async def forbidden_nitris(*args):
-        raise AssertionError("NITRIS was called within negative cache TTL window!")
+        raise AssertionError("NITRIS must never be queried for a negative-cached paper!")
     qp_service._nitris_download = forbidden_nitris
 
     res = await qp_service.deliver(cache_id=8, telegram_id=999)
     assert res.not_available is True
     assert res.delivered is False
+    # Row completely untouched — still negative, still its original stamp,
+    # no claim/acquisition ever started.
+    assert store[8]["status"] == QPStatus.PAPER_NOT_AVAILABLE.value
+    assert store[8]["attempt_count"] == 1
     assert len(fake_bot.sent_documents) == 0
 
 
@@ -497,10 +493,12 @@ async def test_permanent_negative_cache_no_rescrape(qp_service, store, fake_bot)
 
 
 @pytest.mark.asyncio
-async def test_negative_cache_ttl_expiry_triggers_recheck(qp_service, store, fake_bot):
-    """When a negative-cached paper's TTL has expired (not_available_until in the past),
-    deliver() must atomically reset the row and re-query NITRIS."""
-    past_time = datetime.now(timezone.utc) - timedelta(hours=1)
+async def test_negative_cache_expired_stamp_never_rechecked(qp_service, store, fake_bot):
+    """PERMANENT negatives: an EXPIRED not_available_until stamp must NEVER
+    trigger a re-check. Once NITRIS says no paper exists, that answer is
+    final — professors do not retroactively upload papers.
+    Manual recovery from a wrong negative: /admin_reset_qp."""
+    past_time = datetime.now(timezone.utc) - timedelta(hours=48)
     store[10] = {
         "id": 10, "subject_code": "EC301", "academic_year": "2024-25/Autumn",
         "exam_type": "end_sem", "portal_postback_target": "ctl00$ec301",
@@ -512,24 +510,24 @@ async def test_negative_cache_ttl_expiry_triggers_recheck(qp_service, store, fak
         "attempt_count": 1,
     }
 
-    nitris_called = False
-    async def fake_nitris(sub, yr, ex, pb, requester_user_id=None):
-        nonlocal nitris_called
-        nitris_called = True
-        return b"%PDF-1.4 newly uploaded exam paper", "pdf"
-    qp_service._nitris_download = fake_nitris
+    async def forbidden_nitris(*args):
+        raise AssertionError("Expired negative stamp must NEVER be re-checked!")
+    qp_service._nitris_download = forbidden_nitris
 
     res = await qp_service.deliver(cache_id=10, telegram_id=888)
-    assert res.delivered is True
-    assert nitris_called is True
-    assert store[10]["status"] == QPStatus.PAPER_AVAILABLE.value
-    assert store[10]["telegram_file_id"] is not None
+    assert res.not_available is True
+    assert res.delivered is False
+    # No claim, no acquisition attempt — row byte-for-byte unchanged.
+    assert store[10]["status"] == QPStatus.PAPER_NOT_AVAILABLE.value
+    assert store[10]["attempt_count"] == 1
+    assert len(fake_bot.sent_documents) == 0
 
 
 @pytest.mark.asyncio
-async def test_paper_not_available_error_creates_negative_cache(qp_service, store, fake_bot):
-    """When NITRIS download raises PaperNotAvailableError (postback returned form HTML),
-    acquisition must set status='paper_not_available' with 24h TTL."""
+async def test_paper_not_available_error_creates_permanent_negative(qp_service, store, fake_bot):
+    """When NITRIS download raises PaperNotAvailableError (postback returned
+    form HTML), acquisition must set status='paper_not_available' PERMANENTLY:
+    not_available_until cleared to NULL — the row is never re-checked."""
     store[11] = {
         "id": 11, "subject_code": "ME201", "academic_year": "2024-25/Autumn",
         "exam_type": "mid_sem", "portal_postback_target": "ctl00$me201",
@@ -549,8 +547,8 @@ async def test_paper_not_available_error_creates_negative_cache(qp_service, stor
     assert res.not_available is True
     assert res.delivered is False
     assert store[11]["status"] == QPStatus.PAPER_NOT_AVAILABLE.value
-    assert store[11]["not_available_until"] is not None
-    assert store[11]["not_available_until"] > datetime.now(timezone.utc)
+    # Permanent: NULL stamp — never a future TTL to expire.
+    assert store[11]["not_available_until"] is None
 
 
 # ── Own-creds-first policy (launch-hardening) ───────────────────────
@@ -615,9 +613,11 @@ async def test_own_creds_tried_before_pool(qp_service, store, fake_bot, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_pool_fallback_when_own_login_fails(qp_service, store, fake_bot, monkeypatch):
-    """If the requester's own login fails (LoginError), acquisition falls back
-    to the shared pool so the user still gets their paper."""
+async def test_no_pool_fallback_when_own_login_fails(qp_service, store, fake_bot, monkeypatch):
+    """H2: if the requester's own login fails (LoginError), acquisition must
+    NOT fall back to other students' accounts. The user gets an error, no
+    cross-account login is attempted, and the shared cache row is not poisoned
+    into permanent_failure by one student's bad credentials."""
     from contextlib import asynccontextmanager
 
     from app.nitris.exceptions import LoginError
@@ -625,7 +625,7 @@ async def test_pool_fallback_when_own_login_fails(qp_service, store, fake_bot, m
     login_order: list[str] = []
 
     async def fake_provider():
-        return [("POOLROLL", 42, b"pool-enc")]
+        return None  # H2: probe only
 
     qp_service.creds_provider = fake_provider
 
@@ -664,6 +664,16 @@ async def test_pool_fallback_when_own_login_fails(qp_service, store, fake_bot, m
         lambda enc: enc.decode() if isinstance(enc, bytes) else enc,
     )
 
+    # Track that on_login_failure fires for the RIGHT person (the requester).
+    quarantine_calls: list[tuple[int, str]] = []
+
+    async def fake_on_login_failure(user_id, err):
+        quarantine_calls.append((user_id, err))
+
+    monkeypatch.setattr(
+        "app.nitris.auth_gate.on_login_failure", fake_on_login_failure
+    )
+
     store[21] = {
         "id": 21, "subject_code": "CS2001", "academic_year": "2024-25/Autumn",
         "exam_type": "mid_sem", "portal_postback_target": "ctl00$cs2001b",
@@ -676,8 +686,13 @@ async def test_pool_fallback_when_own_login_fails(qp_service, store, fake_bot, m
     }
 
     res = await qp_service.deliver(cache_id=21, telegram_id=556, requester_user_id=7)
-    assert res.delivered is True
-    # Pool candidate served the request after the requester's own login failed.
-    assert login_order == ["POOLROLL"]
-    assert store[21]["status"] == QPStatus.PAPER_AVAILABLE.value
+
+    # No delivery — and the pool account was NEVER contacted.
+    assert res.delivered is False
+    assert login_order == []
+    # The failure was attributed to the REQUESTER only.
+    assert quarantine_calls == [(7, "Invalid credentials.")]
+    # Shared row was released for retry but NOT escalated to permanent.
+    assert store[21]["status"] == QPStatus.RETRYABLE_FAILURE.value
+    assert res.error
 

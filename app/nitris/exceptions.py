@@ -6,7 +6,22 @@ class NitrisError(Exception):
 
 
 class LoginError(NitrisError):
-    """Authentication failed."""
+    """Authentication failed — the portal explicitly REJECTED the credentials.
+
+    This is raised ONLY when the portal responded and refused the login
+    (e.g. "SUCCESS" missing from its reply). It is safe to treat as
+    confirmed bad credentials: callers quarantine the user on this type.
+    """
+
+
+class LoginUnavailableError(NitrisError):
+    """Portal unreachable or misbehaving during login — NOT evidence of bad credentials.
+
+    Raised for transport failures, HTTP 5xx, malformed/empty server responses,
+    and exhausted retries of such transient errors. Callers must NEVER
+    quarantine a user because of this type; it is a portal-level fault and
+    counts toward the gateway circuit breaker instead.
+    """
 
 
 class SessionExpiredError(NitrisError):

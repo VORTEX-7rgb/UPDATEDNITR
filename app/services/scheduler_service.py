@@ -49,7 +49,7 @@ from app.config import config
 from app.db.database import get_db_session, async_session_factory, is_db_connection_error
 from app.nitris.gateway import nitris_gateway, NitrisCircuitOpenError
 from app.nitris.job_queue import nitris_job_queue, Priority
-from app.nitris.exceptions import LoginError, CredentialsQuarantinedError
+from app.nitris.exceptions import LoginError, LoginUnavailableError, CredentialsQuarantinedError
 logger = logging.getLogger(__name__)
 
 # module_name -> registered job_type whitelist. Anything NOT in this map is
@@ -402,7 +402,8 @@ async def init_scheduler() -> None:
                     )
                     return {"success": False, "error": "user_invalid"}
                 roll_number = user.roll_number
-                password = decrypt_password(user.encrypted_password)
+                encrypted_password = user.encrypted_password
+                # M9 fix: NO plaintext out here — decrypted just-in-time below.
         except Exception as e:
             logger.error("sync_attendance DB lookup failed for user_id=%d: %r", user_id, e)
             await update_schedule_after_job(
@@ -411,9 +412,10 @@ async def init_scheduler() -> None:
             )
             return {"success": False, "error": str(e)}
 
-        # Phase 2: NITRIS work -- INSIDE gateway (login + scrape only)
+        # Phase 2: NITRIS work -- INSIDE gateway (decrypt + login + scrape only)
         try:
             async with nitris_gateway.acquire():
+                password = decrypt_password(encrypted_password)
                 client = NitrisClient()
                 try:
                     await nitris_gateway.login_through_gateway(client, roll_number, password, user_id=user_id)
@@ -425,6 +427,16 @@ async def init_scheduler() -> None:
                 async_session_factory, schedule_id,
                 success=False, error_msg=str(e), module_name=module_name,
             )
+            return {"success": False, "error": str(e)}
+        except LoginUnavailableError as e:
+            # Portal down/misbehaving — NOT a credential problem (H1 fix).
+            # Normal exponential backoff via the schedule row; never quarantine.
+            logger.warning("sync_attendance: NITRIS unavailable for user_id=%s: %r", user_id, e)
+            await update_schedule_after_job(
+                async_session_factory, schedule_id,
+                success=False, error_msg="portal_unavailable", module_name=module_name,
+            )
+            await _update_sync_state(user_id, success=False, error_msg=str(e))
             return {"success": False, "error": str(e)}
         except (LoginError, CredentialsQuarantinedError) as e:
             # One confirmed LoginError → permanent quarantine (no auto-retry).
@@ -495,7 +507,8 @@ async def init_scheduler() -> None:
                     )
                     return {"success": False, "error": "user_invalid"}
                 roll_number = user.roll_number
-                password = decrypt_password(user.encrypted_password)
+                encrypted_password = user.encrypted_password
+                # M9 fix: NO plaintext out here — decrypted just-in-time below.
         except Exception as e:
             logger.error("sync_inbox DB lookup failed for user_id=%d: %r", user_id, e)
             await update_schedule_after_job(
@@ -504,9 +517,10 @@ async def init_scheduler() -> None:
             )
             return {"success": False, "error": str(e)}
 
-        # Phase 2: NITRIS network -- INSIDE gateway (login + fetch + details)
+        # Phase 2: NITRIS network -- INSIDE gateway (decrypt + login + fetch + details)
         try:
             async with nitris_gateway.acquire():
+                password = decrypt_password(encrypted_password)
                 client = NitrisClient()
                 try:
                     await nitris_gateway.login_through_gateway(client, roll_number, password, user_id=user_id)
@@ -517,6 +531,15 @@ async def init_scheduler() -> None:
             await update_schedule_after_job(
                 async_session_factory, schedule_id,
                 success=False, error_msg=str(e), module_name=module_name,
+            )
+            return {"success": False, "error": str(e)}
+        except LoginUnavailableError as e:
+            # Portal down/misbehaving — NOT a credential problem (H1 fix).
+            # Normal exponential backoff via the schedule row; never quarantine.
+            logger.warning("sync_inbox: NITRIS unavailable for user_id=%s: %r", user_id, e)
+            await update_schedule_after_job(
+                async_session_factory, schedule_id,
+                success=False, error_msg="portal_unavailable", module_name=module_name,
             )
             return {"success": False, "error": str(e)}
         except (LoginError, CredentialsQuarantinedError) as e:

@@ -370,6 +370,9 @@ class AttendanceRecord:
     ua: str
     le: str
     oa: str
+    # NITRIS's debar table is keyed on the Lecture-Tutorial-Practical pattern.
+    # Empty string on rows where the portal omits it (health engine falls back).
+    ltp: str = ""
 
 
 @dataclass
@@ -441,6 +444,7 @@ def parse_attendance_html(html: str) -> AttendanceResult:
             ua=_cell(cells, col.get("ua")),
             le=_cell(cells, col.get("le")),
             oa=_cell(cells, col.get("oa")),
+            ltp=_cell(cells, col.get("ltp")),
         )
         records.append(record)
 
@@ -460,14 +464,16 @@ def _map_columns(headers: list[str]) -> dict[str, int]:
     """Map column names to indices. Case-insensitive, partial match."""
     mapping: dict[str, Optional[int]] = {
         "subject_code": None, "subject_name": None, "faculty": None,
-        "tc": None, "ua": None, "le": None, "oa": None,
+        "tc": None, "ua": None, "le": None, "oa": None, "ltp": None,
     }
-    
+
     aliases = {
         "subject_code": ["subject code", "sub code", "code"],
         "subject_name": ["subject name", "course name", "sub name", "subject", "name"],
         "faculty": ["faculty name", "faculty", "teacher"],
         "tc": ["tc"], "ua": ["ua"], "le": ["le"], "oa": ["oa"],
+        # Header renders as "L-T-P"; match before generic patterns.
+        "ltp": ["l-t-p", "ltp", "l t p"],
     }
 
     for i, header in enumerate(headers):

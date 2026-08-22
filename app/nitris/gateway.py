@@ -37,6 +37,11 @@ class CircuitBreakerOpenError(NitrisError):
     pass
 
 
+# PERF P5: background work (scheduler syncs etc.) leaves this many gateway
+# slots free so an interactive tap never queues behind a sync storm.
+RESERVED_INTERACTIVE_SLOTS = 2
+
+
 # Alias for backward and test compatibility
 NitrisCircuitOpenError = CircuitBreakerOpenError
 
@@ -74,7 +79,9 @@ class NitrisGateway:
         self.circuit_error_threshold = circuit_error_threshold or config.NITRIS_GATEWAY_CIRCUIT_ERROR_THRESHOLD
         self.circuit_recovery_seconds = circuit_recovery_seconds or config.NITRIS_GATEWAY_CIRCUIT_RECOVERY_SECONDS
 
-        self._login_lock = asyncio.Lock()
+        self._pacing_cond = asyncio.Condition()
+        self._pacing_busy = False
+        self._interactive_pace_waiters = 0
         # In-memory quarantine guard (defense-in-depth). The DB `credentials_valid`
         # column is the source of truth; this set lets login_through_gateway()
         # refuse a quarantined user in O(1) WITHOUT touching the DB inside the
@@ -89,6 +96,8 @@ class NitrisGateway:
 
         self.circuit_state = CircuitState.CLOSED
         self.circuit_opened_at: float = 0.0
+        # M2 fix: exactly ONE in-flight request may probe a HALF-OPEN circuit.
+        self._probe_in_flight: bool = False
         self.metrics = GatewayMetrics()
 
         logger.info(
@@ -115,52 +124,94 @@ class NitrisGateway:
         self.metrics = GatewayMetrics()
 
     def is_circuit_open(self) -> bool:
-        """Check if circuit breaker is currently open."""
+        """Pure predicate: True while NEW traffic should be rejected.
+
+        M2 fix: this method NO LONGER mutates state. The old version flipped
+        OPEN→HALF_OPEN as a side effect of a read — every concurrent caller
+        then saw False and stampeded the recovering portal simultaneously,
+        re-tripping the circuit in a stutter loop. State transitions now
+        happen only inside acquire()'s locked admission section, which admits
+        exactly ONE recovery probe into HALF_OPEN and rejects everyone else.
+
+        HALF_OPEN counts as open here so background callers (the scheduler)
+        skip claiming work while a recovery probe is in flight.
+        """
+        if self.circuit_state == CircuitState.HALF_OPEN:
+            return True
         if self.circuit_state == CircuitState.OPEN:
             elapsed = time.monotonic() - self.circuit_opened_at
-            if elapsed >= self.circuit_recovery_seconds:
-                self.circuit_state = CircuitState.HALF_OPEN
-                logger.info("NITRIS Gateway circuit transitioned from OPEN to HALF_OPEN (trial probe)")
-                return False
-            return True
+            return elapsed < self.circuit_recovery_seconds
         return False
 
     @asynccontextmanager
     async def acquire(self, is_login: bool = False) -> AsyncGenerator[None, None]:
         """Async context manager guarding all NITRIS portal interactions.
 
-        Usage:
-            async with nitris_gateway.acquire(is_login=True):
-                await client.login(roll, password)
-        """
-        # 1. Check Circuit Breaker
-        if self.is_circuit_open():
-            raise NitrisCircuitOpenError(
-                f"NITRIS portal circuit is OPEN (outage detected). Retry in "
-                f"{int(self.circuit_recovery_seconds - (time.monotonic() - self.circuit_opened_at))}s"
-            )
+        Admission (M2 fix): circuit-state transitions AND capacity checks run
+        inside ONE locked section. A HALF-OPEN circuit admits exactly ONE
+        recovery probe; every other caller fails fast with
+        NitrisCircuitOpenError instead of stampeding a recovering portal.
 
-        # 2. Acquire Concurrency Slot (dynamic admission — respects the current
-        #    effective cap, which shrinks on failure and grows on recovery).
+        Usage:
+            async with nitris_gateway.acquire():
+                await nitris_gateway.login_through_gateway(client, roll, pw, user_id=uid)
+        """
+        is_probe = False
+        # PERF P5: classify the caller once — background work leaves a couple
+        # of slots free so interactive taps always have headroom.
+        interactive = self._caller_is_interactive()
+        # ── Admission: ONE locked section owns circuit transitions + capacity ──
         async with self._state_lock:
-            while self.metrics.active_requests >= self.current_max_concurrent:
-                await self._state_lock.wait()
-            self.metrics.active_requests += 1
-            if is_login:
-                self.metrics.active_logins += 1
+            while True:
+                # Circuit gate — atomic OPEN → HALF_OPEN → single-probe machine.
+                if self.circuit_state == CircuitState.OPEN:
+                    elapsed = time.monotonic() - self.circuit_opened_at
+                    if elapsed >= self.circuit_recovery_seconds:
+                        self.circuit_state = CircuitState.HALF_OPEN
+                        logger.info(
+                            "NITRIS Gateway circuit OPEN -> HALF_OPEN "
+                            "(single recovery probe armed)"
+                        )
+                    else:
+                        raise NitrisCircuitOpenError(
+                            f"NITRIS portal circuit is OPEN (outage detected). Retry in "
+                            f"{int(self.circuit_recovery_seconds - elapsed)}s"
+                        )
+                if self.circuit_state == CircuitState.HALF_OPEN:
+                    if self._probe_in_flight:
+                        raise NitrisCircuitOpenError(
+                            "NITRIS circuit is HALF-OPEN: one recovery probe is "
+                            "already in flight — retry in a few seconds."
+                        )
+                    self._probe_in_flight = True
+                    is_probe = True
+
+                # Capacity wait — re-checks the circuit after every wake, so a
+                # queued caller can never jump across a transition that happened
+                # while it waited.
+                #
+                # PERF P5: background callers admit only up to
+                # (cap - RESERVED_INTERACTIVE_SLOTS); interactive callers may
+                # use the full cap. The limit is recomputed each iteration
+                # because the adaptive cap shrinks/grows at runtime.
+                limit = self.current_max_concurrent
+                if not interactive:
+                    limit = max(1, limit - RESERVED_INTERACTIVE_SLOTS)
+                if self.metrics.active_requests >= limit:
+                    await self._state_lock.wait()
+                    continue
+                self.metrics.active_requests += 1
+                if is_login:
+                    self.metrics.active_logins += 1
+                break
 
         try:
-            # 3. If login, enforce pacing interval
+            # Pacing hook for explicit is_login=True callers only. Production
+            # logins pace slot-free inside _do_login() (M3 fix), with
+            # interactive priority (PERF P2).
             if is_login:
-                async with self._login_lock:
-                    now = time.monotonic()
-                    elapsed = now - self.metrics.last_login_time
-                    if elapsed < self.current_login_interval:
-                        delay = self.current_login_interval - elapsed
-                        logger.debug("Pacing login by %.2fs", delay)
-                        await asyncio.sleep(delay)
-                    self.metrics.last_login_time = time.monotonic()
-                    self.metrics.total_logins += 1
+                await self._paced_wait(interactive=True)
+                self.metrics.total_logins += 1
 
             start_time = time.monotonic()
             self.metrics.total_requests += 1
@@ -180,6 +231,16 @@ class NitrisGateway:
             # session, a quarantined credential) must NOT trip the global
             # circuit breaker. One student's bad state must not take the whole
             # bot down for everyone.
+            #
+            # NOTE: LoginUnavailableError is deliberately NOT in this tuple.
+            # It signals the PORTAL is down/misbehaving during login, so it
+            # falls through to the generic NitrisError arm below and counts
+            # toward the circuit breaker — protecting the portal and every
+            # other user during an outage (H1 fix).
+            #
+            # M2: a per-user verdict means the PORTAL responded — recovery
+            # evidence. Close a HALF-OPEN probe so waiters are released.
+            await self._note_portal_responded()
             raise
 
         except NitrisError as exc:
@@ -204,7 +265,21 @@ class NitrisGateway:
                 self.metrics.active_requests -= 1
                 if is_login:
                     self.metrics.active_logins -= 1
+                # Probe finished — whichever way it went, clear the flag so a
+                # HALF-OPEN circuit can never deadlock on a lost probe.
+                if is_probe:
+                    self._probe_in_flight = False
                 self._state_lock.notify_all()
+
+    async def _note_portal_responded(self) -> None:
+        """Per-user faults carry a PORTAL response (a user-level verdict), which
+        is recovery evidence for the circuit breaker (M2)."""
+        async with self._state_lock:
+            if self.circuit_state == CircuitState.HALF_OPEN:
+                self.circuit_state = CircuitState.CLOSED
+                logger.info(
+                    "NITRIS Gateway probe received a portal response: Circuit CLOSED"
+                )
 
     def quarantine(self, user_id: int) -> None:
         """Add a user to the in-memory quarantine guard."""
@@ -222,12 +297,49 @@ class NitrisGateway:
     def quarantined_user_count(self) -> int:
         return len(self._quarantined)
 
-    async def _do_login(self, client, username: str, password: str) -> None:
-        """Paced login with metrics tracking. Shared by the automatic login
-        path (login_through_gateway) and the explicit verification path
-        (verify_credentials)."""
-        # Enforce minimum interval between logins (pacing)
-        async with self._login_lock:
+    @staticmethod
+    def _caller_is_interactive() -> bool:
+        """PERF P2/P5 classification of the current caller.
+
+        The job queue names its workers 'nitris-bg-*' / 'nitris-shared-*';
+        those run background syncs and cold acquisitions. Everything else —
+        aiogram handler tasks (button taps), registration, direct calls,
+        tests — is user-facing INTERACTIVE work.
+        """
+        task = asyncio.current_task()
+        name = task.get_name() if task is not None else ""
+        return not (name.startswith("nitris-bg") or name.startswith("nitris-shared"))
+
+    @asynccontextmanager
+    async def _pacing_turn(self, interactive: bool):
+        """Hold the global login-pacing turn.
+
+        Same minimum-interval guarantee as before (portal protection is
+        IDENTICAL), but with PERF P2 ordering: an interactive caller jumps
+        ahead of queued background logins instead of strict FIFO.
+        """
+        async with self._pacing_cond:
+            if interactive:
+                self._interactive_pace_waiters += 1
+                try:
+                    while self._pacing_busy:
+                        await self._pacing_cond.wait()
+                finally:
+                    self._interactive_pace_waiters -= 1
+            else:
+                while self._pacing_busy or self._interactive_pace_waiters > 0:
+                    await self._pacing_cond.wait()
+            self._pacing_busy = True
+        try:
+            yield
+        finally:
+            async with self._pacing_cond:
+                self._pacing_busy = False
+                self._pacing_cond.notify_all()
+
+    async def _paced_wait(self, interactive: bool) -> None:
+        """Sleep out the remaining login interval while holding a pacing turn."""
+        async with self._pacing_turn(interactive):
             now = time.monotonic()
             elapsed = now - self.metrics.last_login_time
             if elapsed < self.current_login_interval:
@@ -235,6 +347,43 @@ class NitrisGateway:
                 logger.debug("Pacing login by %.2fs", delay)
                 await asyncio.sleep(delay)
             self.metrics.last_login_time = time.monotonic()
+
+    async def _release_slot(self) -> None:
+        """Temporarily hand back the caller's portal concurrency slot.
+
+        M3 fix: the paced-login wait used to run while HOLDING a slot, so N
+        queued logins could occupy every slot while merely sleeping — starving
+        interactive taps of capacity even when the portal was idle. The slot is
+        released for the wait and reacquired before any portal I/O.
+        """
+        async with self._state_lock:
+            if self.metrics.active_requests > 0:
+                self.metrics.active_requests -= 1
+            self._state_lock.notify_all()
+
+    async def _reacquire_slot(self) -> None:
+        """Re-take a portal concurrency slot (counterpart to _release_slot)."""
+        async with self._state_lock:
+            while self.metrics.active_requests >= self.current_max_concurrent:
+                await self._state_lock.wait()
+            self.metrics.active_requests += 1
+
+    async def _do_login(self, client, username: str, password: str) -> None:
+        """Paced login with metrics tracking. Shared by the automatic login
+        path (login_through_gateway), the explicit verification path
+        (verify_credentials), and the mid-workflow re-login path.
+
+        M3 fix: the paced wait runs WITHOUT occupying a portal concurrency
+        slot — the caller's slot is released around the sleep and reacquired
+        before the login request is sent. Queued logins therefore cannot
+        starve interactive taps of gateway capacity.
+        """
+        # ── Paced wait, slot-free, interactive-priority (M3 + PERF P2) ──
+        await self._release_slot()
+        try:
+            await self._paced_wait(self._caller_is_interactive())
+        finally:
+            await self._reacquire_slot()
 
         async with self._state_lock:
             self.metrics.total_logins += 1
@@ -251,9 +400,14 @@ class NitrisGateway:
 
         ``user_id`` is REQUIRED — this is the credential-quarantine enforcement
         point. A quarantined user is refused in O(1) (in-memory, no DB access
-        inside the gateway lock) before any NITRIS login attempt. On a LoginError
-        the user is added to the in-memory guard so even a future handler that
-        forgets the pre-check cannot re-attempt.
+        inside the gateway lock) before any NITRIS login attempt. On a confirmed
+        LoginError (the portal explicitly rejected the credentials) the user is
+        added to the in-memory guard so even a future handler that forgets the
+        pre-check cannot re-attempt.
+
+        LoginUnavailableError (portal down/misbehaving — H1 fix) propagates
+        WITHOUT quarantining: an unreachable portal says nothing about the
+        user's credentials.
         """
         if user_id in self._quarantined:
             raise CredentialsQuarantinedError(
@@ -282,6 +436,8 @@ class NitrisGateway:
 
             if self.circuit_state == CircuitState.HALF_OPEN:
                 self.circuit_state = CircuitState.CLOSED
+                # M2: release the waiting crowd — the portal has recovered.
+                self._probe_in_flight = False
                 logger.info("NITRIS Gateway trial probe succeeded: Circuit CLOSED")
 
             # Slow recovery: after 10 consecutive successes, step concurrency back up
@@ -303,6 +459,18 @@ class NitrisGateway:
             self.metrics.last_error_time = time.time()
 
             if not is_client_fault:
+                # M2: a PORTAL fault during the recovery probe re-trips the
+                # circuit immediately — no need to wait for a threshold.
+                if self.circuit_state == CircuitState.HALF_OPEN:
+                    self.circuit_state = CircuitState.OPEN
+                    self.circuit_opened_at = time.monotonic()
+                    self.metrics.circuit_trips += 1
+                    logger.error(
+                        "NITRIS Gateway recovery probe FAILED — Circuit re-TRIPPED to OPEN for %ds.",
+                        self.circuit_recovery_seconds,
+                    )
+                    return
+
                 self.metrics.consecutive_errors += 1
                 self.metrics.consecutive_successes = 0
 

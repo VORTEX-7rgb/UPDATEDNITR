@@ -19,6 +19,9 @@ from app.utils import esc
 
 from app.bot.fsm import QuestionPaperFlow
 from app.bot import qpaper_registry
+from app.ui.surface import show, Surface
+from app.ui import copy as ui_copy
+from app.ui import theme as ui_theme
 
 logger = logging.getLogger(__name__)
 
@@ -56,9 +59,13 @@ async def cmd_papers(message: types.Message, state: FSMContext, explicit_telegra
         courses = snapshot.snapshot_json["records"]
 
     text = (
-        "📚 <b>Previous Year Question Papers</b>\n\n"
-        "Here are your registered courses for the current semester. "
-        "Select one below to find historical exam papers, or search for other subjects:\n\n"
+        "📝 <b>QUESTION PAPERS</b>\n"
+        "<i>Your courses · pick one to hunt papers</i>\n\n"
+        + ui_theme.quote("\n".join(
+            f"<b>{esc(c.get('subject_code', '?'))}</b> — {esc((c.get('subject_name') or '')[:34])}"
+            for c in courses
+        ) or "No registered courses found.\nRun /attendance once and they'll appear here.")
+        + "\n\n<i>Papers marked 🚀 deliver instantly from cache.</i>"
     )
 
     builder = InlineKeyboardBuilder()
@@ -67,11 +74,9 @@ async def cmd_papers(message: types.Message, state: FSMContext, explicit_telegra
         for idx, course in enumerate(courses, start=1):
             code = course.get("subject_code", "Unknown")
             name = course.get("subject_name", "Unknown")
-            text += f"<b>{idx}.</b> <code>{esc(code)}</code> | <i>{esc(name)}</i>\n"
-            builder.row(types.InlineKeyboardButton(text=f"📚 {code} - {name[:25]}...", callback_data=f"qp_sub_{code}"))
-        text += "\n"
+            builder.row(types.InlineKeyboardButton(text=f"📚 {code} · {name[:22]}", callback_data=f"qp_sub_{code}"))
     else:
-        text += "<i>No registered courses found in your attendance snapshot. Use /attendance to update them!</i>\n\n"
+        text += "\n⚠️ <i>No subjects yet? Tap Refresh on your Attendance screen first.</i>"
 
     builder.row(types.InlineKeyboardButton(text="🔍 Search Other Subjects", callback_data="qp_search_prompt"))
     if courses:
@@ -136,19 +141,27 @@ async def handle_year_selected(callback: types.CallbackQuery, state: FSMContext)
         pass
 
     status_msg = await callback.message.answer("⏳ Querying question paper database cache...")
+    from app.ui.surface import Surface
+    from app.ui import copy as ui_copy, theme as ui_theme
+    surf = Surface(status_msg)
 
     async with get_db_session() as session:
         user_repo = UserRepository(session)
         user = await user_repo.get_by_telegram_id(telegram_id)
 
         if not user:
-            await status_msg.edit_text("❌ You are not registered. Use /start to register.")
+            await show(status_msg, "❌ You are not registered. Use /start to register.")
             return
 
         exam_service = ExaminationService(session)
         mid_cache = await exam_service.get_cached_paper(subject_code, full_year_str, "mid_sem")
         end_cache = await exam_service.get_cached_paper(subject_code, full_year_str, "end_sem")
 
+    _kb_back_year = lambda: ui_theme.footer_kb(back_cb=f"qp_sub_{subject_code}", back_text="← Back")
+
+    # Negative cache is PERMANENT by design: if cached rows exist for this
+    # subject/year, trust them and never re-query NITRIS (professors do not
+    # retroactively upload papers). Manual recovery: /admin_reset_qp.
     if not mid_cache and not end_cache:
         from app.nitris.job_queue import nitris_job_queue, Priority
         from app.nitris.gateway import NitrisCircuitOpenError
@@ -157,12 +170,14 @@ async def handle_year_selected(callback: types.CallbackQuery, state: FSMContext)
         clean_subj = _clean_code(subject_code)
         dedup_key = f"qp_metadata:{clean_subj}:{full_year_str}"
 
-        await status_msg.edit_text(
-            "⏳ <b>Fetching paper metadata from NITRIS...</b>\n\n"
-            "<i>If other students are requesting the same paper, this request "
-            "is being shared with them to avoid hammering the portal.</i>",
-            parse_mode=ParseMode.HTML,
+        await surf.edit(
+            f"📝 <b>{esc(subject_code)}</b> · {esc(full_year_str)}\n"
+            + ui_theme.quote("⚡ Checking NITRIS for papers…\n\n<i>Sharing the request with other "
+                             "students so nobody hammers the portal.</i>")
+            ,
+            ui_theme.footer_kb(back_cb=f"qp_sub_{subject_code}", back_text="← Back"),
         )
+        surf.poke_later(4.0, ui_copy.slow_note("checking NITRIS"))
 
         try:
             future = await nitris_job_queue.enqueue(
@@ -181,34 +196,28 @@ async def handle_year_selected(callback: types.CallbackQuery, state: FSMContext)
             try:
                 result = await asyncio.wait_for(future, timeout=90.0)
             except asyncio.TimeoutError:
-                await status_msg.edit_text(
-                    "⏳ <b>Metadata fetch is taking longer than expected.</b>\n\n"
-                    "NITRIS may be slow. Please try again in a moment — your request "
-                    "is queued and will complete shortly.",
-                    parse_mode=ParseMode.HTML,
+                await surf.final(
+                    "⏳ <b>NITRIS is slow — your request is queued safely.</b>\n\n"
+                    "<i>Try again in a moment; the catalog will be ready shortly.</i>",
+                    _kb_back_year(),
                 )
                 return
 
             if not result.get("success"):
                 error = result.get("error", "Unknown error")
-                await status_msg.edit_text(
+                await surf.final(
                     f"❌ <b>Portal query failed</b>\n\n"
                     f"Couldn't reach NITRIS to check for papers.\n"
                     f"Error: <code>{html.escape(str(error)[:200])}</code>\n\n"
-                    f"Please try again in a moment.",
-                    parse_mode=ParseMode.HTML,
+                    f"<i>Please try again in a moment.</i>",
+                    _kb_back_year(),
                 )
                 return
 
             parsed_records = result.get("parsed_records", [])
 
         except NitrisCircuitOpenError:
-            await status_msg.edit_text(
-                "⚠️ <b>NITRIS is temporarily unavailable.</b>\n\n"
-                "The system is protecting the portal from overload. "
-                "Please try again in ~60 seconds.",
-                parse_mode=ParseMode.HTML,
-            )
+            await surf.final(ui_copy.CIRCUIT_DOWN, _kb_back_year())
             return
 
         try:
@@ -224,10 +233,10 @@ async def handle_year_selected(callback: types.CallbackQuery, state: FSMContext)
                 end_cache = await exam_service.get_cached_paper(subject_code, full_year_str, "end_sem")
         except Exception as e:
             logger.error("Failed persisting paper metadata: %r", e)
-            await status_msg.edit_text(
+            await surf.final(
                 f"❌ <b>Failed to cache paper metadata</b>\n\n"
                 f"Error: <code>{html.escape(str(e)[:200])}</code>",
-                parse_mode=ParseMode.HTML,
+                _kb_back_year(),
             )
             return
 
@@ -236,36 +245,33 @@ async def handle_year_selected(callback: types.CallbackQuery, state: FSMContext)
         (end_cache and end_cache.status != "paper_not_available")
     )
     if not has_available:
-        await status_msg.edit_text(
-            f"ℹ️ <b>No paper available</b>\n\n"
-            f"📖 Subject: <b>{esc(subject_code)}</b>\n"
-            f"📅 Year: <b>{esc(full_year_str)}</b>\n\n"
-            f"NITRIS portal confirmed no question papers are uploaded for this "
-            f"subject and year. This is normal for lab / 1-credit subjects.",
-            parse_mode=ParseMode.HTML,
+        await surf.final(
+            f"📝 <b>Papers · {esc(subject_code)}</b> — {esc(full_year_str)}\n\n"
+            + ui_theme.quote(
+                "Nothing here yet.\nNITRIS hasn't uploaded any papers for this "
+                "subject and year — normal for lab / 1-credit subjects."
+            ),
+            _kb_back_year(),
         )
         return
 
-    try:
-        await status_msg.delete()
-    except Exception:
-        pass
-
     text = (
-        f"📝 <b>Download Question Papers</b>\n\n"
-        f"📖 Subject: <b>{esc(subject_code)}</b>\n"
-        f"📅 Session: <b>{esc(full_year_str)}</b>\n\n"
-        f"Tap a paper to download. Already-cached papers deliver instantly."
+        f"📝 <b>Papers · {esc(subject_code)}</b>\n"
+        f"<i>{esc(full_year_str)}</i>\n\n"
+        + ui_theme.quote(
+            "Papers marked 🚀 deliver instantly from Claw cache.\n"
+            "<i>Others take ~20s straight from NITRIS.</i>"
+        )
     )
 
     builder = InlineKeyboardBuilder()
     if mid_cache and mid_cache.status != "paper_not_available":
-        mid_label = "📝 Download Mid Sem"
+        mid_label = "📝 Mid Sem"
         if mid_cache.status == "paper_available" and mid_cache.telegram_file_id:
             mid_label += " 🚀"
         builder.row(types.InlineKeyboardButton(text=mid_label, callback_data=f"qp_dl_{mid_cache.id}"))
     if end_cache and end_cache.status != "paper_not_available":
-        end_label = "📝 Download End Sem"
+        end_label = "📝 End Sem"
         if end_cache.status == "paper_available" and end_cache.telegram_file_id:
             end_label += " 🚀"
         builder.row(types.InlineKeyboardButton(text=end_label, callback_data=f"qp_dl_{end_cache.id}"))
@@ -274,7 +280,7 @@ async def handle_year_selected(callback: types.CallbackQuery, state: FSMContext)
         types.InlineKeyboardButton(text="🏠 Dashboard", callback_data="inbox_back_dashboard"),
     )
 
-    await callback.message.answer(text, reply_markup=builder.as_markup(), parse_mode=ParseMode.HTML)
+    await surf.final(text, builder.as_markup())
 
 
 @router.callback_query(F.data.startswith("qp_dl_"))
@@ -311,8 +317,8 @@ async def handle_paper_download(callback: types.CallbackQuery, state: FSMContext
             cache_id, telegram_id, requester_user_id=requester_user_id,
         )
         if not result.delivered:
-            status_msg = await callback.message.answer("⚠️ Processing paper...")
-            await _present_qp_result(status_msg, result)
+            surf = Surface(await callback.message.answer("⚠️ Processing paper..."))
+            await _present_qp_result(surf, result)
         return
 
     try:
@@ -320,11 +326,16 @@ async def handle_paper_download(callback: types.CallbackQuery, state: FSMContext
     except Exception:
         pass
 
-    status_msg = await callback.message.answer("⏳ Acquiring paper from NITRIS portal...")
+    # ONE bubble: acquisition progress -> slow-poke persona -> receipt/error.
+    surf = Surface(await callback.message.answer(
+        f"📝 <b>Acquiring paper from NITRIS…</b>\n"
+        + ui_theme.quote("<i>Big files take a moment. This bubble will update itself.</i>")
+    ))
+    surf.poke_later(6.0, ui_copy.slow_note("acquiring"))
     result: QPResult = await qpaper_registry.qpaper_service.deliver(
         cache_id, telegram_id, requester_user_id=requester_user_id,
     )
-    await _present_qp_result(status_msg, result)
+    await _present_qp_result(surf, result)
 
 
 @router.callback_query(F.data == "qp_dlall_prompt")
@@ -527,56 +538,63 @@ async def handle_qp_download_all_year(callback: types.CallbackQuery, state: FSMC
     await status_msg.edit_text(summary, parse_mode=ParseMode.HTML)
 
 
-async def _present_qp_result(status_msg: types.Message, result: QPResult) -> None:
+async def _present_qp_result(surf, result: QPResult) -> None:
+    """Terminal render of a download attempt onto the SAME bubble."""
+    kb = ui_theme.footer_kb()
     try:
         if result.delivered:
-            try:
-                await status_msg.delete()
-            except Exception:
-                pass
+            # File has landed in the chat; this bubble becomes the receipt.
+            await surf.final(ui_copy.QP_DROPPED, kb)
             return
 
         if result.not_available:
-            await status_msg.edit_text(
-                "ℹ️ <b>Paper not uploaded</b>\n\n"
-                "NITRIS has no downloadable question paper for this exam type right now.\n"
-                "This is usually because it hasn't been uploaded yet (or it's a lab / "
-                "1-credit subject with no paper).\n\n"
-                "It will be re-checked automatically — no need to keep tapping.",
-                parse_mode=ParseMode.HTML,
+            await surf.final(
+                "ℹ️ <b>No paper on NITRIS</b>\n\n"
+                + ui_theme.quote(
+                    "NITRIS has no paper uploaded for this exam — "
+                    "usually a lab / 1-credit subject.\n"
+                    "<i>Nothing to download, so Claw won't keep asking the "
+                    "portal for it.</i>"
+                ),
+                kb,
             )
             return
 
         if result.in_progress:
-            await status_msg.edit_text(
+            await surf.final(
                 "⏳ <b>Acquisition in progress</b>\n\n"
-                "Another student is currently fetching this paper from NITRIS. "
-                "Tap the button again in ~30 seconds — it will deliver instantly "
-                "once cached.",
-                parse_mode=ParseMode.HTML,
+                + ui_theme.quote(
+                    "Another student is fetching this exact paper right now.\n"
+                    "<i>Tap again in ~30s — it'll be instant once cached.</i>"
+                ),
+                kb,
             )
             return
 
         if result.permanent:
-            await status_msg.edit_text(
+            await surf.final(
                 f"❌ <b>Paper unavailable</b>\n\n"
-                f"This paper could not be acquired after multiple attempts.\n"
-                f"Reason: <code>{html.escape(result.error or 'unknown')[:300]}</code>\n\n"
-                f"Contact support if this persists.",
-                parse_mode=ParseMode.HTML,
+                + ui_theme.quote(
+                    "Couldn't acquire after multiple attempts.\n"
+                    f"Reason: <code>{html.escape((result.error or 'unknown')[:300])}</code>\n\n"
+                    "<i>Contact support if this persists.</i>"
+                ),
+                kb,
             )
             return
 
-        await status_msg.edit_text(
+        await surf.final(
             f"⚠️ <b>Temporary error fetching paper</b>\n\n"
-            f"The system failed to fetch this paper right now. Please try again.\n"
-            f"Error: <code>{html.escape(result.error or 'unknown')[:300]}</code>",
-            parse_mode=ParseMode.HTML,
+            + ui_theme.quote(
+                "Failed just now — worth one more tap.\n"
+                f"Error: <code>{html.escape((result.error or 'unknown')[:300])}</code>"
+            ),
+            kb,
         )
     except Exception as e:
         logger.error("Failed to present QP result to user: %r", e)
         try:
-            await status_msg.edit_text("❌ Internal error. Please try again.")
+            await surf.final("🦀 Something broke on our side. Your data is safe.", ui_theme.footer_kb())
         except Exception:
             pass
 
@@ -612,6 +630,8 @@ async def process_qp_search_query(message: types.Message, state: FSMContext) -> 
         return
 
     status_msg = await message.answer(f"🔍 Searching for <b>\"{esc(query)}\"</b> on NITRIS portal...")
+    surf = Surface(status_msg)
+    surf.poke_later(4.0, ui_copy.slow_note("searching NITRIS"))
 
     if query.startswith("/"):
         await state.clear()
@@ -658,19 +678,19 @@ async def process_qp_search_query(message: types.Message, state: FSMContext) -> 
         try:
             result = await asyncio.wait_for(future, timeout=90.0)
         except asyncio.TimeoutError:
-            await status_msg.edit_text(
+            await surf.final(
                 "⏳ <b>Search is taking longer than expected.</b>\n\n"
                 "NITRIS may be slow. Please try again in a moment.",
-                parse_mode=ParseMode.HTML,
+                ui_theme.footer_kb(),
             )
             await state.clear()
             return
 
         if not result.get("success"):
             error = result.get("error", "Unknown error")
-            await status_msg.edit_text(
+            await surf.final(
                 f"❌ Portal query failed: {html.escape(str(error)[:200])}",
-                parse_mode=ParseMode.HTML,
+                ui_theme.footer_kb(),
             )
             await state.clear()
             return
@@ -679,26 +699,18 @@ async def process_qp_search_query(message: types.Message, state: FSMContext) -> 
         parsed_records = records
 
     except NitrisCircuitOpenError:
-        await status_msg.edit_text(
-            "⚠️ <b>NITRIS is temporarily unavailable.</b>\n\n"
-            "The system is protecting the portal from overload. "
-            "Please try again in ~60 seconds.",
-            parse_mode=ParseMode.HTML,
-        )
+        await surf.final(ui_copy.CIRCUIT_DOWN, ui_theme.footer_kb())
         await state.clear()
         return
 
     if not parsed_records:
-        builder = InlineKeyboardBuilder()
-        builder.row(types.InlineKeyboardButton(text="🔍 Search Again", callback_data="qp_search_prompt"))
-        builder.row(types.InlineKeyboardButton(text="◀️ Back to Menu", callback_data="qp_back_subjects"))
-
-        await status_msg.edit_text(
-            f"🔍 <b>Search Results</b>\n\n"
-            f"No matching subjects found on NITRIS for: \"<b>{esc(query)}</b>\".\n\n"
-            f"Please verify the subject code or course spelling and try again.",
-            reply_markup=builder.as_markup(),
-            parse_mode=ParseMode.HTML
+        await surf.final(
+            f"🔍 <b>No matches</b>\n\n"
+            + ui_theme.quote(
+                f'Nothing found for "<b>{esc(query)}</b>".\n'
+                "Double-check the subject code or spelling and try again."
+            ),
+            ui_theme.footer_kb(back_cb="qp_search_prompt", back_text="🔍 Search Again"),
         )
         await state.clear()
         return
@@ -711,31 +723,21 @@ async def process_qp_search_query(message: types.Message, state: FSMContext) -> 
 
     if len(unique_subjects) == 1:
         subject_code = list(unique_subjects.keys())[0]
-        try:
-            await status_msg.delete()
-        except Exception:
-            pass
 
         builder = InlineKeyboardBuilder()
         for code, label in YEAR_MAP.items():
             builder.row(types.InlineKeyboardButton(text=label, callback_data=f"qp_yr_{subject_code}_{code}"))
         builder.row(types.InlineKeyboardButton(text="◀️ Search Menu", callback_data="qp_search_prompt"))
+        builder.row(ui_theme.home_button())
 
-        await message.answer(
-            f"📅 <b>Select Academic Year</b>\n\n"
-            f"Subject: <b>{esc(subject_code)} - {esc(unique_subjects[subject_code])}</b>\n\n"
-            f"Please select the historical exam year you want to retrieve papers for:",
-            reply_markup=builder.as_markup(),
-            parse_mode=ParseMode.HTML
+        await surf.final(
+            f"📅 <b>{esc(subject_code)}</b> · {esc(unique_subjects[subject_code])}\n\n"
+            "Pick the exam year:",
+            builder.as_markup(),
         )
         return
 
-    try:
-        await status_msg.delete()
-    except Exception:
-        pass
-
-    text = f"🔍 <b>Search Results for \"{esc(query)}\"</b>\n\nSelect a subject from the matches below:\n\n"
+    text = f"🔍 <b>Matches for \"{esc(query)}\"</b>\n\nPick a subject:\n\n"
     builder = InlineKeyboardBuilder()
 
     for idx, (code, name) in enumerate(unique_subjects.items(), start=1):
@@ -744,8 +746,9 @@ async def process_qp_search_query(message: types.Message, state: FSMContext) -> 
 
     builder.row(types.InlineKeyboardButton(text="🔍 Search Again", callback_data="qp_search_prompt"))
     builder.row(types.InlineKeyboardButton(text="🏠 Back to Menu", callback_data="qp_back_subjects"))
+    builder.row(ui_theme.home_button())
 
-    await message.answer(text, reply_markup=builder.as_markup(), parse_mode=ParseMode.HTML)
+    await surf.final(text, builder.as_markup())
 
 
 @router.message(QuestionPaperFlow.waiting_for_search_query, ~F.text)

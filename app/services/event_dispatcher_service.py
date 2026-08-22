@@ -11,12 +11,13 @@ in DB → re-sent on restart → DUPLICATE NOTIFICATIONS. Crash window: ~30s.
 
 This service implements the correct pattern:
   Phase 1 (atomic claim):
-    UPDATE events SET claimed_at=NOW(), claimed_by=:worker, attempt_count=attempt_count+1
+    UPDATE events SET claimed_at=NOW(), claimed_by=:worker
     WHERE id IN (SELECT id FROM events
                  WHERE sent=False AND permanent_failure=False
                    AND (claimed_at IS NULL OR claimed_at < NOW()-INTERVAL '5 min')
                  ORDER BY id LIMIT :batch)
     RETURNING *
+    (M1 fix: claiming does NOT touch attempt_count — see below.)
   Phase 2 (per-event send + immediate mark):
     For each claimed event:
       - Send to Telegram (FloodWait-aware)
@@ -24,8 +25,12 @@ This service implements the correct pattern:
       - On user-blocked: UPDATE event SET sent=True, sent_at=NOW(),
                          permanent_failure=True, last_error='user blocked bot',
                          claimed_at=NULL
-      - On retryable error: UPDATE event SET claimed_at=NULL, last_error=...,
-                            (next cycle re-claims and retries)
+      - On retryable error: UPDATE event SET claimed_at=NULL,
+                            attempt_count=attempt_count+1, last_error=...
+                            (M1 fix: the counter grows ONLY here — a real
+                            failed delivery — never at claim time, so
+                            restarts/reclaims can never burn the budget of
+                            notifications that were never sent)
       - If attempt_count >= MAX_DISPATCH_ATTEMPTS:
             UPDATE event SET permanent_failure=True, claimed_at=NULL, last_error=...
 
@@ -89,6 +94,11 @@ async def claim_events(
       - claimed_at IS NULL OR claimed_at < NOW()-INTERVAL '5 min' (stale claim)
     are eligible.
 
+    M1 fix: claiming NO LONGER increments attempt_count. The counter only
+    grows when a delivery attempt actually FAILS (see release_event_claim),
+    so bot restarts / redeploys / stale-claim reaps can no longer silently
+    burn the retry budget and drop notifications that were never sent.
+
     Returns list of dicts: {id, user_id, event_type, payload_json, attempt_count}.
     Empty list if no events to claim.
     """
@@ -97,8 +107,7 @@ async def claim_events(
             stmt = text("""
                 UPDATE events
                 SET claimed_at = NOW(),
-                    claimed_by = :worker_id,
-                    attempt_count = attempt_count + 1
+                    claimed_by = :worker_id
                 WHERE id IN (
                     SELECT id FROM events
                     WHERE sent = FALSE
@@ -171,13 +180,18 @@ async def release_event_claim(
     session_factory: async_sessionmaker[AsyncSession], event_id: int, error: Optional[str] = None,
 ) -> None:
     """Release the claim on an event so it can be re-claimed next cycle.
-    Used after a retryable failure (e.g. FloodWait exhausted, network error)."""
+    Used after a retryable failure (e.g. FloodWait exhausted, network error).
+
+    M1 fix: this is where attempt_count grows — a REAL failed delivery
+    attempt — not at claim time. Restart/redeploy cycles therefore never
+    consume the retry budget of notifications that were never sent."""
     async with session_factory() as session:
         async with session.begin():
             await session.execute(text("""
                 UPDATE events
                 SET claimed_at = NULL,
                     claimed_by = NULL,
+                    attempt_count = attempt_count + 1,
                     last_error = :err
                 WHERE id = :id
             """), {"id": event_id, "err": str(error)[:1000] if error else None})
@@ -456,6 +470,20 @@ def _format_notification(event_type: str | EventType, payload: dict) -> tuple[st
             f"📊 Current Stats: TC: {esc(payload.get('total_classes', '0'))} | UA: {esc(payload.get('new_ua', '0'))}\n\n"
             f"<i>Keep an eye on your attendance to avoid debarment!</i>"
         )
+        # Debar-engine countdown (Phase B) — only when the snapshot carried LTP.
+        try:
+            from app.services.attendance_health import skips_left_line
+            line = skips_left_line({
+                "subject_code": payload.get("subject_code"),
+                "ltp": payload.get("ltp"),
+                "ua": payload.get("new_ua"),
+                "tc": payload.get("total_classes"),
+                "le": 0, "oa": payload.get("new_ua"),
+            })
+            if line:
+                text += f"\n\n{line}"
+        except Exception:  # never let enrichment break a notification
+            pass
         return text, None
 
     if ev_type_val == EventType.NEW_MESSAGE_RECEIVED.value:

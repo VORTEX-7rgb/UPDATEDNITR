@@ -69,30 +69,56 @@ async def _dispose_engine_debounced() -> None:
         logger.error("Failed to dispose engine connection pool: %s", dispose_err)
 
 
+async def _shielded_finish(coro) -> None:
+    """Await a cleanup coroutine so it COMPLETES even when the surrounding
+    task is being cancelled.
+
+    Leak fix: if CancelledError lands during session.rollback()/close(), the
+    await aborts midway and the pooled connection is left checked-out — the
+    garbage collector later reports 'non-checked-in connection'. Shielding
+    guarantees the connection returns to the pool before we propagate.
+    """
+    import asyncio as _aio
+    try:
+        await _aio.shield(coro)
+    except _aio.CancelledError:
+        # Outer cancellation arrived mid-cleanup — finish the job anyway.
+        try:
+            await coro
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
 @asynccontextmanager
 async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
     """Provide a transactional async database session context manager.
-    
+
     Guarantees clean closure and rollback of the session to prevent pool exhaustion.
     Disposes connection pool proactively on connection failures to recover seamlessly.
+    Cancellation-safe: rollback/close are shielded so a cancelled task can
+    never leak a checked-out connection back to the garbage collector.
     """
     session: AsyncSession = async_session_factory()
     try:
         yield session
-    except Exception as e:
-        if is_db_connection_error(e):
+    except BaseException as e:
+        if isinstance(e, asyncio.CancelledError):
+            logger.debug("DB session cancelled mid-use — rolling back safely.")
+        elif is_db_connection_error(e):
             logger.warning(
                 "Database connection lost or reset encountered: %s. Disposing engine connection pool.",
                 str(e)
             )
-            await _dispose_engine_debounced()
+            try:
+                await _dispose_engine_debounced()
+            except Exception:
+                pass
         else:
             logger.error("Database session error encountered, rolling back: %s", e)
-            
-        try:
-            await session.rollback()
-        except Exception:
-            pass
+
+        await _shielded_finish(session.rollback())
         raise
     finally:
-        await session.close()
+        await _shielded_finish(session.close())

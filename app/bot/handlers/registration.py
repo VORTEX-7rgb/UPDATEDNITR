@@ -22,7 +22,8 @@ from app.db.models import User, SyncState
 from app.config import IST
 
 from app.bot.fsm import Registration, Deregistration, InboxSearch
-from app.bot.common import format_dashboard_text, get_dashboard_keyboard
+from app.bot.common import get_dashboard_keyboard
+from app.ui.alive import render_dashboard
 from app.bot.handlers.attendance import fetch_attendance_for_callback
 from app.bot.handlers.papers import cmd_papers
 
@@ -76,8 +77,10 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
     if user:
         await state.clear()
-        text = format_dashboard_text(user, unread_count)
-        await message.answer(text, reply_markup=get_dashboard_keyboard(unread_count), parse_mode=ParseMode.HTML)
+        # Text-only dashboard (PNG photo card removed by design decision).
+        text = await render_dashboard(session, user, unread_count)
+        kb = get_dashboard_keyboard(unread_count)
+        await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
     else:
         await state.clear()
         await state.set_state(Registration.waiting_for_roll)
@@ -305,7 +308,7 @@ async def process_password(message: types.Message, state: FSMContext):
                 unread_count = await inbox_repo.get_unread_count(user.id)
 
         if user:
-            text = format_dashboard_text(user, unread_count)
+            text = await render_dashboard(session, user, unread_count)
             await message.answer(text, reply_markup=get_dashboard_keyboard(unread_count), parse_mode=ParseMode.HTML)
 
         await state.clear()
@@ -381,7 +384,7 @@ async def process_delete_confirm(message: types.Message, state: FSMContext):
                 unread_count = await inbox_repo.get_unread_count(user.id)
 
         if user:
-            text = format_dashboard_text(user, unread_count)
+            text = await render_dashboard(session, user, unread_count)
             await message.answer(text, reply_markup=get_dashboard_keyboard(unread_count), parse_mode=ParseMode.HTML)
         else:
             await message.answer("⚠️ You are not registered. Please use /start to register.")
@@ -459,7 +462,7 @@ async def handle_cancel_deregister(callback: types.CallbackQuery, state: FSMCont
             unread_count = await inbox_repo.get_unread_count(user.id)
 
     if user:
-        text = format_dashboard_text(user, unread_count)
+        text = await render_dashboard(session, user, unread_count)
         await callback.message.answer(text, reply_markup=get_dashboard_keyboard(unread_count), parse_mode=ParseMode.HTML)
     else:
         await callback.message.answer("⚠️ You are not registered. Please use /start to register.")

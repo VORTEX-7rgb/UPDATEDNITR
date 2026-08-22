@@ -93,10 +93,12 @@ async def test_gateway_circuit_breaker_open_rejects_fast():
 
     # Wait for recovery window to expire
     await asyncio.sleep(0.25)
+    # M2 fix: is_circuit_open() is a pure predicate — it no longer flips the
+    # state as a read side-effect. The OPEN -> HALF_OPEN transition happens
+    # lazily inside acquire(), which admits exactly ONE probe.
     assert gw.is_circuit_open() is False
-    assert gw.circuit_state == CircuitState.HALF_OPEN
 
-    # Trial probe succeeds -> circuit closes
+    # First acquire becomes the single recovery probe; success closes circuit.
     async with gw.acquire():
         pass
     assert gw.circuit_state == CircuitState.CLOSED

@@ -44,6 +44,9 @@ def get_now_next_keyboard() -> types.InlineKeyboardMarkup:
             [
                 types.InlineKeyboardButton(text="⚡ Sync from NITRIS", callback_data="tt_sync"),
             ],
+            [
+                types.InlineKeyboardButton(text="🏠 Home", callback_data="inbox_back_dashboard"),
+            ],
         ]
     )
 
@@ -56,7 +59,10 @@ def get_not_synced_keyboard() -> types.InlineKeyboardMarkup:
                 types.InlineKeyboardButton(
                     text="🔄 Sync Timetable Now", callback_data="tt_sync"
                 )
-            ]
+            ],
+            [
+                types.InlineKeyboardButton(text="🏠 Home", callback_data="inbox_back_dashboard"),
+            ],
         ]
     )
 
@@ -82,6 +88,9 @@ def get_day_selector_keyboard(selected_day: int) -> types.InlineKeyboardMarkup:
             [
                 types.InlineKeyboardButton(text="⏰ Now & Next", callback_data="tt_now_next"),
                 types.InlineKeyboardButton(text="🔄 Sync from NITRIS", callback_data="tt_sync"),
+            ],
+            [
+                types.InlineKeyboardButton(text="🏠 Home", callback_data="inbox_back_dashboard"),
             ],
         ]
     )

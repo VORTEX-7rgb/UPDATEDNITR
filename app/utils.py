@@ -1,5 +1,6 @@
 """Shared formatting utilities for HTML-safe Telegram message rendering and attachment handling."""
 
+import asyncio
 import html
 import posixpath
 import urllib.parse
@@ -7,6 +8,23 @@ from datetime import datetime
 from typing import Any
 
 from app.config import IST
+
+# ── Fire-and-forget task tracking ────────────────────────────────────────────
+# CPython keeps only WEAK references to running tasks. A bare
+# `asyncio.create_task(...)` whose result nobody stores can be garbage-collected
+# mid-flight — the coroutine silently dies, and if it was holding a DB session,
+# that session's connection leaks (the 'non-checked-in connection' GC warning).
+# Every fire-and-forget task in this codebase MUST go through spawn_tracked().
+
+_background_tasks: set = set()
+
+
+def spawn_tracked(coro, *, name: str | None = None) -> asyncio.Task:
+    """Create a background task with a strong reference until it finishes."""
+    task = asyncio.create_task(coro, name=name)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
 
 
 def current_academic_year(now: datetime | None = None) -> str:

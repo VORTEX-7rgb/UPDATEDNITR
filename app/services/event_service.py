@@ -136,6 +136,9 @@ class EventService:
                         "old_ua": str(old_ua),
                         "new_ua": str(new_ua),
                         "total_classes": new_rec.get("tc", "0"),
+                        # Debar-engine enrichment (Phase B). Older queued events
+                        # simply lack these keys — the formatter falls back.
+                        "ltp": new_rec.get("ltp", ""),
                     }
                     absence_event = await self.event_repo.create_event(
                         user_id=user_id,

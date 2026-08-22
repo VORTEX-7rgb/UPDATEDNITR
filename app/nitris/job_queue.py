@@ -320,10 +320,11 @@ class NitrisJobQueue:
                 # alive across the backoff window - identical requests arriving
                 # during that window must JOIN this retry, not race a duplicate.
                 job._retry_scheduled = True
-                asyncio.create_task(self._schedule_retry(
+                from app.utils import spawn_tracked
+                spawn_tracked(self._schedule_retry(
                     job.job_type, job.user_id, job.priority, job.dedup_key,
                     new_payload, backoff, job.future,
-                ))
+                ), name=f"job-retry-{job.job_type}")
         finally:
             if not getattr(job, "_retry_scheduled", False):
                 self._cleanup_dedup(job.dedup_key)

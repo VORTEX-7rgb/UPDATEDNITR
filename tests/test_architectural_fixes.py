@@ -73,25 +73,41 @@ def test_registration_uses_gateway():
 
 @pytest.mark.asyncio
 async def test_creds_provider_returns_encrypted_not_plaintext():
-    """creds_provider returns tuples with encrypted_password rather than decrypting all upfront."""
+    """H2 contract: creds_provider is a health probe only — it must NEVER
+    return or reference candidate credential material (no encrypted_password
+    rows, no pool tuples). Actual acquisition uses requester-owned creds."""
     import app.bot.telegram as tg_module
     src = inspect.getsource(tg_module.init_qpaper_service)
-    assert "candidates = [(r.roll_number, r.id, r.encrypted_password) for r in rows]" in src or "encrypted_password" in src
+    assert "encrypted_password" not in src, (
+        "creds_provider must not select/return credential material (H2: "
+        "cross-account pool removed)"
+    )
+    assert "credentials_valid = TRUE" in src, (
+        "creds_provider must remain a valid-credentials health probe"
+    )
+    assert "return None" in src, "creds_provider signals own-creds-only by returning None"
 
 
 @pytest.mark.asyncio
 async def test_full_qp_download_no_deadlock():
-    """_nitris_download decrypts JIT and logs in through gateway without deadlock."""
+    """_nitris_download decrypts JIT (own credentials) and logs in through the
+    gateway without deadlock."""
     from app.services.qpaper_service import QPaperService
     from app.db.crypto import encrypt_password
 
     enc_pass = encrypt_password("supersecret")
+
     async def mock_creds():
-        return [("125AI0001", 1, enc_pass)]
+        return None  # H2: probe only
 
     bot = MagicMock()
     session_factory = MagicMock()
     service = QPaperService(bot, session_factory, mock_creds)
+
+    async def fake_own(user_id):
+        return ("125AI0001", user_id, enc_pass)
+
+    service._load_own_credentials = fake_own
 
     with patch("app.services.qpaper_service.NitrisClient") as mock_client_cls:
         client_instance = AsyncMock()
@@ -99,6 +115,46 @@ async def test_full_qp_download_no_deadlock():
         client_instance.close = AsyncMock()
         mock_client_cls.return_value = client_instance
 
-        bytes_out, kind = await service._nitris_download("CS101", "2024-25/Autumn", "mid_sem", "btnTest")
+        bytes_out, kind = await service._nitris_download(
+            "CS101", "2024-25/Autumn", "mid_sem", "btnTest", requester_user_id=1,
+        )
         assert bytes_out == b"%PDF-1.4 test"
         assert kind == "pdf"
+
+
+@pytest.mark.asyncio
+async def test_qp_download_without_requester_is_rejected():
+    """H2 contract: cold acquisition REQUIRES requester_user_id — no anonymous
+    or cross-account downloads are possible anymore."""
+    from app.services.qpaper_service import QPaperService
+
+    async def mock_creds():
+        return None
+
+    service = QPaperService(MagicMock(), MagicMock(), mock_creds)
+
+    with pytest.raises(RuntimeError, match="requester_user_id"):
+        await service._nitris_download("CS101", "2024-25/Autumn", "mid_sem", "btnTest")
+
+
+@pytest.mark.asyncio
+async def test_qp_download_quarantined_requester_never_uses_other_accounts():
+    """H2 contract: a quarantined requester yields CredentialsQuarantinedError;
+    no other user's account is ever contacted."""
+    from app.services.qpaper_service import QPaperService
+    from app.nitris.exceptions import CredentialsQuarantinedError
+
+    async def mock_creds():
+        return None
+
+    service = QPaperService(MagicMock(), MagicMock(), mock_creds)
+
+    async def fake_own(user_id):
+        return None  # missing / quarantined
+
+    service._load_own_credentials = fake_own
+
+    with pytest.raises(CredentialsQuarantinedError):
+        await service._nitris_download(
+            "CS101", "2024-25/Autumn", "mid_sem", "btnTest", requester_user_id=7,
+        )

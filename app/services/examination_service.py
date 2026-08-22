@@ -8,8 +8,11 @@ portal search, PDF download). All public methods are split into two phases:
   Phase 2 (DB):   persist_*() — does DB work only, no HTTP. Uses self.session
                    which the caller must have opened as a SHORT transaction.
 
-Includes persistent NEGATIVE CACHING (QPStatus.PAPER_NOT_AVAILABLE) so subjects
-without exam papers (labs, practicals) are NEVER re-queried on NITRIS.
+Includes permanent NEGATIVE CACHING (QPStatus.PAPER_NOT_AVAILABLE): if NITRIS
+has no paper for a subject/year (labs, practicals, not-uploaded), that fact is
+remembered FOREVER and NITRIS is NEVER queried again for it. Professors do not
+retroactively upload papers, so periodic re-checks would only spam the portal.
+Manual recovery from a wrong negative is /admin_reset_qp.
 """
 
 import logging
@@ -94,7 +97,11 @@ class ExaminationService:
         commit after this returns.
 
         If no papers exist on NITRIS for this subject/year (e.g. lab/practical subjects),
-        explicitly stores rows with status='paper_not_available' so NITRIS is NEVER queried again.
+        rows are stored with status='paper_not_available' and NO expiry
+        (``not_available_until=None``) — a PERMANENT negative. NITRIS is
+        never queried again for that subject/year; professors do not
+        retroactively upload papers, so re-checks would be pure portal spam.
+        Manual recovery: /admin_reset_qp.
 
         Args:
             parsed_records: records returned by fetch_subject_metadata_from_portal()
@@ -111,7 +118,7 @@ class ExaminationService:
 
         if not target_records:
             logger.info(
-                "No portal matches found for Subject: %s (Normalized: %s), Year: %s — caching as paper_not_available",
+                "No portal matches found for Subject: %s (Normalized: %s), Year: %s — caching as paper_not_available (permanent)",
                 subject_code, cleaned_subject_code, academic_year,
             )
             for ex in ("mid_sem", "end_sem"):

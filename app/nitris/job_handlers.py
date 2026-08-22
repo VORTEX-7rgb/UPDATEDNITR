@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import html
+import time
 from datetime import datetime, timezone
 from typing import Optional, Any
 
@@ -37,7 +38,7 @@ from app.nitris.gateway import nitris_gateway, NitrisCircuitOpenError
 from app.nitris.job_queue import nitris_job_queue, NitrisJob, Priority
 from app.nitris.client import NitrisClient
 from app.nitris.exceptions import (
-    LoginError, SessionExpiredError, AttendanceParseError,
+    LoginError, LoginUnavailableError, SessionExpiredError, AttendanceParseError,
     AttendanceWorkflowError, NitrisError, CredentialsQuarantinedError,
 )
 from app.services.attendance_service import get_attendance_data
@@ -91,6 +92,9 @@ async def handle_attendance_refresh(job: NitrisJob) -> dict:
     callback_chat_id = job.payload.get("callback_chat_id")
     callback_message_id = job.payload.get("callback_message_id")
 
+    # PERF instrumentation: one line showing where the time went.
+    _t0 = time.monotonic()
+
     # ── Step 1: DB lookup (encrypted credential) — OUTSIDE gateway ────
     async with async_session_factory() as session:
         user = await session.get(User, user_id)
@@ -104,6 +108,7 @@ async def handle_attendance_refresh(job: NitrisJob) -> dict:
             }
         roll_number = user.roll_number
         encrypted_password = user.encrypted_password
+    _t_db = time.monotonic()
 
     # ── Step 2: NITRIS work (decrypt + login + HTTP) — INSIDE gateway ──
     try:
@@ -112,10 +117,19 @@ async def handle_attendance_refresh(job: NitrisJob) -> dict:
             client = NitrisClient()
             try:
                 await nitris_gateway.login_through_gateway(client, roll_number, password, user_id=user_id)
+                _t_login = time.monotonic()
                 data = await get_attendance_data(roll_number, password, client=client, user_id=user_id)
+                _t_scrape = time.monotonic()
             finally:
                 await client.close()
                 # password drops out of scope here
+        logger.info(
+            "⏱ attendance_refresh user=%s db=%dms login=%dms scrape=%dms",
+            roll_number,
+            int((_t_db - _t0) * 1000),
+            int((_t_login - _t_db) * 1000),
+            int((_t_scrape - _t_login) * 1000),
+        )
 
     except NitrisCircuitOpenError as e:
         await _edit_callback_message(
@@ -125,6 +139,18 @@ async def handle_attendance_refresh(job: NitrisJob) -> dict:
             "Please try again in ~60 seconds.",
         )
         return {"success": False, "error": str(e), "data": None}
+
+    except LoginUnavailableError as e:
+        # Portal down/misbehaving — NOT a credential problem (H1 fix).
+        # Never quarantine on this; surface the same "try later" UX.
+        logger.warning("attendance_refresh: NITRIS unavailable for user_id=%s: %r", user_id, e)
+        await _edit_callback_message(
+            callback_chat_id, callback_message_id,
+            "⚠️ <b>NITRIS is temporarily unavailable.</b>\n\n"
+            "Could not reach the portal right now. "
+            "Please try again in a few minutes.",
+        )
+        return {"success": False, "error": f"NITRIS temporarily unavailable: {e}", "data": None}
 
     except (LoginError, CredentialsQuarantinedError) as e:
         # Mark credentials as invalid
@@ -219,6 +245,10 @@ async def handle_inbox_refresh(job: NitrisJob) -> dict:
 
     except NitrisCircuitOpenError as e:
         return {"success": False, "error": str(e)}
+    except LoginUnavailableError as e:
+        # Portal down/misbehaving — NOT a credential problem (H1 fix).
+        logger.warning("inbox_refresh: NITRIS unavailable for user_id=%s: %r", user_id, e)
+        return {"success": False, "error": f"NITRIS temporarily unavailable: {e}"}
     except (LoginError, CredentialsQuarantinedError) as e:
         await on_login_failure(user_id, str(e))
         return {"success": False, "error": f"Login failed: {e}"}
@@ -287,6 +317,10 @@ async def handle_sync_onboarding(job: NitrisJob) -> dict:
                 # password drops out of scope here
     except NitrisCircuitOpenError as e:
         return {"success": False, "error": str(e)}
+    except LoginUnavailableError as e:
+        # Portal down/misbehaving — NOT a credential problem (H1 fix).
+        logger.warning("sync_onboarding: NITRIS unavailable for user_id=%s: %r", user_id, e)
+        return {"success": False, "error": f"NITRIS temporarily unavailable: {e}"}
     except (LoginError, CredentialsQuarantinedError) as e:
         await on_login_failure(user_id, str(e))
         return {"success": False, "error": f"Login failed: {e}"}
@@ -424,6 +458,10 @@ async def handle_qp_metadata_fetch(job: NitrisJob) -> dict:
 
     except NitrisCircuitOpenError as e:
         return {"success": False, "error": str(e)}
+    except LoginUnavailableError as e:
+        # Portal down/misbehaving — NOT a credential problem (H1 fix).
+        logger.warning("qp_metadata_fetch: NITRIS unavailable for user_id=%s: %r", user_id, e)
+        return {"success": False, "error": f"NITRIS temporarily unavailable: {e}"}
     except (LoginError, CredentialsQuarantinedError) as e:
         await on_login_failure(user_id, str(e))
         return {"success": False, "error": f"Login failed: {e}"}
@@ -493,6 +531,10 @@ async def handle_inbox_detail_fetch(job: NitrisJob) -> dict:
                 # password drops out of scope here
     except NitrisCircuitOpenError as e:
         return {"success": False, "error": str(e)}
+    except LoginUnavailableError as e:
+        # Portal down/misbehaving — NOT a credential problem (H1 fix).
+        logger.warning("inbox_detail_fetch: NITRIS unavailable for user_id=%s: %r", user_id, e)
+        return {"success": False, "error": f"NITRIS temporarily unavailable: {e}"}
     except (LoginError, CredentialsQuarantinedError) as e:
         await on_login_failure(user_id, str(e))
         return {"success": False, "error": f"Login failed: {e}"}
@@ -605,6 +647,10 @@ async def handle_attachment_download(job: NitrisJob) -> dict:
 
     except NitrisCircuitOpenError as e:
         return {"success": False, "error": str(e)}
+    except LoginUnavailableError as e:
+        # Portal down/misbehaving — NOT a credential problem (H1 fix).
+        logger.warning("attachment_download: NITRIS unavailable for user_id=%s: %r", user_id, e)
+        return {"success": False, "error": f"NITRIS temporarily unavailable: {e}"}
     except (LoginError, CredentialsQuarantinedError) as e:
         await on_login_failure(user_id, str(e))
         return {"success": False, "error": f"Login failed: {e}"}
@@ -732,6 +778,10 @@ async def handle_qp_search(job: NitrisJob) -> dict:
 
     except NitrisCircuitOpenError as e:
         return {"success": False, "error": str(e)}
+    except LoginUnavailableError as e:
+        # Portal down/misbehaving — NOT a credential problem (H1 fix).
+        logger.warning("qp_search: NITRIS unavailable for user_id=%s: %r", user_id, e)
+        return {"success": False, "error": f"NITRIS temporarily unavailable: {e}"}
     except (LoginError, CredentialsQuarantinedError) as e:
         await on_login_failure(user_id, str(e))
         return {"success": False, "error": f"Login failed: {e}"}

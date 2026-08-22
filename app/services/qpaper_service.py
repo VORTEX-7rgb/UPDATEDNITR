@@ -23,6 +23,8 @@ Design:
     leaves the cache row untouched. Only failed NITRIS acquisition or failed
     upload-to-storage-channel updates the cache row to retryable_failure.
   * ZIP and PDF both supported (signature sniffed from response bytes).
+  * CREDENTIAL POLICY (H2): cold acquisitions use ONLY the requesting
+    student's own NITRIS credentials. There is no cross-account fallback pool.
 
 NEVER call this service from inside an open DB session — it manages its own
 short-lived sessions internally.
@@ -49,7 +51,7 @@ from app.db.models import QuestionPaperCache, QPStatus, User
 from app.nitris.client import NitrisClient
 from app.nitris.exceptions import (
     AttendanceWorkflowError, SessionExpiredError, LoginError, InvalidContextError,
-    PaperNotAvailableError,
+    PaperNotAvailableError, CredentialsQuarantinedError,
 )
 from app.utils import esc
 
@@ -60,7 +62,6 @@ MAX_CONCURRENT_ACQUISITIONS = 8       # caps NITRIS load + memory (8 × ~5MB PDF
 MAX_CONCURRENT_DELIVERIES = 25        # under Telegram's ~30/sec bot rate limit
 ACQUIRE_STALE_SECONDS = 300            # 5 min — stale locks become reclaimable
 ACQUIRE_PERMANENT_AFTER = 5           # retryable_failure becomes permanent_failure after N attempts
-NEGATIVE_CACHE_TTL_SECONDS = 86400    # 24h negative cache TTL for papers not yet uploaded
 WAIT_POLL_INTERVAL_SEC = 2.0
 WAIT_TIMEOUT_SEC = 60.0
 FLOODWAIT_MAX_RETRIES = 3
@@ -156,23 +157,21 @@ class QPaperService:
         Args:
             cache_id: question_paper_caches row id.
             telegram_id: chat to deliver to.
-            requester_user_id: internal user id of the requesting student. When
-                supplied, THEIR OWN NITRIS credentials are used for cold
-                acquisitions (own-account attribution, no cross-tenant logins);
-                the shared healthy-user pool remains only as fallback when the
-                requester's credentials are missing/quarantined/fail.
+            requester_user_id: internal user id of the requesting student.
+                REQUIRED for cold acquisitions: THEIR OWN NITRIS credentials
+                are used exclusively (own-account attribution, no cross-tenant
+                logins — H2 fix). Cache-hit deliveries never touch credentials.
 
         Flow:
           1. Read cache row (short DB session).
           2. Dispatch on status:
-             - paper_available → cached delivery (bounded by delivery semaphore)
-             - paper_not_available → check TTL:
-                  * not_available_until is None -> permanent (e.g. labs), instant no paper
-                  * not_available_until > now -> TTL active, instant no paper (zero NITRIS calls)
-                  * not_available_until <= now -> TTL expired, reset to retryable_failure and re-check
-             - permanent_failure → error result
-             - fetch_in_progress → wait + deliver
-             - retryable_failure → try to acquire (claim)
+              - paper_available → cached delivery (bounded by delivery semaphore)
+              - paper_not_available → PERMANENT negative: instant no-paper
+                answer, zero NITRIS calls, never re-checked (professors do not
+                retroactively upload papers). Manual recovery via /admin_reset_qp.
+              - permanent_failure → error result
+              - fetch_in_progress → wait + deliver
+              - retryable_failure → try to acquire (claim)
           3. Acquisition (if claimed): NITRIS download → Telegram upload →
              atomic state update → wake any waiters via DB poll.
         """
@@ -180,7 +179,7 @@ class QPaperService:
         snapshot = await self._read_cache(cache_id)
         if snapshot is None:
             return QPResult(error="Question paper record not found.")
-        status, file_id, file_kind, sub_code, ac_year, ex_type, postback, err_msg, not_avail_until = snapshot
+        status, file_id, file_kind, sub_code, ac_year, ex_type, postback, err_msg, _not_avail_until = snapshot
 
         if status == QPStatus.PAPER_AVAILABLE.value and file_id:
             return await self._deliver_cached(
@@ -188,30 +187,11 @@ class QPaperService:
                 requester_user_id=requester_user_id,
             )
         if status == QPStatus.PAPER_NOT_AVAILABLE.value:
-            if not_avail_until is None:
-                # Permanent negative cache (e.g. labs/1-credit with no portal button)
-                return QPResult(not_available=True)
-            if not_avail_until > _now_utc():
-                # TTL active — zero NITRIS traffic
-                return QPResult(not_available=True)
-            # TTL expired — atomically reset to retryable_failure so we re-acquire
-            async with self.session_factory() as session:
-                async with session.begin():
-                    await session.execute(text("""
-                        UPDATE question_paper_caches
-                        SET status = :retryable,
-                            not_available_until = NULL,
-                            attempt_count = 0,
-                            updated_at = NOW()
-                        WHERE id = :id AND status = :not_avail
-                    """), {
-                        "retryable": QPStatus.RETRYABLE_FAILURE.value,
-                        "not_avail": QPStatus.PAPER_NOT_AVAILABLE.value,
-                        "id": cache_id,
-                    })
+            # PERMANENT negative cache — no TTL expiry, no re-check traffic.
+            return QPResult(not_available=True)
         if status == QPStatus.PERMANENT_FAILURE.value:
             return QPResult(permanent=True, error=err_msg or "permanent_failure")
-        # fetch_in_progress OR retryable_failure (including newly expired TTL) → try to claim
+        # fetch_in_progress OR retryable_failure → try to claim
         return await self._claim_or_wait_and_deliver(
             cache_id, telegram_id, sub_code, ac_year, ex_type, postback,
             requester_user_id=requester_user_id,
@@ -406,13 +386,26 @@ class QPaperService:
                     cache_id, file_id, kind, telegram_id, sub_code, ac_year, ex_type
                 )
             except PaperNotAvailableError as exc:
-                # NITRIS confirms paper is not uploaded yet -> mark paper_not_available with 24h TTL
-                await self._mark_not_available(cache_id, exc, ttl_seconds=NEGATIVE_CACHE_TTL_SECONDS)
+                # NITRIS confirms no paper is uploaded -> PERMANENT negative.
+                # Professors do not retroactively upload papers, so this row is
+                # never re-checked. Manual recovery: /admin_reset_qp.
+                await self._mark_not_available(cache_id, exc)
                 logger.info(
-                    "QP paper not uploaded cache_id=%d job=%s — caching negatively for %ds",
-                    cache_id, job_id[:8], NEGATIVE_CACHE_TTL_SECONDS,
+                    "QP paper not available cache_id=%d job=%s — cached permanently",
+                    cache_id, job_id[:8],
                 )
                 return QPResult(not_available=True)
+            except CredentialsQuarantinedError as exc:
+                # H2: the REQUESTER has no usable credentials — this must NOT
+                # mark the SHARED cache row failed (other students may still
+                # acquire with their own accounts). Leave the row untouched.
+                logger.info(
+                    "QP acquisition blocked: requester_user_id=%s missing/quarantined",
+                    requester_user_id,
+                )
+                return QPResult(
+                    error="Update your NITRIS credentials first — use /forgot, then try again.",
+                )
             except Exception as exc:
                 # Classify and update cache atomically. NEVER corrupt: the row's
                 # status transitions to retryable_failure or permanent_failure —
@@ -483,95 +476,82 @@ class QPaperService:
         self, sub_code: str, ac_year: str, ex_type: str, postback_target: str,
         requester_user_id: Optional[int] = None,
     ) -> Tuple[bytes, str]:
-        """Login to NITRIS, submit the postback target, fetch raw paper bytes.
-        Returns (bytes, kind) where kind is 'pdf' or 'zip'.
+        """Login to NITRIS as the REQUESTER ONLY, submit the postback target,
+        fetch raw paper bytes. Returns (bytes, kind) where kind is 'pdf' or 'zip'.
 
-        CREDENTIAL POLICY (own-first): the requesting student's OWN account is
-        used whenever available, so downloads are attributed to them in the
-        portal and a failed login quarantines the right person. The shared
-        healthy-user pool is only a fallback for when the requester's
-        credentials are missing/quarantined/failing.
+        CREDENTIAL POLICY (H2 fix — own credentials exclusively): cold
+        acquisitions run under the requesting student's OWN account, so
+        downloads are attributed to them in the portal and a failed login
+        quarantines the right person. There is NO cross-account fallback:
+        logging into another student's account to serve someone else's
+        request was a consent/attribution hazard and could quarantine
+        innocent users.
+
+        Raises:
+            CredentialsQuarantinedError: requester missing or quarantined —
+                callers must surface "/forgot" guidance and MUST NOT mark
+                the shared cache row failed (other users may still acquire).
+            LoginError: portal rejected the requester's credentials.
+            LoginUnavailableError: portal down/misbehaving (never a
+                credential problem — propagates without quarantine).
         """
-        raw_creds = await self.creds_provider()
-        if isinstance(raw_creds, list):
-            candidates = list(raw_creds)
-        else:
-            candidates = [raw_creds]
+        if requester_user_id is None:
+            raise RuntimeError(
+                "QP acquisition requires requester_user_id — no anonymous "
+                "cross-account downloads."
+            )
 
-        if requester_user_id is not None:
-            own = await self._load_own_credentials(requester_user_id)
-            if own is not None:
-                # Prepend own creds; de-dup against the pool by user_id.
-                candidates = [own] + [
-                    c for c in candidates
-                    if not (isinstance(c, (list, tuple)) and len(c) >= 3 and c[1] == own[1])
-                ]
+        own = await self._load_own_credentials(requester_user_id)
+        if own is None:
+            raise CredentialsQuarantinedError(
+                f"Requester user_id={requester_user_id} is missing or has "
+                "invalid credentials — use /forgot to update them."
+            )
 
-        if not candidates:
-            raise RuntimeError("No candidate credentials available to download paper")
+        from app.nitris.gateway import nitris_gateway
+        from app.nitris.exceptions import LoginError, LoginUnavailableError
+        from app.db.crypto import decrypt_password
 
-        last_err = None
-        for candidate in candidates:
-            encrypted_password = None
-            password = None
-            user_id = 0
-            if isinstance(candidate, (list, tuple)) and len(candidate) >= 3:
-                roll = candidate[0]
-                user_id = candidate[1]
-                encrypted_password = candidate[2]
-            elif isinstance(candidate, (list, tuple)) and len(candidate) == 2:
-                roll = candidate[0]
-                password = candidate[1]
-            else:
-                continue
+        roll, user_id, encrypted_password = own
 
-            from app.nitris.gateway import nitris_gateway
-            from app.nitris.exceptions import LoginError
-            from app.db.crypto import decrypt_password
+        async with nitris_gateway.acquire():
+            # Decrypt the password INSIDE acquire() — just-in-time
+            try:
+                password = decrypt_password(encrypted_password)
+            except Exception as e:
+                logger.error("Failed to decrypt password for user_id=%d: %r", user_id, e)
+                raise RuntimeError("Could not decrypt stored credentials.") from e
 
-            async with nitris_gateway.acquire():
-                # Decrypt the password INSIDE acquire() — just-in-time
-                if encrypted_password is not None:
-                    try:
-                        password = decrypt_password(encrypted_password)
-                    except Exception as e:
-                        logger.error(
-                            "Failed to decrypt password for user_id=%d: %r — skipping candidate",
-                            user_id, e,
-                        )
-                        continue
-
-                client = NitrisClient()
-                try:
-                    await nitris_gateway.login_through_gateway(client, roll, password, user_id=user_id)
-                    file_bytes = await client.download_question_paper_bytes(
-                        academic_year=ac_year,
-                        subject_query=sub_code,
-                        event_target=postback_target,
-                    )
-                    kind = _sniff_kind(file_bytes)
-                    return file_bytes, kind
-                except LoginError as e:
-                    last_err = e
-                    logger.warning("QP download login failed for roll=%s: %r", roll, e)
-                    if user_id:
-                        from app.nitris.auth_gate import on_login_failure
-                        await on_login_failure(user_id, str(e))
-                    continue
-                except Exception as e:
-                    last_err = e
-                    logger.warning("QP download attempt failed for roll=%s: %r", roll, e)
-                finally:
-                    await client.close()
-
-        raise last_err or RuntimeError("All candidate credentials failed to download paper")
+            client = NitrisClient()
+            try:
+                await nitris_gateway.login_through_gateway(client, roll, password, user_id=user_id)
+                file_bytes = await client.download_question_paper_bytes(
+                    academic_year=ac_year,
+                    subject_query=sub_code,
+                    event_target=postback_target,
+                )
+                kind = _sniff_kind(file_bytes)
+                return file_bytes, kind
+            except LoginError as e:
+                # Confirmed rejection of the REQUESTER'S OWN credentials —
+                # quarantine the right person via the standard gate.
+                logger.warning("QP download login failed for user_id=%d: %r", user_id, e)
+                from app.nitris.auth_gate import on_login_failure
+                await on_login_failure(user_id, str(e))
+                raise
+            except LoginUnavailableError:
+                # Portal fault — never a credential problem; propagate as-is.
+                raise
+            finally:
+                await client.close()
 
     async def _load_own_credentials(self, user_id: int) -> Optional[Tuple[str, int, str]]:
         """Short-session read of a user's OWN credentials.
 
         Returns (roll_number, user_id, encrypted_password) or None if the user
-        is missing or quarantined. Never raises — a lookup failure just means
-        the pool fallback is used.
+        is missing or quarantined (H2: there is no pool fallback anymore —
+        None means acquisition cannot proceed for this requester). Never
+        raises — a lookup failure is treated like missing credentials.
         """
         try:
             from sqlalchemy import select as sa_select
@@ -698,15 +678,19 @@ class QPaperService:
                     "in_progress": QPStatus.FETCH_IN_PROGRESS.value,
                 })
 
-    async def _mark_not_available(
-        self, cache_id: int, exc: Exception, ttl_seconds: int = NEGATIVE_CACHE_TTL_SECONDS,
-    ) -> None:
+    async def _mark_not_available(self, cache_id: int, exc: Exception) -> None:
+        """Mark a paper as permanently not available.
+
+        ``not_available_until`` is set to NULL on purpose: NULL means the
+        negative is permanent (no TTL expiry re-check). This also heals any
+        legacy row that still carried an old TTL stamp.
+        """
         async with self.session_factory() as session:
             async with session.begin():
                 await session.execute(text("""
                     UPDATE question_paper_caches
                     SET status = :status,
-                        not_available_until = NOW() + make_interval(secs => :ttl),
+                        not_available_until = NULL,
                         acquired_by = NULL,
                         acquired_at = NULL,
                         error_message = :err,
@@ -714,7 +698,6 @@ class QPaperService:
                     WHERE id = :cache_id AND status = :in_progress
                 """), {
                     "status": QPStatus.PAPER_NOT_AVAILABLE.value,
-                    "ttl": ttl_seconds,
                     "err": str(exc)[:1000],
                     "cache_id": cache_id,
                     "in_progress": QPStatus.FETCH_IN_PROGRESS.value,

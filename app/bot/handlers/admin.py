@@ -348,12 +348,14 @@ async def _broadcast_common(message: types.Message, pin: bool, command_name: str
         parse_mode=ParseMode.HTML,
     )
 
-    asyncio.create_task(
+    from app.utils import spawn_tracked
+    spawn_tracked(
         _run_broadcast(
             message.bot, telegram_ids, text,
             status_msg.chat.id, status_msg.message_id,
             pin=pin,
-        )
+        ),
+        name=f"broadcast-{len(telegram_ids)}-users",
     )
 
 

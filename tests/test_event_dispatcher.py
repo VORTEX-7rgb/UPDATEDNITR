@@ -105,13 +105,14 @@ class FakeSession:
                     ev = self.event_store[eid]
                     ev["claimed_at"] = now
                     ev["claimed_by"] = worker_id
-                    ev["attempt_count"] = ev.get("attempt_count", 0) + 1
+                    # M1 fix: claiming does NOT touch attempt_count — the
+                    # budget only burns on real failed delivery attempts.
                     results.append((
                         eid,
                         ev["user_id"],
                         ev["event_type"],
                         ev["payload_json"],
-                        ev["attempt_count"],
+                        ev.get("attempt_count", 0),
                     ))
                 return FakeResult(results, rowcount=len(results))
 
@@ -140,13 +141,15 @@ class FakeSession:
                     ev["last_error"] = params.get("err")
                 return FakeResult([], rowcount=1)
 
-            # 4. Release claim
+            # 4. Release claim (M1 fix: a REAL failed attempt — burns budget)
             if "SET claimed_at = NULL" in sql and "sent = FALSE" not in sql:
                 eid = params.get("id")
                 if eid in self.event_store:
                     ev = self.event_store[eid]
                     ev["claimed_at"] = None
                     ev["claimed_by"] = None
+                    if "attempt_count = attempt_count + 1" in sql:
+                        ev["attempt_count"] = ev.get("attempt_count", 0) + 1
                     ev["last_error"] = params.get("err")
                 return FakeResult([], rowcount=1)
 
@@ -248,7 +251,9 @@ async def test_per_event_mark_sent_crash_window(test_setup):
         assert ev["sent"] is True
         assert ev["claimed_at"] is None
         assert ev["sent_at"] is not None
-        assert ev["attempt_count"] == 1
+        # M1 fix: a SUCCESSFUL delivery never burns retry budget — only real
+        # failures do. Restarts can therefore never drop unsent notifications.
+        assert ev["attempt_count"] == 0
 
 
 @pytest.mark.asyncio
@@ -326,6 +331,8 @@ async def test_floodwait_exhausted_releases_claim(test_setup):
     assert event_store[1]["sent"] is False
     assert event_store[1]["claimed_at"] is None
     assert "floodwait_exhausted" in (event_store[1]["last_error"] or "")
+    # M1 fix: exactly ONE real failed attempt burned from the budget.
+    assert event_store[1]["attempt_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -378,12 +385,14 @@ async def test_orphaned_event_marked_permanent_not_silently_dropped(test_setup):
 
 @pytest.mark.asyncio
 async def test_retry_exhaustion_permanent_failure(test_setup):
-    """Verifies that an event failing persistently for 5 attempts transitions to permanent_failure."""
+    """Verifies that an event failing persistently across 5 REAL attempts
+    transitions to permanent_failure. (M1: only failed deliveries increment
+    the counter — restarts/reclaims never burn budget for unsent events.)"""
     service, bot, event_store, user_store, session_factory = test_setup
     bot.fail_mode = "transient"
 
-    # Set event 1 to attempt_count = 4 so next try makes it 5
-    event_store[1]["attempt_count"] = 4
+    # The event has already failed 5 real times.
+    event_store[1]["attempt_count"] = 5
 
     sent_count = await service._dispatch_once()
     assert sent_count == 0
@@ -391,3 +400,31 @@ async def test_retry_exhaustion_permanent_failure(test_setup):
     ev1 = event_store[1]
     assert ev1["permanent_failure"] is True
     assert "exhausted 5 attempts" in ev1["last_error"]
+
+
+@pytest.mark.asyncio
+async def test_m1_repeated_claims_never_burn_attempt_budget(test_setup):
+    """M1 core guarantee: claims/reclaims/restarts do NOT touch attempt_count.
+    A notification that keeps getting claimed but never actually attempted
+    (e.g. bot restarted mid-cycle) can never be silently dropped."""
+    service, bot, event_store, user_store, session_factory = test_setup
+
+    for _ in range(5):
+        claimed = await claim_events(session_factory, worker_id="crasher")
+        assert len(claimed) == 3
+        # Simulate a crash: nothing sent, no release — just stale-claim the row.
+        for r in claimed:
+            event_store[r["id"]]["claimed_at"] = (
+                datetime.now(timezone.utc) - timedelta(minutes=15)
+            )
+        await reap_stale_claims(session_factory)
+
+        for eid in [1, 2, 3]:
+            assert event_store[eid]["attempt_count"] == 0, (
+                "claim/reap cycles must never consume retry budget"
+            )
+
+    # One REAL failed delivery burns exactly one attempt.
+    bot.fail_mode = "transient"
+    await service._dispatch_once()
+    assert all(event_store[eid]["attempt_count"] == 1 for eid in [1, 2, 3])

@@ -3,6 +3,7 @@
 import logging
 import os
 import re
+import time
 import urllib.parse
 from datetime import datetime
 from typing import Optional
@@ -37,6 +38,7 @@ from app.nitris.constants import (
 )
 from app.nitris.exceptions import (
     LoginError,
+    LoginUnavailableError,
     SessionExpiredError,
     AttendanceWorkflowError,
     AttendanceTableMissingError,
@@ -56,6 +58,40 @@ from app.nitris.aspnet import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ── Resolved-module-URL cache (PERF P3) ──────────────────────────────────────
+# NITRIS rotates its AppId/AppName/SubModId token suffixes only PERIODICALLY,
+# so a freshly resolved (launcher, subpage) URL pair stays valid for a while.
+# Caching it skips the Home.aspx discovery GET + sidebar parse on every scrape.
+# Context-safety note: the launcher visit still happens on EVERY cache hit
+# (inside _resolve_module_subpage_url), because that visit is what sets the
+# PER-SESSION Server['CurrentModule'] — only the Home discovery is skipped.
+_RESOLVED_URL_TTL_SECONDS = 600.0  # 10 minutes
+_resolved_url_cache: dict[tuple[str, str], tuple[str, str, float]] = {}
+# key -> (launcher_href, subpage_href, expires_at_monotonic)
+
+
+def _cache_key(module_name: str, subpage_keyword: str) -> tuple[str, str]:
+    return (module_name.strip().lower(), subpage_keyword.strip().lower())
+
+
+# ── Year/session probe hints (PERF: skip redundant dropdown probes) ──────────
+# After a successful scrape we remember which academic-year / session values
+# worked for this student. The NEXT scrape tries them FIRST, skipping the
+# usual probe round-trips (~0.5–2s). Wrong/stale hints degrade gracefully:
+# they simply fail the existing skip-checks and the normal probe order runs.
+_PROBE_HINT_TTL_SECONDS = 2700.0  # 45 min
+_probe_hints: dict[str, tuple[str, str, float]] = {}
+
+
+def _prioritize(options: list[tuple[str, str]], preferred: Optional[str]) -> list[tuple[str, str]]:
+    """Return `options` with the entry whose VALUE == `preferred` moved to the
+    front (stable order otherwise). Unknown/None hint → unchanged order."""
+    if not preferred:
+        return options
+    head = [o for o in options if o[0] == preferred]
+    tail = [o for o in options if o[0] != preferred]
+    return head + tail
 
 
 class NitrisClient:
@@ -84,7 +120,16 @@ class NitrisClient:
     async def login(self, username: str, password: str) -> None:
         """Authenticate: init session → transform password → login → visit home.
 
-        Retries up to 3 times with exponential backoff on transient network/IIS errors.
+        Exception contract (H1 fix — do not blur these two types):
+          * LoginError               → the portal RESPONDED and rejected the
+            credentials. Callers quarantine the user on this. Raised ONLY for
+            an explicit server-side rejection ("SUCCESS" missing from reply).
+          * LoginUnavailableError    → portal unreachable/misbehaving (network,
+            HTTP 5xx, malformed/empty responses, exhausted retries). This is a
+            portal fault, NOT evidence of bad credentials. Retried up to 3x
+            with exponential backoff; callers must never quarantine on it.
+
+        Transient failures are retried up to 3 times with exponential backoff.
         """
         import asyncio
         max_attempts = 3
@@ -98,7 +143,7 @@ class NitrisClient:
                     resp.raise_for_status()
                     logger.info("Session initialized via Login.aspx")
                 except Exception as e:
-                    raise LoginError("Could not initialize NITRIS session.") from e
+                    raise LoginUnavailableError("Could not initialize NITRIS session.") from e
 
                 # Step 1: Server-side password transformation
                 try:
@@ -110,12 +155,16 @@ class NitrisClient:
                     resp.raise_for_status()
                     transformed = resp.json().get("d", "")
                     if not transformed:
-                        raise LoginError("Server returned empty transformed password.")
+                        # Server responded but with an unusable payload — a
+                        # portal oddity, not proof the password is wrong.
+                        raise LoginUnavailableError(
+                            "Server returned empty transformed password."
+                        )
                     logger.info("Password transformed OK")
-                except LoginError:
+                except LoginUnavailableError:
                     raise
                 except Exception as e:
-                    raise LoginError("Password transformation failed.") from e
+                    raise LoginUnavailableError("Password transformation failed.") from e
 
                 # Step 2: Authenticate
                 try:
@@ -127,9 +176,10 @@ class NitrisClient:
                     resp.raise_for_status()
                     result = resp.json().get("d", "")
                 except Exception as e:
-                    raise LoginError("Login request failed.") from e
+                    raise LoginUnavailableError("Login request failed.") from e
 
                 if not result or "SUCCESS" not in result:
+                    # The ONLY hard-auth signal: portal explicitly rejected.
                     raise LoginError(f"Invalid credentials. Server: {result}")
 
                 # Step 3: Visit home page to finalize session
@@ -143,10 +193,10 @@ class NitrisClient:
                 return
 
             except LoginError:
-                # Hard authentication/invalid credentials fail fast and bypass retries
+                # Confirmed credential rejection fails fast and bypasses retries
                 raise
-            except Exception as e:
-                # Catch transient network/HTTP/IIS errors
+            except LoginUnavailableError as e:
+                # Portal-level transient failure — retry with backoff
                 logger.warning(
                     "Login attempt %d/%d failed for %s: %s",
                     attempt,
@@ -155,7 +205,9 @@ class NitrisClient:
                     e,
                 )
                 if attempt == max_attempts:
-                    raise LoginError(f"Login failed after {max_attempts} attempts.") from e
+                    raise LoginUnavailableError(
+                        f"NITRIS login unavailable after {max_attempts} attempts."
+                    ) from e
                 await asyncio.sleep(backoff)
                 backoff *= 2.0  # 1s, 2s, 4s backoff
 
@@ -184,6 +236,44 @@ class NitrisClient:
         Returns:
             Absolute httpx.URL with the current valid tokens.
         """
+        key = _cache_key(module_name, subpage_keyword)
+
+        # ── PERF P3 fast-path: reuse a recently resolved URL pair ──
+        # We STILL visit the launcher on every hit — that GET is what sets
+        # this session's Server['CurrentModule']; only the Home.aspx
+        # discovery GET + sidebar parse are skipped. Any hint of trouble
+        # (non-200 / login form / 503 page / network error) falls through to
+        # the full self-healing resolution below, which also refreshes the
+        # cache — so token rotation degrades gracefully instead of failing.
+        cached = _resolved_url_cache.get(key)
+        if cached is not None and cached[2] > time.monotonic():
+            launcher_href, subpage_href, _ = cached
+            try:
+                l_resp = await self.client.get(
+                    launcher_href,
+                    headers={"Referer": f"{self.base_url}{HOME_PAGE_URL}"},
+                    follow_redirects=True,
+                )
+                if (
+                    l_resp.status_code == 200
+                    and not is_login_page(l_resp.text)
+                    and not is_error_page(l_resp.text, l_resp)
+                ):
+                    logger.info(
+                        "Resolved %s via cached launcher URL (fast-path)",
+                        module_name,
+                    )
+                    parsed = urllib.parse.urlparse(subpage_href)
+                    raw_path = f"{parsed.path}?{parsed.query}".encode("ascii")
+                    return httpx.URL(self.base_url).copy_with(raw_path=raw_path)
+            except httpx.HTTPError as e:
+                logger.debug(
+                    "Cached module URL fast-path failed (%s) — full re-resolve.",
+                    e,
+                )
+            # Stale or broken cache entry — drop it and fully re-resolve below.
+            _resolved_url_cache.pop(key, None)
+
         # Step 1: GET Home.aspx — the dashboard has all module launcher URLs in
         # the sidebar.
         home_resp = await self.client.get(
@@ -246,6 +336,13 @@ class NitrisClient:
             subpage_url[:90],
         )
 
+        # Cache the pair for the fast-path (PERF P3).
+        _resolved_url_cache[key] = (
+            launcher_url,
+            subpage_url,
+            time.monotonic() + _RESOLVED_URL_TTL_SECONDS,
+        )
+
         # Return as absolute httpx.URL with the raw query string preserved.
         parsed = urllib.parse.urlparse(subpage_url)
         raw_path = f"{parsed.path}?{parsed.query}".encode("ascii")
@@ -301,7 +398,7 @@ class NitrisClient:
 
     # ── Attendance Workflow ─────────────────────────────────────
 
-    async def fetch_attendance(self, semester: Optional[str] = None) -> str:
+    async def fetch_attendance(self, semester: Optional[str] = None, *, prefer_key: Optional[str] = None) -> str:
         """Execute the full ASP.NET postback workflow to get the attendance table HTML.
 
         Permanent fix: the attendance sub-page URL is resolved DYNAMICALLY from
@@ -309,11 +406,17 @@ class NitrisClient:
         periodic token rotation. The module launcher is visited FIRST to set
         Session['CurrentModule'], which prevents 503 errors.
 
+        PERF: `prefer_key` (typically the student's roll number) enables a
+        year/session hint cache — the values that worked last time are tried
+        FIRST, skipping the usual probe round-trips. Wrong hints fall through
+        to the normal probe order automatically.
+
         Args:
             semester: Optional preferred semester type ("Spring" or "Autumn").
                 If None (default), the current semester is auto-detected from
                 today's date — Jul-Dec = Autumn, Jan-Jun = Spring. This
                 prevents the bot from returning last-year's attendance data.
+            prefer_key: Optional stable per-user key for the hint cache.
 
         Returns:
             Final HTML page containing the attendance table.
@@ -331,6 +434,21 @@ class NitrisClient:
         if semester is None:
             semester = self._current_semester_type()
         logger.info("Using semester preference: %s", semester)
+
+        hint_year = hint_session = None
+        if prefer_key:
+            _h = _probe_hints.get(prefer_key)
+            if _h and _h[2] > time.monotonic():
+                hint_year, hint_session, _ = _h
+                logger.info(
+                    "[hint] %s → year=%r session=%r (trying these first)",
+                    prefer_key, hint_year, hint_session,
+                )
+            else:
+                _probe_hints.pop(prefer_key, None)
+
+        selected_year_value: Optional[str] = None
+        selected_session_value: Optional[str] = None
 
         # Step 1: GET initial attendance page
         logger.info("[step1] GET attendance page")
@@ -412,7 +530,7 @@ class NitrisClient:
         logger.info("[step3] All year options: %s", year_options)
 
         valid_year_html = None
-        for year_value, year_text in valid_years:
+        for year_value, year_text in _prioritize(valid_years, hint_year):
             logger.info("[step3] Probing year: %s (%s)", year_value, year_text)
             try:
                 temp_html = await submit_postback(
@@ -433,6 +551,7 @@ class NitrisClient:
                     continue
 
                 valid_year_html = temp_html
+                selected_year_value = year_value
                 logger.info("[step3] Successfully selected year: %s", year_text)
                 break
 
@@ -466,7 +585,7 @@ class NitrisClient:
         from app.nitris.exceptions import AttendanceParseError
 
         final_html = None
-        for session_value, session_text in prioritized_sessions:
+        for session_value, session_text in _prioritize(prioritized_sessions, hint_session):
             logger.info("[step4] Probing session: %s (%s)", session_value, session_text)
             try:
                 temp_html = await submit_postback(
@@ -496,6 +615,7 @@ class NitrisClient:
                 try:
                     parse_attendance_html(temp_html)
                     final_html = temp_html
+                    selected_session_value = session_value
                     logger.info(
                         "[step4] Successfully selected session: %s", session_text
                     )
@@ -547,6 +667,16 @@ class NitrisClient:
             )
 
         logger.info("Attendance workflow complete — valid table and rows found")
+
+        # PERF: remember the winning (year, session) so the next scrape for
+        # this student skips the probe round-trips.
+        if prefer_key and selected_year_value and selected_session_value:
+            _probe_hints[prefer_key] = (
+                selected_year_value,
+                selected_session_value,
+                time.monotonic() + _PROBE_HINT_TTL_SECONDS,
+            )
+
         return final_html
 
     # ── Helpers ─────────────────────────────────────────────────

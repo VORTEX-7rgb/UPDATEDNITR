@@ -3,6 +3,15 @@
 Kept in a dedicated module (rather than inside the bot assembly) so the papers
 handler can read the current singleton at call time without importing the whole
 bot wiring (which would create a circular import).
+
+H2 fix: the old ``creds_provider`` returned a POOL of other students'
+encrypted credentials for cold QP acquisitions — the bot would log into
+accounts belonging to users who never requested the paper, and could even
+quarantine the wrong person when a pool candidate's login failed. Cold
+acquisitions now use ONLY the requesting student's own credentials (see
+``QPaperService._nitris_download``). This provider survives solely as a
+health probe so a totally credential-less deployment fails fast with the
+same clear message as before.
 """
 
 import logging
@@ -21,56 +30,30 @@ async def init_qpaper_service(bot: Bot) -> None:
     """Initialize the singleton QPaperService on startup."""
     global qpaper_service
     from app.db.database import async_session_factory
-    from app.db.crypto import decrypt_password  # noqa: F401  (kept for parity)
-    from app.db.models import User, SyncState
-    from sqlalchemy import select, or_, func
+    from sqlalchemy import text
 
     async def creds_provider():
-        """Return a list of (roll, password, user_id) candidates for QP acquisition."""
+        """Health probe: fail fast when NO user has valid credentials.
+
+        Returns None on success — actual acquisition uses the requester's own
+        credentials exclusively (H2 fix: no cross-account logins, ever).
+        """
         async with async_session_factory() as s:
-            stmt = (
-                select(User.id, User.roll_number, User.encrypted_password)
-                .outerjoin(SyncState, User.id == SyncState.user_id)
-                .where(User.credentials_valid == True)
-                .where(
-                    or_(
-                        User.qp_cooldown_until.is_(None),
-                        User.qp_cooldown_until < func.now()
-                    )
+            count = (
+                await s.execute(
+                    text("SELECT COUNT(*) FROM users WHERE credentials_valid = TRUE")
                 )
-                .order_by(SyncState.last_success.desc().nulls_last(), User.id.desc())
-                .limit(5)
+            ).scalar()
+
+        if not count:
+            raise RuntimeError(
+                "No users with credentials_valid=TRUE — cannot acquire QP. "
+                "Register at least one student with valid credentials before "
+                "downloading papers."
             )
-            rows = (await s.execute(stmt)).all()
 
-            if not rows:
-                logger.warning(
-                    "No healthy QP credential candidates with sync history — "
-                    "falling back to any user with credentials_valid=TRUE"
-                )
-                stmt = (
-                    select(User.id, User.roll_number, User.encrypted_password)
-                    .where(User.credentials_valid == True)
-                    .order_by(User.id.desc())
-                    .limit(5)
-                )
-                rows = (await s.execute(stmt)).all()
-
-            if not rows:
-                raise RuntimeError(
-                    "No users with credentials_valid=TRUE — cannot acquire QP. "
-                    "Register at least one student with valid credentials before "
-                    "downloading papers."
-                )
-
-            candidates = [(r.roll_number, r.id, r.encrypted_password) for r in rows]
-
-            logger.info(
-                "creds_provider: returning %d candidate(s) for QP acquisition "
-                "(passwords NOT decrypted — will be decrypted one-at-a-time inside gateway)",
-                len(candidates),
-            )
-            return candidates
+        logger.debug("creds_provider: %d user(s) with valid credentials", count)
+        return None
 
     qpaper_service = QPaperService(
         bot=bot,

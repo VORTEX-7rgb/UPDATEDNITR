@@ -13,6 +13,12 @@ Every automatic login path must:
   2. call ``nitris_gateway.login_through_gateway(..., user_id=...)`` which
      refuses quarantined users in O(1) as a defense-in-depth backstop.
 
+IMPORTANT (H1 fix): only a CONFIRMED credential rejection
+(:class:`LoginError` — the portal responded and said no) may trigger
+``on_login_failure``. :class:`LoginUnavailableError` (portal down /
+misbehaving) must NEVER reach this module — an outage is not proof of bad
+credentials.
+
 The ONLY exception is registration/re-registration, which uses
 ``nitris_gateway.verify_credentials(...)`` — an explicit, user-initiated path
 with no user_id and no quarantine check.

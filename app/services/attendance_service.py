@@ -71,7 +71,9 @@ async def get_attendance_data(
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            html = await client.fetch_attendance()
+            # PERF: prefer_key enables the year/session hint cache — repeat
+            # scrapes for the same student skip the dropdown probe postbacks.
+            html = await client.fetch_attendance(prefer_key=username)
             return parse_attendance_html(html)
         except SessionExpiredError:
             # Session dropped mid-workflow — re-login and retry the WHOLE workflow.

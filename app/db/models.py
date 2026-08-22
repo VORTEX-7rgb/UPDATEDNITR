@@ -198,6 +198,11 @@ class SyncState(Base):
     last_metrics: Mapped[Optional[dict[str, Any]]] = mapped_column(
         JSON().with_variant(JSONB, "postgresql"), nullable=True
     )
+    # Claw Briefing marker: last time the user SAW their dashboard. Nullable —
+    # NULL means "never rendered" and suppresses the briefing until set.
+    last_seen_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     # Relationships
     user: Mapped["User"] = relationship("User", back_populates="sync_state")
