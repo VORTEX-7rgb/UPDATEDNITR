@@ -107,15 +107,27 @@ async def main():
         except Exception:
             pass
         
-        # Clean shutdown: release the DB pool and the Telegram HTTP session so
-        # no connection outlives the event loop (stops 'Event loop is closed'
-        # errors and port/socket warnings on Ctrl+C / redeploy).
+        # Clean shutdown: release the DB pool, the shared NITRIS HTTP
+        # transport and the Telegram HTTP session so no connection outlives
+        # the event loop (stops 'Event loop is closed' errors on Ctrl+C).
         try:
             from app.db.database import engine
             await engine.dispose()
             logging.info("Database engine disposed.")
         except Exception as e:
             logging.warning("Engine dispose failed: %r", e)
+        try:
+            from app.nitris.session_pool import drop_all_sessions
+            dropped = await drop_all_sessions()
+            logging.info("Session pool drained (%d client(s)).", dropped)
+        except Exception as e:
+            logging.warning("Session pool drain failed: %r", e)
+        try:
+            from app.nitris.client import close_shared_transport
+            await close_shared_transport()
+            logging.info("Shared NITRIS transport closed.")
+        except Exception as e:
+            logging.warning("Shared transport close failed: %r", e)
         try:
             await bot.session.close()
             logging.info("Telegram session closed.")

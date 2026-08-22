@@ -77,6 +77,42 @@ def _cache_key(module_name: str, subpage_keyword: str) -> tuple[str, str]:
     return (module_name.strip().lower(), subpage_keyword.strip().lower())
 
 
+# ── Shared HTTP transport (PERF #3) ─────────────────────────────────────────
+# Every NitrisClient previously built its OWN httpx pool (5 keepalive/10 max).
+# With the session pool holding many clients, that multiplied into thousands
+# of idle TCP sockets to NITRIS. One shared AsyncHTTPTransport pools TCP/TLS
+# connections process-wide; COOKIES and ASP.NET session state remain fully
+# per-client (httpx keeps them on the Client, never on the transport) — so
+# multi-tenant isolation is untouched.
+_shared_transport: Optional[httpx.AsyncHTTPTransport] = None
+
+
+def get_shared_transport() -> httpx.AsyncHTTPTransport:
+    """Process-wide lazy singleton transport. Closed in main.py shutdown."""
+    global _shared_transport
+    if _shared_transport is None:
+        _shared_transport = httpx.AsyncHTTPTransport(
+            limits=httpx.Limits(
+                max_keepalive_connections=50,
+                max_connections=200,
+                keepalive_expiry=60.0,
+            ),
+            retries=1,
+        )
+    return _shared_transport
+
+
+async def close_shared_transport() -> None:
+    """Shutdown helper — release the shared connection pool."""
+    global _shared_transport
+    if _shared_transport is not None:
+        try:
+            await _shared_transport.aclose()
+        except Exception:
+            pass
+        _shared_transport = None
+
+
 # ── Year/session probe hints (PERF: skip redundant dropdown probes) ──────────
 # After a successful scrape we remember which academic-year / session values
 # worked for this student. The NEXT scrape tries them FIRST, skipping the
@@ -115,6 +151,11 @@ class NitrisClient:
             timeout=30.0,
             follow_redirects=True,
             limits=limits,
+            # PERF #3: shared process-wide connection pool. Per-request
+            # limits above still apply per-client; TCP/TLS connections are
+            # pooled globally so N pooled sessions ≈ dozens of sockets, not
+            # thousands.
+            transport=get_shared_transport(),
         )
 
     # ── Login Flow ──────────────────────────────────────────────

@@ -80,7 +80,9 @@ class NitrisGateway:
         self.circuit_recovery_seconds = circuit_recovery_seconds or config.NITRIS_GATEWAY_CIRCUIT_RECOVERY_SECONDS
 
         self._pacing_cond = asyncio.Condition()
-        self._pacing_busy = False
+        self._login_burst = max(1, int(config.NITRIS_LOGIN_BURST))
+        self._login_tokens = float(self._login_burst)
+        self._login_last_refill = time.monotonic()
         self._interactive_pace_waiters = 0
         # In-memory quarantine guard (defense-in-depth). The DB `credentials_valid`
         # column is the source of truth; this set lets login_through_gateway()
@@ -310,42 +312,55 @@ class NitrisGateway:
         name = task.get_name() if task is not None else ""
         return not (name.startswith("nitris-bg") or name.startswith("nitris-shared"))
 
+    def _refill_tokens_locked(self) -> None:
+        """Refill the login token bucket. Caller MUST hold _pacing_cond."""
+        now = time.monotonic()
+        elapsed = now - self._login_last_refill
+        if elapsed > 0:
+            self._login_tokens = min(
+                float(self._login_burst),
+                self._login_tokens + elapsed / max(self.current_login_interval, 0.001),
+            )
+            self._login_last_refill = now
+
     @asynccontextmanager
     async def _pacing_turn(self, interactive: bool):
-        """Hold the global login-pacing turn.
+        """Acquire one login token from the bucket (PERF: burst-capable).
 
-        Same minimum-interval guarantee as before (portal protection is
-        IDENTICAL), but with PERF P2 ordering: an interactive caller jumps
-        ahead of queued background logins instead of strict FIFO.
+        Portal protection is rate-based, not gap-based: the AVERAGE login
+        rate never exceeds 1/current_login_interval per second — bursts only
+        consume tokens that accrued while the bucket sat idle.
+
+        PERF P2 ordering preserved: when tokens are contended, an interactive
+        caller takes the next refilled token ahead of queued background ones.
         """
         async with self._pacing_cond:
             if interactive:
                 self._interactive_pace_waiters += 1
-                try:
-                    while self._pacing_busy:
-                        await self._pacing_cond.wait()
-                finally:
-                    self._interactive_pace_waiters -= 1
-            else:
-                while self._pacing_busy or self._interactive_pace_waiters > 0:
+            try:
+                while True:
+                    self._refill_tokens_locked()
+                    if self._login_tokens >= 1.0 and (
+                        interactive or self._interactive_pace_waiters == 0
+                    ):
+                        self._login_tokens -= 1.0
+                        break
                     await self._pacing_cond.wait()
-            self._pacing_busy = True
+                    # Loop re-refills and re-checks priority on every wake.
+            finally:
+                if interactive:
+                    self._interactive_pace_waiters -= 1
+                self._pacing_cond.notify_all()
         try:
             yield
         finally:
+            # Wake any waiters so they can re-check refill timing promptly.
             async with self._pacing_cond:
-                self._pacing_busy = False
                 self._pacing_cond.notify_all()
 
     async def _paced_wait(self, interactive: bool) -> None:
-        """Sleep out the remaining login interval while holding a pacing turn."""
+        """Take a pacing token (waiting for refill/priority as needed)."""
         async with self._pacing_turn(interactive):
-            now = time.monotonic()
-            elapsed = now - self.metrics.last_login_time
-            if elapsed < self.current_login_interval:
-                delay = self.current_login_interval - elapsed
-                logger.debug("Pacing login by %.2fs", delay)
-                await asyncio.sleep(delay)
             self.metrics.last_login_time = time.monotonic()
 
     async def _release_slot(self) -> None:

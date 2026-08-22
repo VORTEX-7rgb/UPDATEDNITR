@@ -53,6 +53,12 @@ class Config:
     # Scaled to safely serve up to 5k+ registered students.
     NITRIS_GATEWAY_MAX_CONCURRENT = int(os.getenv("NITRIS_GATEWAY_MAX_CONCURRENT", "8"))
     NITRIS_GATEWAY_MIN_LOGIN_INTERVAL = float(os.getenv("NITRIS_GATEWAY_MIN_LOGIN_INTERVAL", "1.5"))
+    # PERF: token-bucket burst capacity for logins — up to this many
+    # back-to-back logins when the bucket is full; refill rate stays
+    # 1/NITRIS_GATEWAY_MIN_LOGIN_INTERVAL per second (same average-rate
+    # portal protection). Raise interval/burst ONLY after measuring the
+    # portal's real tolerance; the circuit breaker backstops overshoots.
+    NITRIS_LOGIN_BURST = int(os.getenv("NITRIS_LOGIN_BURST", "3"))
     NITRIS_GATEWAY_CIRCUIT_ERROR_THRESHOLD = int(os.getenv("NITRIS_GATEWAY_CIRCUIT_ERROR_THRESHOLD", "10"))
     NITRIS_GATEWAY_CIRCUIT_RECOVERY_SECONDS = float(os.getenv("NITRIS_GATEWAY_CIRCUIT_RECOVERY_SECONDS", "60"))
 

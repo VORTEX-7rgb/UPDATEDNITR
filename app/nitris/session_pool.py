@@ -33,8 +33,12 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
-SESSION_TTL_SECONDS = 600.0      # 10 min, sliding on every successful run
-MAX_POOLED_SESSIONS = 64
+# PERF: raised from 600/64. ASP.NET portal sessions typically live ~20–30 min
+# server-side (sliding), so a 30-min client TTL stays inside that window and
+# background syncs mostly stop re-logging entirely. A stale reuse is harmless:
+# SessionExpiredError drops the entry and the next run re-authenticates.
+SESSION_TTL_SECONDS = 1800.0      # 30 min, sliding on every successful run
+MAX_POOLED_SESSIONS = 256         # safe with the SHARED httpx transport (#3)
 
 from app.nitris.exceptions import (  # noqa: E402
     CredentialsQuarantinedError,

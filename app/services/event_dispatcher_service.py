@@ -69,10 +69,13 @@ from app.utils import esc, safe_truncate
 logger = logging.getLogger(__name__)
 
 # ── Tunables ────────────────────────────────────────────────────────────────
-DISPATCH_BATCH_SIZE = 25                # events claimed per cycle
+# PERF #5: Telegram allows ~30 msg/s; the old 25-per-60s drained a notice
+# burst to 1k users in ~40 minutes. 100 per 10s cycle ≈ up to 10 msg/s —
+# well under the limit, with FloodWait handling as the backstop.
+DISPATCH_BATCH_SIZE = 100               # events claimed per cycle
 CLAIM_STALE_SECONDS = 300               # 5 min — stale claims reclaimable
 MAX_DISPATCH_ATTEMPTS = 5               # → permanent_failure after N retries
-DISPATCH_INTERVAL_SECONDS = 60          # main loop sleep
+DISPATCH_INTERVAL_SECONDS = 10          # main loop sleep
 REAPER_INTERVAL_SECONDS = 60            # stale-claim reaper sleep
 PER_EVENT_SEND_TIMEOUT = 30             # bot.send_message timeout (seconds)
 FLOODWAIT_MAX_RETRIES = 3               # per-event FloodWait retries

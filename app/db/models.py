@@ -216,6 +216,8 @@ Index("idx_snapshots_user_module", Snapshot.user_id, Snapshot.module_name)
 Index("idx_events_user_sent", Event.user_id, Event.sent)
 Index("idx_events_created_at", Event.created_at)
 Index("idx_events_event_type", Event.event_type)
+# PERF #4: composite index for briefing COUNT/group-by + absence payload fetch
+Index("idx_events_user_type_created", Event.user_id, Event.event_type, Event.created_at)
 
 
 class InboxMessage(Base):
