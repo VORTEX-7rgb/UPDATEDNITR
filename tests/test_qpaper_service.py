@@ -589,9 +589,17 @@ async def test_own_creds_tried_before_pool(qp_service, store, fake_bot, monkeypa
             return b"%PDF-1.4 paper"
 
     monkeypatch.setattr("app.nitris.gateway.nitris_gateway", FakeGateway())
+    # P1 pool builds its client via session_pool.NitrisClient — patch there so
+    # no real HTTP happens; the fake serves the paper bytes.
+    monkeypatch.setattr("app.nitris.session_pool.NitrisClient", FakeNitrisClient)
     monkeypatch.setattr("app.services.qpaper_service.NitrisClient", FakeNitrisClient)
     monkeypatch.setattr(
         "app.db.crypto.decrypt_password",
+        lambda enc: enc.decode() if isinstance(enc, bytes) else enc,
+    )
+    # P1 pool decrypts via its own imported symbol — patch there too.
+    monkeypatch.setattr(
+        "app.nitris.session_pool.decrypt_password",
         lambda enc: enc.decode() if isinstance(enc, bytes) else enc,
     )
 
@@ -661,6 +669,11 @@ async def test_no_pool_fallback_when_own_login_fails(qp_service, store, fake_bot
     monkeypatch.setattr("app.services.qpaper_service.NitrisClient", FakeNitrisClient)
     monkeypatch.setattr(
         "app.db.crypto.decrypt_password",
+        lambda enc: enc.decode() if isinstance(enc, bytes) else enc,
+    )
+    # P1 pool decrypts via its own imported symbol — patch there too.
+    monkeypatch.setattr(
+        "app.nitris.session_pool.decrypt_password",
         lambda enc: enc.decode() if isinstance(enc, bytes) else enc,
     )
 

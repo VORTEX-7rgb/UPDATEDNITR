@@ -391,14 +391,12 @@ class AttachmentService:
         source_roll_number: str,
         encrypted_password: str,
     ) -> tuple[bytes, str, str]:
-        """Download attachment from NITRIS strictly within gateway.acquire().
+        """Download attachment from NITRIS via the pooled session (PERF P1).
 
         Enforces the credential-quarantine gate: refuses to attempt a login for
         a quarantined user by loading credentials through auth_gate first.
         """
-        from app.db.crypto import decrypt_password
-        from app.nitris.gateway import nitris_gateway
-        from app.nitris.client import NitrisClient
+        from app.nitris.session_pool import with_pooled_session
         from app.nitris.exceptions import LoginError
         from app.nitris.auth_gate import load_user_credentials, on_login_failure
 
@@ -409,19 +407,20 @@ class AttachmentService:
 
         filename = attachment_basename(canonical_path)
 
-        async with nitris_gateway.acquire():
-            password = decrypt_password(creds.encrypted_password)
-            client = NitrisClient()
-            try:
-                await nitris_gateway.login_through_gateway(
-                    client, creds.roll_number, password, user_id=source_user_id
-                )
-                file_bytes = await client.download_attachment(attachment_url)
-            except LoginError:
-                await on_login_failure(source_user_id, "attachment_download_login_failed")
-                raise
-            finally:
-                await client.close()
+        async def _work(client, _password):
+            file_bytes = await client.download_attachment(attachment_url)
+            return file_bytes
+
+        try:
+            file_bytes = await with_pooled_session(
+                user_id=source_user_id,
+                roll_number=creds.roll_number,
+                encrypted_password=creds.encrypted_password,
+                work=_work,
+            )
+        except LoginError:
+            await on_login_failure(source_user_id, "attachment_download_login_failed")
+            raise
 
         if not file_bytes:
             return b"", filename, "pdf"

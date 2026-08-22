@@ -10,6 +10,7 @@ from app.nitris.constants import (
     ATTENDANCE_TABLE_ID, STUDENT_INFO_LABEL_ID,
     TIMETABLE_HEADING_TEXT, TIMETABLE_TABLE_CSS_CLASS,
     TIMETABLE_TITLE_RE, TIMETABLE_ROOM_RE, TIMETABLE_TIME_RE,
+    HTML_PARSER,
 )
 from app.nitris.exceptions import AttendanceParseError, HomeParseError, InboxParseError
 
@@ -212,7 +213,7 @@ def parse_timetable_from_home(html: str) -> list[TimetableSlot]:
     remaining rows) and pre-fill the aligned[] array for each row, so the
     column layout stays correct for every day.
     """
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, HTML_PARSER)
     tbl = _find_timetable_table(soup)
     if tbl is None:
         raise HomeParseError(
@@ -386,7 +387,7 @@ class AttendanceResult:
 
 def parse_attendance_html(html: str) -> AttendanceResult:
     """Parse final attendance page HTML. Expects table to already exist."""
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, HTML_PARSER)
 
     # Student info
     info_el = soup.find(id=STUDENT_INFO_LABEL_ID)
@@ -549,13 +550,13 @@ def parse_messages_list_html(html: str) -> list[dict]:
     import hashlib
     import base64
     
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, HTML_PARSER)
     
     # Handle Chrome view-source
     td_lines = soup.find_all('td', class_='line-content')
     if td_lines:
         reconstructed = "\n".join(td.get_text() for td in td_lines)
-        soup = BeautifulSoup(reconstructed, "html.parser")
+        soup = BeautifulSoup(reconstructed, HTML_PARSER)
         
     # 1. Parse all message items in the notification dropdown to get direct tokens
     dropdown_messages = []
@@ -726,13 +727,13 @@ def parse_message_detail_html(html: str) -> dict:
     
     Returns a dict containing: sender, sent_on, subject, body, attachment_url.
     """
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, HTML_PARSER)
     
     # Handle Chrome view-source
     td_lines = soup.find_all('td', class_='line-content')
     if td_lines:
         reconstructed = "\n".join(td.get_text() for td in td_lines)
-        soup = BeautifulSoup(reconstructed, "html.parser")
+        soup = BeautifulSoup(reconstructed, HTML_PARSER)
         
     from_el = soup.find(id=MSG_FROM_LABEL_ID)
     senton_el = soup.find(id=MSG_SENTON_LABEL_ID)

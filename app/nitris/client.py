@@ -1,5 +1,6 @@
 """NITRIS client — login + ASP.NET postback attendance workflow."""
 
+import html
 import logging
 import os
 import re
@@ -35,6 +36,7 @@ from app.nitris.constants import (
     CTL_QP_SEARCH_BTN,
     MESSAGES_PAGE_PATH,
     MESSAGE_DETAIL_PATH,
+    HTML_PARSER,
 )
 from app.nitris.exceptions import (
     LoginError,
@@ -188,6 +190,12 @@ class NitrisClient:
                     resp = await self.client.get(parts[1].strip())
                     resp.raise_for_status()
                     logger.info("Session finalized via home page")
+                    # PERF (Waste #2): mine module launcher URLs from the Home
+                    # HTML we are already holding — saves a discovery GET later.
+                    try:
+                        self._seed_module_urls_from_home(resp.text)
+                    except Exception as seed_err:
+                        logger.debug("URL seeding skipped: %r", seed_err)
 
                 logger.info("Login successful for %s", username)
                 return
@@ -254,11 +262,23 @@ class NitrisClient:
                     headers={"Referer": f"{self.base_url}{HOME_PAGE_URL}"},
                     follow_redirects=True,
                 )
-                if (
+                ok = (
                     l_resp.status_code == 200
                     and not is_login_page(l_resp.text)
                     and not is_error_page(l_resp.text, l_resp)
-                ):
+                )
+                if ok and not subpage_href:
+                    # Partial entry (launcher seeded from a login-time Home
+                    # visit) — resolve the sub-page link now and complete it.
+                    found = self._find_subpage_link(l_resp.text, subpage_keyword)
+                    if found:
+                        subpage_href = found
+                        _resolved_url_cache[key] = (
+                            launcher_href,
+                            subpage_href,
+                            time.monotonic() + _RESOLVED_URL_TTL_SECONDS,
+                        )
+                if ok and subpage_href:
                     logger.info(
                         "Resolved %s via cached launcher URL (fast-path)",
                         module_name,
@@ -348,6 +368,24 @@ class NitrisClient:
         raw_path = f"{parsed.path}?{parsed.query}".encode("ascii")
         return httpx.URL(self.base_url).copy_with(raw_path=raw_path)
 
+    def _seed_module_urls_from_home(self, home_html: str) -> None:
+        """PERF (Waste #2): we are ALREADY holding Home.aspx HTML right after
+        login — mine the module launcher hrefs from it so the first scrape
+        skips its own Home discovery GET. Entries are PARTIAL (subpage=None);
+        the resolver fast-path completes them with a single launcher visit."""
+        now = time.monotonic()
+        for module_name, keyword in (
+            (ATTENDANCE_MODULE_NAME, ATTENDANCE_SIDEBAR_LINK_KEYWORD),
+            (QP_MODULE_NAME, QP_SIDEBAR_LINK_KEYWORD),
+        ):
+            href = self._find_launcher_by_module_name(home_html, module_name)
+            if href:
+                key = _cache_key(module_name, keyword)
+                # setdefault: never downgrade a FULL cached entry to partial.
+                _resolved_url_cache.setdefault(
+                    key, (href, None, now + _RESOLVED_URL_TTL_SECONDS)
+                )
+
     @staticmethod
     def _find_launcher_by_module_name(home_html: str, module_name: str) -> Optional[str]:
         """Find the module launcher URL in Home.aspx sidebar by display name.
@@ -355,7 +393,7 @@ class NitrisClient:
         The sidebar link text matches the module name (e.g. "Attendance and Leave").
         Returns the href (relative URL with full query string) or None.
         """
-        soup = BeautifulSoup(home_html, "html.parser")
+        soup = BeautifulSoup(home_html, HTML_PARSER)
         for a in soup.find_all("a", href=True):
             text = a.get_text(strip=True)
             if not text:
@@ -364,8 +402,9 @@ class NitrisClient:
             text_clean = re.sub(r"\s+", " ", text).strip()
             if text_clean.lower() == module_name.lower():
                 href = a["href"]
-                # Resolve relative URL + unescape HTML entities
-                href = BeautifulSoup(href, "html.parser").get_text()
+                # Unescape HTML entities (&amp; -> &) — plain stdlib, no BS4
+                # locator warning (PERF cleanup).
+                href = html.unescape(href)
                 if href.startswith("/"):
                     return href
                 if href.startswith("../../"):
@@ -380,13 +419,13 @@ class NitrisClient:
         """Find the first sub-page href containing the keyword (case-insensitive)
         in the module launcher's sidebar HTML.
         """
-        soup = BeautifulSoup(module_html, "html.parser")
+        soup = BeautifulSoup(module_html, HTML_PARSER)
         kw_lower = keyword.lower()
         for a in soup.find_all("a", href=True):
             href = a["href"]
             if kw_lower in href.lower():
-                # Unescape HTML entities like &amp; -> &
-                href = BeautifulSoup(href, "html.parser").get_text()
+                # Unescape HTML entities (&amp; -> &) without BS4 locator noise.
+                href = html.unescape(href)
                 if href.startswith("/"):
                     return href
                 if href.startswith("../../"):
@@ -497,21 +536,29 @@ class NitrisClient:
                 "step1_initial",
             )
 
-        # Step 2: POST semester selection
+        # Step 2: POST semester selection — SKIPPED when the page already has
+        # the desired semester selected server-side (PERF Waste #3: saves a
+        # full postback round-trip on every scrape).
         form_state = extract_form_fields(html)
         sem_options = extract_dropdown_options(html, CTL_SEMESTER)
         sem_value = self._pick_option(sem_options, semester, fallback_idx=-1)
-        logger.info("[step2] Selecting semester: %s", sem_value)
-
-        html = await submit_postback(
-            self.client,
-            url,
-            form_state,
-            CTL_SEMESTER,
-            {CTL_SEMESTER: sem_value},
-            "step2_semester",
-            self._debug,
-        )
+        current_sem = form_state.get(CTL_SEMESTER)
+        if current_sem and sem_value and current_sem == sem_value:
+            logger.info(
+                "[step2] Semester %r already selected server-side — skipping postback",
+                sem_value,
+            )
+        else:
+            logger.info("[step2] Selecting semester: %s (was %r)", sem_value, current_sem)
+            html = await submit_postback(
+                self.client,
+                url,
+                form_state,
+                CTL_SEMESTER,
+                {CTL_SEMESTER: sem_value},
+                "step2_semester",
+                self._debug,
+            )
 
         # Step 3: Iterate through academic years (latest first)
         form_state = extract_form_fields(html)

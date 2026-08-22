@@ -75,15 +75,20 @@ async def cmd_start(message: types.Message, state: FSMContext):
             inbox_repo = InboxRepository(session)
             unread_count = await inbox_repo.get_unread_count(user.id)
 
+        # LEAK FIX: render INSIDE the session — a closed AsyncSession silently
+        # checks out a fresh pool connection that nothing ever closes again.
+        if user:
+            await state.clear()
+            # Text-only dashboard (PNG photo card removed by design decision).
+            text = await render_dashboard(session, user, unread_count)
+            kb = get_dashboard_keyboard(unread_count)
+        else:
+            await state.clear()
+            await state.set_state(Registration.waiting_for_roll)
+
     if user:
-        await state.clear()
-        # Text-only dashboard (PNG photo card removed by design decision).
-        text = await render_dashboard(session, user, unread_count)
-        kb = get_dashboard_keyboard(unread_count)
         await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
     else:
-        await state.clear()
-        await state.set_state(Registration.waiting_for_roll)
         await message.answer(f"👋 Welcome to NitrClaw!\n\nPlease enter your NITRIS Roll Number (e.g. {SIGNATURE_ROLLS_PLAIN}):")
 
 
@@ -307,8 +312,11 @@ async def process_password(message: types.Message, state: FSMContext):
                 inbox_repo = InboxRepository(session)
                 unread_count = await inbox_repo.get_unread_count(user.id)
 
+            # LEAK FIX: render INSIDE the session (see cmd_start).
+            if user:
+                text = await render_dashboard(session, user, unread_count)
+
         if user:
-            text = await render_dashboard(session, user, unread_count)
             await message.answer(text, reply_markup=get_dashboard_keyboard(unread_count), parse_mode=ParseMode.HTML)
 
         await state.clear()
@@ -383,8 +391,11 @@ async def process_delete_confirm(message: types.Message, state: FSMContext):
                 inbox_repo = InboxRepository(session)
                 unread_count = await inbox_repo.get_unread_count(user.id)
 
+            # LEAK FIX: render INSIDE the session (see cmd_start).
+            if user:
+                text = await render_dashboard(session, user, unread_count)
+
         if user:
-            text = await render_dashboard(session, user, unread_count)
             await message.answer(text, reply_markup=get_dashboard_keyboard(unread_count), parse_mode=ParseMode.HTML)
         else:
             await message.answer("⚠️ You are not registered. Please use /start to register.")
@@ -461,8 +472,11 @@ async def handle_cancel_deregister(callback: types.CallbackQuery, state: FSMCont
             inbox_repo = InboxRepository(session)
             unread_count = await inbox_repo.get_unread_count(user.id)
 
+        # LEAK FIX: render INSIDE the session (see cmd_start).
+        if user:
+            text = await render_dashboard(session, user, unread_count)
+
     if user:
-        text = await render_dashboard(session, user, unread_count)
         await callback.message.answer(text, reply_markup=get_dashboard_keyboard(unread_count), parse_mode=ParseMode.HTML)
     else:
         await callback.message.answer("⚠️ You are not registered. Please use /start to register.")

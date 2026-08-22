@@ -480,11 +480,13 @@ async def handle_inbox_back_dashboard(callback: types.CallbackQuery, state: FSMC
             inbox_repo = InboxRepository(session)
             unread_count = await inbox_repo.get_unread_count(user.id)
 
+        # LEAK FIX: render INSIDE the session (see registration.cmd_start).
+        if user:
+            await state.clear()
+            text = await render_dashboard(session, user, unread_count)
+            kb = get_dashboard_keyboard(unread_count)
+
     if user:
-        await state.clear()
-        # Text-only dashboard (PNG photo card removed by design decision).
-        text = await render_dashboard(session, user, unread_count)
-        kb = get_dashboard_keyboard(unread_count)
         await show(callback.message, text, kb)
     else:
         await callback.message.answer("⚠️ You are not registered. Please use /start to register.")

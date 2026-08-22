@@ -107,6 +107,21 @@ async def main():
         except Exception:
             pass
         
+        # Clean shutdown: release the DB pool and the Telegram HTTP session so
+        # no connection outlives the event loop (stops 'Event loop is closed'
+        # errors and port/socket warnings on Ctrl+C / redeploy).
+        try:
+            from app.db.database import engine
+            await engine.dispose()
+            logging.info("Database engine disposed.")
+        except Exception as e:
+            logging.warning("Engine dispose failed: %r", e)
+        try:
+            await bot.session.close()
+            logging.info("Telegram session closed.")
+        except Exception as e:
+            logging.warning("Bot session close failed: %r", e)
+        
         logging.info("Background workers stopped successfully.")
 
 if __name__ == "__main__":

@@ -508,42 +508,33 @@ class QPaperService:
                 "invalid credentials — use /forgot to update them."
             )
 
-        from app.nitris.gateway import nitris_gateway
-        from app.nitris.exceptions import LoginError, LoginUnavailableError
-        from app.db.crypto import decrypt_password
+        from app.nitris.session_pool import with_pooled_session
 
         roll, user_id, encrypted_password = own
 
-        async with nitris_gateway.acquire():
-            # Decrypt the password INSIDE acquire() — just-in-time
-            try:
-                password = decrypt_password(encrypted_password)
-            except Exception as e:
-                logger.error("Failed to decrypt password for user_id=%d: %r", user_id, e)
-                raise RuntimeError("Could not decrypt stored credentials.") from e
+        async def _work(client: NitrisClient, password: str):
+            file_bytes = await client.download_question_paper_bytes(
+                academic_year=ac_year,
+                subject_query=sub_code,
+                event_target=postback_target,
+            )
+            return file_bytes, _sniff_kind(file_bytes)
 
-            client = NitrisClient()
-            try:
-                await nitris_gateway.login_through_gateway(client, roll, password, user_id=user_id)
-                file_bytes = await client.download_question_paper_bytes(
-                    academic_year=ac_year,
-                    subject_query=sub_code,
-                    event_target=postback_target,
-                )
-                kind = _sniff_kind(file_bytes)
-                return file_bytes, kind
-            except LoginError as e:
-                # Confirmed rejection of the REQUESTER'S OWN credentials —
-                # quarantine the right person via the standard gate.
-                logger.warning("QP download login failed for user_id=%d: %r", user_id, e)
-                from app.nitris.auth_gate import on_login_failure
-                await on_login_failure(user_id, str(e))
-                raise
-            except LoginUnavailableError:
-                # Portal fault — never a credential problem; propagate as-is.
-                raise
-            finally:
-                await client.close()
+        # PERF P1: pooled authenticated session — warm acquisitions skip login.
+        try:
+            return await with_pooled_session(
+                user_id=user_id,
+                roll_number=roll,
+                encrypted_password=encrypted_password,
+                work=_work,
+            )
+        except LoginError as e:
+            # Confirmed rejection of the REQUESTER'S OWN credentials —
+            # quarantine the right person via the standard gate.
+            logger.warning("QP download login failed for user_id=%d: %r", user_id, e)
+            from app.nitris.auth_gate import on_login_failure
+            await on_login_failure(user_id, str(e))
+            raise
 
     async def _load_own_credentials(self, user_id: int) -> Optional[Tuple[str, int, str]]:
         """Short-session read of a user's OWN credentials.

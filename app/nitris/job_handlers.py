@@ -110,25 +110,25 @@ async def handle_attendance_refresh(job: NitrisJob) -> dict:
         encrypted_password = user.encrypted_password
     _t_db = time.monotonic()
 
-    # ── Step 2: NITRIS work (decrypt + login + HTTP) — INSIDE gateway ──
+    # ── Step 2: NITRIS work — pooled authenticated session (PERF P1) ────
     try:
-        async with nitris_gateway.acquire():
-            password = decrypt_password(encrypted_password)
-            client = NitrisClient()
-            try:
-                await nitris_gateway.login_through_gateway(client, roll_number, password, user_id=user_id)
-                _t_login = time.monotonic()
-                data = await get_attendance_data(roll_number, password, client=client, user_id=user_id)
-                _t_scrape = time.monotonic()
-            finally:
-                await client.close()
-                # password drops out of scope here
+        from app.nitris.session_pool import with_pooled_session
+
+        async def _work(client, password):
+            return await get_attendance_data(roll_number, password, client=client, user_id=user_id)
+
+        data = await with_pooled_session(
+            user_id=user_id,
+            roll_number=roll_number,
+            encrypted_password=encrypted_password,
+            work=_work,
+        )
+        _t_nitris = time.monotonic()
         logger.info(
-            "⏱ attendance_refresh user=%s db=%dms login=%dms scrape=%dms",
+            "⏱ attendance_refresh user=%s db=%dms nitris=%dms",
             roll_number,
             int((_t_db - _t0) * 1000),
-            int((_t_login - _t_db) * 1000),
-            int((_t_scrape - _t_login) * 1000),
+            int((_t_nitris - _t_db) * 1000),
         )
 
     except NitrisCircuitOpenError as e:
@@ -226,17 +226,20 @@ async def handle_inbox_refresh(job: NitrisJob) -> dict:
         logger.error("inbox_refresh DB lookup failed: %r", e)
         return {"success": False, "error": f"DB lookup failed: {e}"}
 
-    # ── Step 2: NITRIS work — INSIDE gateway ──
+    # ── Step 2: NITRIS work — pooled authenticated session (PERF P1) ──
     try:
-        async with nitris_gateway.acquire():
-            password = decrypt_password(encrypted_password)
+        from app.nitris.session_pool import with_pooled_session
 
-            client = NitrisClient()
-            try:
-                await nitris_gateway.login_through_gateway(client, roll_number, password, user_id=user_id)
-                scraped, detail_cache, existing_by_id = await prepare_inbox_sync(client, user_id)
-            finally:
-                await client.close()
+        async def _inbox_work(client, password):
+            scraped, detail_cache, existing_by_id = await prepare_inbox_sync(client, user_id)
+            return scraped, detail_cache, existing_by_id
+
+        scraped, detail_cache, existing_by_id = await with_pooled_session(
+            user_id=user_id,
+            roll_number=roll_number,
+            encrypted_password=encrypted_password,
+            work=_inbox_work,
+        )
 
         # DB write -- OUTSIDE the gateway lock (lease boundary fix)
         await persist_inbox_sync(user_id, scraped, detail_cache, existing_by_id)
@@ -285,42 +288,45 @@ async def handle_sync_onboarding(job: NitrisJob) -> dict:
         logger.error("sync_onboarding DB lookup failed for user_id=%d: %r", user_id, e)
         return {"success": False, "error": str(e)}
 
-    # ── Phase 2: ONE login, then scrape inbox + timetable — INSIDE gateway ──
+    # ── Phase 2: pooled session — inbox scrape, then timetable (PERF P1) ──
     scraped = detail_cache = existing_by_id = None
     slots = None
     inbox_scrape_error: Optional[str] = None
     timetable_scrape_error: Optional[str] = None
     try:
-        async with nitris_gateway.acquire():
-            password = decrypt_password(encrypted_password)
-            client = NitrisClient()
-            try:
-                await nitris_gateway.login_through_gateway(client, roll_number, password, user_id=user_id)
+        from app.nitris.session_pool import with_pooled_session
 
-                # Inbox scrape (list + recent-message details) — best-effort.
-                try:
-                    scraped, detail_cache, existing_by_id = await prepare_inbox_sync(client, user_id)
-                except Exception as e:
-                    inbox_scrape_error = str(e)
-                    logger.warning("sync_onboarding inbox scrape failed for user_id=%d: %r", user_id, e)
+        async def _inbox_work(client, password):
+            return await prepare_inbox_sync(client, user_id)
 
-                # Timetable scrape (Home.aspx) — best-effort, independent.
-                try:
-                    from app.nitris.parser import parse_home_page
-                    home_html = await client.fetch_home_html()
-                    slots = parse_home_page(home_html).timetable
-                except Exception as e:
-                    timetable_scrape_error = str(e)
-                    logger.warning("sync_onboarding timetable scrape failed for user_id=%d: %r", user_id, e)
-            finally:
-                await client.close()
-                # password drops out of scope here
+        try:
+            scraped, detail_cache, existing_by_id = await with_pooled_session(
+                user_id=user_id,
+                roll_number=roll_number,
+                encrypted_password=encrypted_password,
+                work=_inbox_work,
+            )
+        except Exception as e:
+            inbox_scrape_error = str(e)
+            logger.warning("sync_onboarding inbox scrape failed for user_id=%d: %r", user_id, e)
+
+        async def _tt_work(client, password):
+            from app.nitris.parser import parse_home_page
+            home_html = await client.fetch_home_html()
+            return parse_home_page(home_html).timetable
+
+        try:
+            slots = await with_pooled_session(
+                user_id=user_id,
+                roll_number=roll_number,
+                encrypted_password=encrypted_password,
+                work=_tt_work,
+            )
+        except Exception as e:
+            timetable_scrape_error = str(e)
+            logger.warning("sync_onboarding timetable scrape failed for user_id=%d: %r", user_id, e)
     except NitrisCircuitOpenError as e:
         return {"success": False, "error": str(e)}
-    except LoginUnavailableError as e:
-        # Portal down/misbehaving — NOT a credential problem (H1 fix).
-        logger.warning("sync_onboarding: NITRIS unavailable for user_id=%s: %r", user_id, e)
-        return {"success": False, "error": f"NITRIS temporarily unavailable: {e}"}
     except (LoginError, CredentialsQuarantinedError) as e:
         await on_login_failure(user_id, str(e))
         return {"success": False, "error": f"Login failed: {e}"}
@@ -430,24 +436,29 @@ async def handle_qp_metadata_fetch(job: NitrisJob) -> dict:
         logger.error("qp_metadata_fetch DB lookup failed: %r", e)
         return {"success": False, "error": f"DB lookup failed: {e}"}
 
-    # ── Step 2: NITRIS work — INSIDE gateway ──
+    # ── Step 2: NITRIS work — pooled authenticated session (PERF P1) ────
     try:
-        async with nitris_gateway.acquire():
-            password = decrypt_password(encrypted_password)
+        from app.nitris.session_pool import with_pooled_session
+        from app.nitris.parser import parse_question_papers_html
 
+        async def _work(client, password):
             from app.services.examination_service import ExaminationService
-            client = NitrisClient()
-            try:
-                await nitris_gateway.login_through_gateway(client, roll_number, password, user_id=user_id)
-                parsed_records = await ExaminationService.fetch_subject_metadata_from_portal(
-                    username=roll_number,
-                    password=password,
-                    academic_year=academic_year,
-                    subject_code=subject_code,
-                    client=client,
-                )
-            finally:
-                await client.close()
+
+            parsed_records = await ExaminationService.fetch_subject_metadata_from_portal(
+                username=roll_number,
+                password=password,
+                academic_year=academic_year,
+                subject_code=subject_code,
+                client=client,
+            )
+            return parsed_records
+
+        parsed_records = await with_pooled_session(
+            user_id=user_id,
+            roll_number=roll_number,
+            encrypted_password=encrypted_password,
+            work=_work,
+        )
 
         return {
             "success": True,
@@ -508,27 +519,27 @@ async def handle_inbox_detail_fetch(job: NitrisJob) -> dict:
             return {"success": False, "error": "Message not found"}
         token = msg.token
 
-    # ── Step 2: NITRIS work — INSIDE gateway slot ───────────────────────
+    # ── Step 2: NITRIS work — pooled authenticated session (PERF P1) ─────
     real_token = None
     detail_data = None
     try:
-        async with nitris_gateway.acquire():
-            password = decrypt_password(encrypted_password)
-            client = NitrisClient()
-            try:
-                await nitris_gateway.login_through_gateway(client, roll_number, password, user_id=user_id)
-                from app.nitris.parser import parse_message_detail_html
+        from app.nitris.session_pool import with_pooled_session
+        from app.nitris.parser import parse_message_detail_html
 
-                if token.startswith("postback:"):
-                    event_target = token.split("postback:")[1]
-                    real_token, detail_html = await client.submit_message_postback(event_target)
-                    detail_data = parse_message_detail_html(detail_html)
-                else:
-                    detail_html = await client.fetch_message_detail(token)
-                    detail_data = parse_message_detail_html(detail_html)
-            finally:
-                await client.close()
-                # password drops out of scope here
+        async def _work(client, password):
+            if token.startswith("postback:"):
+                event_target = token.split("postback:")[1]
+                rt, detail_html = await client.submit_message_postback(event_target)
+                return rt, parse_message_detail_html(detail_html)
+            detail_html = await client.fetch_message_detail(token)
+            return None, parse_message_detail_html(detail_html)
+
+        real_token, detail_data = await with_pooled_session(
+            user_id=user_id,
+            roll_number=roll_number,
+            encrypted_password=encrypted_password,
+            work=_work,
+        )
     except NitrisCircuitOpenError as e:
         return {"success": False, "error": str(e)}
     except LoginUnavailableError as e:
@@ -632,18 +643,20 @@ async def handle_attachment_download(job: NitrisJob) -> dict:
         logger.error("attachment_download DB lookup failed: %r", e)
         return {"success": False, "error": f"DB lookup failed: {e}"}
 
-    # ── Step 2: NITRIS download — INSIDE gateway ──
+    # ── Step 2: NITRIS download — pooled authenticated session (PERF P1) ──
     file_bytes = None
     try:
-        async with nitris_gateway.acquire():
-            password = decrypt_password(encrypted_password)
+        from app.nitris.session_pool import with_pooled_session
 
-            client = NitrisClient()
-            try:
-                await nitris_gateway.login_through_gateway(client, roll_number, password, user_id=user_id)
-                file_bytes = await client.download_attachment(attachment_url)
-            finally:
-                await client.close()
+        async def _work(client, password):
+            return await client.download_attachment(attachment_url)
+
+        file_bytes = await with_pooled_session(
+            user_id=user_id,
+            roll_number=roll_number,
+            encrypted_password=encrypted_password,
+            work=_work,
+        )
 
     except NitrisCircuitOpenError as e:
         return {"success": False, "error": str(e)}
@@ -738,41 +751,40 @@ async def handle_qp_search(job: NitrisJob) -> dict:
         logger.error("qp_search DB lookup failed: %r", e)
         return {"success": False, "error": f"DB lookup failed: {e}"}
 
-    # ── Step 2: NITRIS work — INSIDE gateway ──
+    # ── Step 2: NITRIS work — pooled authenticated session (PERF P1) ──
     search_records = None
     try:
-        async with nitris_gateway.acquire():
-            password = decrypt_password(encrypted_password)
+        from app.nitris.session_pool import with_pooled_session
+        from app.nitris.examination_parser import parse_question_papers_html
+        from app.utils import current_academic_year
 
-            client = NitrisClient()
+        ay = current_academic_year()
+
+        async def _work(client, password):
+            records = []
             try:
-                await nitris_gateway.login_through_gateway(client, roll_number, password, user_id=user_id)
+                html_autumn = await client.fetch_question_papers(
+                    academic_year=f"{ay}/Autumn", subject_query=query
+                )
+                records.extend(parse_question_papers_html(html_autumn))
+            except Exception as e_autumn:
+                logger.warning("Autumn search failed: %r", e_autumn)
 
-                from app.nitris.examination_parser import parse_question_papers_html
+            try:
+                html_spring = await client.fetch_question_papers(
+                    academic_year=f"{ay}/Spring", subject_query=query
+                )
+                records.extend(parse_question_papers_html(html_spring))
+            except Exception as e_spring:
+                logger.warning("Spring search failed: %r", e_spring)
+            return records
 
-                # Derive the current academic year from the calendar - searching a
-                # hardcoded year silently returns nothing once semesters roll over.
-                from app.utils import current_academic_year
-                ay = current_academic_year()
-
-                search_records = []
-                try:
-                    html_autumn = await client.fetch_question_papers(
-                        academic_year=f"{ay}/Autumn", subject_query=query
-                    )
-                    search_records.extend(parse_question_papers_html(html_autumn))
-                except Exception as e_autumn:
-                    logger.warning("Autumn search failed: %r", e_autumn)
-
-                try:
-                    html_spring = await client.fetch_question_papers(
-                        academic_year=f"{ay}/Spring", subject_query=query
-                    )
-                    search_records.extend(parse_question_papers_html(html_spring))
-                except Exception as e_spring:
-                    logger.warning("Spring search failed: %r", e_spring)
-            finally:
-                await client.close()
+        search_records = await with_pooled_session(
+            user_id=user_id,
+            roll_number=roll_number,
+            encrypted_password=encrypted_password,
+            work=_work,
+        )
 
         return {"success": True, "records": search_records}
 

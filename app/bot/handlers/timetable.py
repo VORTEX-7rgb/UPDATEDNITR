@@ -111,7 +111,7 @@ async def _handle_now_next_display(telegram_user_id: int) -> tuple[str, types.In
 
         tt_repo = TimetableRepository(session)
         entries = await tt_repo.get_user_timetable(user.id)
-        last_synced = await tt_repo.get_last_synced_at(user.id)
+        last_synced = max((e.synced_at for e in entries if e.synced_at is not None), default=None)
 
     if not entries:
         return (
@@ -139,7 +139,7 @@ async def _handle_day_display(telegram_user_id: int, weekday: int) -> tuple[str,
 
         tt_repo = TimetableRepository(session)
         entries = await tt_repo.get_user_timetable(user.id)
-        last_synced = await tt_repo.get_last_synced_at(user.id)
+        last_synced = max((e.synced_at for e in entries if e.synced_at is not None), default=None)
 
     if not entries:
         return (

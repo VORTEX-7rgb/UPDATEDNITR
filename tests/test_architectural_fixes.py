@@ -109,10 +109,17 @@ async def test_full_qp_download_no_deadlock():
 
     service._load_own_credentials = fake_own
 
-    with patch("app.services.qpaper_service.NitrisClient") as mock_client_cls:
+    # P1: the download now runs through the session pool — patch THERE, and
+    # stub the gateway login (the real gateway's acquire() is harmless).
+    from app.nitris.session_pool import NitrisClient as PoolClient  # noqa: F401
+
+    with patch("app.nitris.session_pool.NitrisClient") as mock_client_cls, \
+         patch("app.nitris.gateway.nitris_gateway.login_through_gateway", new=AsyncMock()), \
+         patch("app.nitris.session_pool.decrypt_password", lambda enc: "plaintext"):
         client_instance = AsyncMock()
         client_instance.download_question_paper_bytes = AsyncMock(return_value=b"%PDF-1.4 test")
         client_instance.close = AsyncMock()
+        client_instance.client = MagicMock(is_closed=False)
         mock_client_cls.return_value = client_instance
 
         bytes_out, kind = await service._nitris_download(

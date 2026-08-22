@@ -23,17 +23,17 @@ def parse_question_papers_html(html: str) -> list[QuestionPaperRecord]:
     
     Supports Chrome view-source pages automatically.
     """
-    from app.nitris.constants import QUESTION_TABLE_ID
+    from app.nitris.constants import QUESTION_TABLE_ID, HTML_PARSER
     from app.nitris.exceptions import AttendanceParseError
     
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, HTML_PARSER)
     
     # 1. Handle Chrome view-source automatically
     td_lines = soup.find_all('td', class_='line-content')
     if td_lines:
         logger.info("Chrome view-source presentation wrapper detected. Reconstructing raw HTML...")
         reconstructed = "\n".join(td.get_text() for td in td_lines)
-        soup = BeautifulSoup(reconstructed, "html.parser")
+        soup = BeautifulSoup(reconstructed, HTML_PARSER)
         
     # 2. Locate the GridView table
     # Standard GridView ID: ContentPlaceHolder2_ContentPlaceHolder1_mainContent_gvSubjects

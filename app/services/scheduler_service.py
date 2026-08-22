@@ -412,16 +412,19 @@ async def init_scheduler() -> None:
             )
             return {"success": False, "error": str(e)}
 
-        # Phase 2: NITRIS work -- INSIDE gateway (decrypt + login + scrape only)
+        # Phase 2: NITRIS work — pooled authenticated session (PERF P1)
         try:
-            async with nitris_gateway.acquire():
-                password = decrypt_password(encrypted_password)
-                client = NitrisClient()
-                try:
-                    await nitris_gateway.login_through_gateway(client, roll_number, password, user_id=user_id)
-                    data = await get_attendance_data(roll_number, password, client=client, user_id=user_id)
-                finally:
-                    await client.close()
+            from app.nitris.session_pool import with_pooled_session
+
+            async def _work(client, password):
+                return await get_attendance_data(roll_number, password, client=client, user_id=user_id)
+
+            data = await with_pooled_session(
+                user_id=user_id,
+                roll_number=roll_number,
+                encrypted_password=encrypted_password,
+                work=_work,
+            )
         except NitrisCircuitOpenError as e:
             await update_schedule_after_job(
                 async_session_factory, schedule_id,
@@ -517,16 +520,19 @@ async def init_scheduler() -> None:
             )
             return {"success": False, "error": str(e)}
 
-        # Phase 2: NITRIS network -- INSIDE gateway (decrypt + login + fetch + details)
+        # Phase 2: NITRIS network — pooled authenticated session (PERF P1)
         try:
-            async with nitris_gateway.acquire():
-                password = decrypt_password(encrypted_password)
-                client = NitrisClient()
-                try:
-                    await nitris_gateway.login_through_gateway(client, roll_number, password, user_id=user_id)
-                    scraped, detail_cache, existing_by_id = await prepare_inbox_sync(client, user_id)
-                finally:
-                    await client.close()
+            from app.nitris.session_pool import with_pooled_session
+
+            async def _work(client, password):
+                return await prepare_inbox_sync(client, user_id)
+
+            scraped, detail_cache, existing_by_id = await with_pooled_session(
+                user_id=user_id,
+                roll_number=roll_number,
+                encrypted_password=encrypted_password,
+                work=_work,
+            )
         except NitrisCircuitOpenError as e:
             await update_schedule_after_job(
                 async_session_factory, schedule_id,

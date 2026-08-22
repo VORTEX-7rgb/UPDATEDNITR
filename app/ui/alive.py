@@ -173,7 +173,8 @@ async def render_dashboard(session: AsyncSession, user: User, unread_count: int)
 
     tt_repo = TimetableRepository(session)
     entries = await tt_repo.get_user_timetable(user.id)
-    tt_last = await tt_repo.get_last_synced_at(user.id)
+    # PERF: compute last sync timestamp in-memory from loaded entries — avoids a 2nd DB round-trip
+    tt_last = max((e.synced_at for e in entries if e.synced_at is not None), default=None)
 
     from app.db.repositories.snapshot_repository import SnapshotRepository
     snap = await SnapshotRepository(session).get_latest_snapshot(user.id, "attendance")
@@ -225,20 +226,17 @@ async def render_dashboard(session: AsyncSession, user: User, unread_count: int)
 
             briefing_text = compose_briefing(counts, absence_lines)
 
-    # Stamp last_seen (self-contained txn — never affects caller's session).
+    # Stamp last_seen directly on the caller's session (single connection, zero 2nd checkout).
     try:
-        from app.db.database import async_session_factory
-        async with async_session_factory() as s2:
-            async with s2.begin():
-                await s2.execute(sql_text("""
-                    INSERT INTO sync_states (user_id, failure_count, last_seen_at)
-                    VALUES (:uid, 0, NOW())
-                    ON CONFLICT (user_id)
-                    DO UPDATE SET last_seen_at = NOW()
-                """), {"uid": user.id})
+        await session.execute(sql_text("""
+            INSERT INTO sync_states (user_id, failure_count, last_seen_at)
+            VALUES (:uid, 0, NOW())
+            ON CONFLICT (user_id)
+            DO UPDATE SET last_seen_at = NOW()
+        """), {"uid": user.id})
+        await session.commit()
     except Exception as e:  # stamping must never break rendering
-        import logging
-        logging.getLogger(__name__).warning("last_seen stamp failed: %r", e)
+        logger.warning("last_seen stamp failed: %r", e)
 
     # ── Assemble ────────────────────────────────────────────────────────
     parts: list[str] = [f"{theme.BRAND}"]

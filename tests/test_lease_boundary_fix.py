@@ -91,89 +91,50 @@ async def test_sqlalchemy_error_does_not_trip_circuit():
 import ast
 
 
-def _get_acquire_body_source(fn) -> str:
-    """Extract unparsed Python source of the `async with nitris_gateway.acquire():` body using AST."""
-    tree = ast.parse(inspect.getsource(fn))
-    for node in ast.walk(tree):
-        if isinstance(node, ast.AsyncWith):
-            for item in node.items:
-                call_str = ast.unparse(item.context_expr)
-                if "nitris_gateway.acquire" in call_str:
-                    return "\n".join(ast.unparse(stmt) for stmt in node.body)
-    raise ValueError(f"No acquire block in {fn.__name__}")
+# ── P1 architecture: the lease boundary moved INTO the session pool ────────
+# Handlers no longer open gateway slots themselves — they delegate all NITRIS
+# work to session_pool.with_pooled_session(), which centrally enforces:
+#   * exactly ONE gateway slot per run,
+#   * JIT password decryption INSIDE that slot,
+#   * login ONLY on cache miss via login_through_gateway,
+#   * auth/session faults drop the pooled entry.
+# Those mechanics are proven behaviorally in test_session_pool.py; here we pin
+# the structural routing of every NITRIS-touching handler.
+
+_POOLED_HANDLERS = (
+    "handle_attendance_refresh",
+    "handle_inbox_refresh",
+    "handle_sync_onboarding",
+    "handle_qp_metadata_fetch",
+    "handle_inbox_detail_fetch",
+    "handle_attachment_download",
+    "handle_qp_search",
+)
 
 
-def test_attendance_refresh_handler_boundary():
-    """Verify handle_attendance_refresh keeps DB lookups & writes outside acquire()."""
+@pytest.mark.parametrize("handler_name", _POOLED_HANDLERS)
+def test_handler_routes_nitris_work_through_session_pool(handler_name):
+    """Every NITRIS-touching handler must go through the session pool and must
+    NOT construct clients / decrypt / log in directly."""
     import app.nitris.job_handlers as jh
-    acquire_body = _get_acquire_body_source(jh.handle_attendance_refresh)
 
-    assert "session.get" not in acquire_body
-    assert "async_session_factory" not in acquire_body
-    assert "create_snapshot" not in acquire_body
-    assert "session.begin" not in acquire_body
-    assert "decrypt_password" in acquire_body
-    assert "login_through_gateway" in acquire_body
-
-
-def test_inbox_refresh_handler_boundary():
-    """Verify handle_inbox_refresh keeps DB lookups outside acquire()."""
-    import app.nitris.job_handlers as jh
-    acquire_body = _get_acquire_body_source(jh.handle_inbox_refresh)
-
-    assert "session.get" not in acquire_body
-    assert "async_session_factory" not in acquire_body
-    assert "decrypt_password" in acquire_body
-    assert "login_through_gateway" in acquire_body
+    src = inspect.getsource(getattr(jh, handler_name))
+    assert "with_pooled_session" in src, f"{handler_name} bypasses the pool"
+    body = src.replace("from app.nitris.session_pool import with_pooled_session", "")
+    assert "NitrisClient()" not in body, f"{handler_name} builds its own client"
+    assert "decrypt_password(" not in body, f"{handler_name} decrypts outside the pool"
+    assert "login_through_gateway" not in body, f"{handler_name} logs in outside the pool"
 
 
-def test_qp_metadata_fetch_handler_boundary():
-    """Verify handle_qp_metadata_fetch keeps DB lookups outside acquire()."""
-    import app.nitris.job_handlers as jh
-    acquire_body = _get_acquire_body_source(jh.handle_qp_metadata_fetch)
+def test_session_pool_enforces_gateway_boundaries():
+    """Structural pin: decrypt + login live INSIDE the held gateway slot in
+    with_pooled_session — the lease boundary survives the P1 refactor."""
+    import app.nitris.session_pool as sp_mod
 
-    assert "session.get" not in acquire_body
-    assert "async_session_factory" not in acquire_body
-    assert "decrypt_password" in acquire_body
-    assert "login_through_gateway" in acquire_body
-
-
-def test_inbox_detail_fetch_handler_boundary():
-    """Verify handle_inbox_detail_fetch keeps DB lookups & writes outside acquire()."""
-    import app.nitris.job_handlers as jh
-    acquire_body = _get_acquire_body_source(jh.handle_inbox_detail_fetch)
-
-    assert "session.get" not in acquire_body
-    assert "async_session_factory" not in acquire_body
-    assert "update_message_body" not in acquire_body
-    assert "session.begin" not in acquire_body
-    assert "decrypt_password" in acquire_body
-    assert "login_through_gateway" in acquire_body
-
-
-def test_attachment_download_handler_boundary():
-    """Verify handle_attachment_download keeps DB lookups, Telegram upload & DB cache outside acquire()."""
-    import app.nitris.job_handlers as jh
-    acquire_body = _get_acquire_body_source(jh.handle_attachment_download)
-
-    assert "session.get" not in acquire_body
-    assert "async_session_factory" not in acquire_body
-    assert "send_document" not in acquire_body
-    assert "update_telegram_file_id" not in acquire_body
-    assert "session.begin" not in acquire_body
-    assert "decrypt_password" in acquire_body
-    assert "login_through_gateway" in acquire_body
-
-
-def test_qp_search_handler_boundary():
-    """Verify handle_qp_search keeps DB lookups outside acquire()."""
-    import app.nitris.job_handlers as jh
-    acquire_body = _get_acquire_body_source(jh.handle_qp_search)
-
-    assert "session.get" not in acquire_body
-    assert "async_session_factory" not in acquire_body
-    assert "decrypt_password" in acquire_body
-    assert "login_through_gateway" in acquire_body
+    src = inspect.getsource(sp_mod.with_pooled_session)
+    assert "_gateway_acquire()" in src
+    assert "decrypt_password(encrypted_password)" in src
+    assert "login_through_gateway" in src
 
 
 @pytest.mark.asyncio

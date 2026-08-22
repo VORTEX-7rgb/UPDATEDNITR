@@ -15,7 +15,7 @@ from app.nitris.exceptions import (
     SessionExpiredError,
     InvalidContextError,
 )
-from app.nitris.constants import ATTENDANCE_TABLE_ID, CTL_SESSION
+from app.nitris.constants import ATTENDANCE_TABLE_ID, CTL_SESSION, HTML_PARSER
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +56,7 @@ def extract_form_fields(html: str, exclude_placeholders: bool = True) -> dict[st
             server may reject as inconsistent. The caller is then expected to
             supply real values via form_updates in submit_postback.
     """
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, HTML_PARSER)
     form = soup.find("form")
     if not form:
         raise HiddenFieldExtractionError("No <form> found in HTML.")
@@ -110,7 +110,7 @@ def extract_form_fields(html: str, exclude_placeholders: bool = True) -> dict[st
 
 def extract_dropdown_options(html: str, select_name: str) -> list[tuple[str, str]]:
     """Extract (value, text) pairs from a <select> dropdown by name attribute."""
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, HTML_PARSER)
     select = soup.find("select", {"name": select_name})
     if not select:
         return []

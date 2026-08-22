@@ -64,24 +64,21 @@ async def fetch_timetable_html_via_gateway(
     respect the lease boundary — see qpaper_service pattern).
     """
     # Local imports to avoid circular import (gateway imports from app.nitris)
-    from app.nitris.gateway import nitris_gateway, NitrisCircuitOpenError
-    from app.nitris.client import NitrisClient
-    from app.db.crypto import decrypt_password
+    from app.nitris.session_pool import with_pooled_session
+    from app.nitris.parser import parse_home_page
 
-    async with nitris_gateway.acquire():
-        # JIT password decryption INSIDE acquire() — password never leaves
-        # this scope, never serialized into job payload or logs.
-        password = decrypt_password(encrypted_password)
+    async def _work(client, _password):
+        html = await client.fetch_home_html()
+        slots = parse_home_page(html).timetable
+        return html, slots
 
-        client = NitrisClient()
-        try:
-            await nitris_gateway.login_through_gateway(client, roll_number, password, user_id=user_id)
-            html = await client.fetch_home_html()
-            slots = parse_home_page(html).timetable
-            return html, slots
-        finally:
-            await client.close()
-            # password drops out of scope here
+    # PERF P1: pooled authenticated session — warm runs skip the paced login.
+    return await with_pooled_session(
+        user_id=user_id,
+        roll_number=roll_number,
+        encrypted_password=encrypted_password,
+        work=_work,
+    )
 
 
 async def sync_user_timetable(
