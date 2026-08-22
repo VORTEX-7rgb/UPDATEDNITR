@@ -7,17 +7,54 @@ only as a fallback (message deleted / can't be edited / command entry points).
 Surface class additionally provides progressive latency UX (their §6/§7):
 cached content immediately, optional "slow NITRIS" pokes after 2s+, final
 render that atomically invalidates any pending poke (stale-write protection).
+Also includes cross-handler navigation race protection so slow background
+renders never overwrite newer screens navigated to by the user.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Optional
 
 from aiogram import types
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
 
 logger = logging.getLogger(__name__)
+
+# Bubble ownership registry: (chat_id, message_id) -> latest active interaction sequence
+_bubble_owners: dict[tuple[int, int], int] = {}
+_global_interaction_seq = 0
+
+
+def _get_bubble_key(message: types.Message) -> tuple[int, int] | None:
+    chat_id = getattr(getattr(message, "chat", None), "id", None)
+    message_id = getattr(message, "message_id", None) or id(message)
+    if chat_id is not None:
+        return (chat_id, message_id)
+    return None
+
+
+def claim_bubble(message: types.Message) -> int:
+    """Register a new active interaction owner on this message bubble.
+    Any prior slow in-flight flow on the same bubble will be invalidated."""
+    global _global_interaction_seq
+    key = _get_bubble_key(message)
+    _global_interaction_seq += 1
+    if key is not None:
+        _bubble_owners[key] = _global_interaction_seq
+        if len(_bubble_owners) > 2000:
+            for k in list(_bubble_owners.keys())[:1000]:
+                _bubble_owners.pop(k, None)
+    return _global_interaction_seq
+
+
+def is_bubble_owner(message: types.Message, token: int) -> bool:
+    """Return True if this interaction token still owns the bubble."""
+    key = _get_bubble_key(message)
+    if key is None:
+        return True
+    return _bubble_owners.get(key, token) == token
 
 
 async def show(
@@ -31,6 +68,8 @@ async def show(
     Swallows the benign "message is not modified" error (double-taps on Refresh)
     so handlers never crash on idempotent renders.
     """
+    claim_bubble(message)
+
     # Inaccessible messages (very old callback targets) have no edit_text.
     if not hasattr(message, "edit_text"):
         return await _send_fresh(message, text, reply_markup, parse_mode)
@@ -77,30 +116,51 @@ class Surface:
         await surf.final(final_text, final_kb)
 
     Any pending poke is invalidated by `final()` / a newer `edit()`, so a slow
-    "NITRIS is slow…" note can never overwrite a finished render.
+    "NITRIS is slow…" note can never overwrite a finished render. Cross-handler
+    ownership tokens prevent a slow background scrape from overwriting a newer
+    screen navigated to by the student.
     """
 
     def __init__(self, message: types.Message):
         self.message = message
         self._gen = 0
+        self._owner_token = claim_bubble(message)
         self._pokes: set[asyncio.Task] = set()
 
     async def edit(self, text: str, reply_markup=None) -> types.Message | None:
+        if not is_bubble_owner(self.message, self._owner_token):
+            logger.debug("Surface edit dropped: user navigated to newer interaction")
+            return None
         self._gen += 1
-        msg = await show(self.message, text, reply_markup)
+        msg = await self._raw_show(self.message, text, reply_markup)
         if msg is not None:
             self.message = msg
         return msg
+
+    async def _raw_show(self, message: types.Message, text: str, reply_markup=None) -> types.Message | None:
+        """Internal render without re-claiming bubble ownership."""
+        if not hasattr(message, "edit_text"):
+            return await _send_fresh(message, text, reply_markup, ParseMode.HTML)
+        try:
+            return await message.edit_text(text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+        except TelegramBadRequest as e:
+            if "message is not modified" in str(e).lower():
+                return message
+            logger.debug("Edit fell back to send (%s)", e)
+        except Exception as e:
+            logger.debug("Edit failed, falling back to send: %r", e)
+        return await _send_fresh(message, text, reply_markup, ParseMode.HTML)
 
     def poke_later(self, delay: float, text: str, reply_markup=None) -> asyncio.Task:
         """After `delay`, replace the bubble with `text` UNLESS a newer render
         already happened. Bounded to one pending poke per call."""
         gen = self._gen
+        token = self._owner_token
 
         async def _poke() -> None:
             try:
                 await asyncio.sleep(delay)
-                if gen == self._gen:
+                if gen == self._gen and is_bubble_owner(self.message, token):
                     await self.edit(text, reply_markup)
             except asyncio.CancelledError:
                 return
@@ -116,4 +176,7 @@ class Surface:
         for t in list(self._pokes):
             t.cancel()
         self._pokes.clear()
+        if not is_bubble_owner(self.message, self._owner_token):
+            logger.debug("Surface final dropped: user navigated away to newer interaction")
+            return None
         return await self.edit(text, reply_markup)

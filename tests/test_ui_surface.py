@@ -104,3 +104,25 @@ async def test_surface_poke_fires_when_no_final_arrives():
     task = surf.poke_later(0.02, "slow persona")
     await asyncio.wait_for(task, timeout=1.0)
     assert "slow persona" in m.edits
+
+
+@pytest.mark.asyncio
+async def test_surface_navigation_race_drops_stale_final():
+    """If user navigates away to a new screen (via show()), a slow in-flight Surface.final()
+    from the previous interaction must NOT overwrite the newer screen."""
+    m = FakeMsg()
+    surf_attendance = Surface(m)  # User tapped Attendance (interaction 1)
+    await surf_attendance.edit("Updating attendance...")
+    assert m.edits[-1] == "Updating attendance..."
+
+    # User clicks 'Home' before attendance finishes -> show() renders Home (interaction 2)
+    await show(m, "🏠 Home Dashboard", KB)
+    assert m.edits[-1] == "🏠 Home Dashboard"
+
+    # Slow attendance job finally finishes and tries to call final()
+    result = await surf_attendance.final("📊 85.5% Attendance")
+
+    # The final edit MUST be dropped because user moved to Home
+    assert result is None
+    assert m.edits[-1] == "🏠 Home Dashboard"
+    assert "📊 85.5% Attendance" not in m.edits
