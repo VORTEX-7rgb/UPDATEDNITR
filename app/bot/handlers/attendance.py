@@ -232,18 +232,24 @@ async def _run_flow(surf: Surface, user_id: int, cached: AttendanceSummary | Non
 
 async def fetch_attendance_for_callback(callback: types.CallbackQuery, user: User):
     from app.nitris.rate_limiter import operation_cooldown, COOLDOWN_ATTENDANCE_REFRESH
+
+    # CACHE-FIRST, ALWAYS (user contract): even when the anti-spam cooldown is
+    # active, this tap must immediately render the LATEST CACHED attendance
+    # plus an inline countdown — never a dead bubble, never a dependent alert.
     allowed, wait = await operation_cooldown.check(
         user.id, "attendance_refresh", cooldown_seconds=COOLDOWN_ATTENDANCE_REFRESH
     )
-    if not allowed:
-        try:
-            await callback.answer(f"⏳ Please wait {wait}s before refreshing again.", show_alert=True)
-        except Exception:
-            pass
-        return
-
     cached = await _load_summary(user.id)
     surf = Surface(callback.message)  # EDIT WHAT YOU TAPPED
+
+    if not allowed:
+        cooldown_note = f"⏳ Synced just now. Next live refresh in {wait}s."
+        await surf.edit(
+            _list_text(cached, cooldown_note),
+            _kb_viewing(cached),
+        )
+        return
+
     await _run_flow(surf, user.id, cached)
 
 

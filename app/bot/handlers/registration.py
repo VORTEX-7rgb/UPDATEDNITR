@@ -282,32 +282,51 @@ async def process_password(message: types.Message, state: FSMContext):
                 sync_state.last_error = None
                 sync_state.failure_count = 0
 
-            # Create module_sync_schedule rows for the user
-            from app.services.scheduler_service import ensure_schedule_exists
-            from app.db.database import async_session_factory
-            for module_name in ("attendance", "inbox"):
-                await ensure_schedule_exists(async_session_factory, user_id, module_name)
+        # ── Admin notification: GUARANTEED post-commit slot ─────────────
+        # Fired immediately after the user row COMMITTED and before any
+        # side-effect that could raise — so a later hiccup (onboarding,
+        # schedules) can never suppress an admin notification for a real
+        # registration.
+        if is_new_user and roll:
+            try:
+                from app.bot.handlers.admin_notify import notify_admins_of_new_user
+                await notify_admins_of_new_user(
+                    message.bot,
+                    roll,
+                    student_name=getattr(data, "student_info", None),
+                )
+            except Exception as notify_err:
+                logger.warning(
+                    "Admin new-user notification failed (registration succeeded for roll=%s): %r",
+                    roll, notify_err,
+                )
 
-            # Re-enable logins after a successful explicit verification.
-            # Bumps credentials_version, clears any prior quarantine, and resets
-            # the failure counters + gateway in-memory guard.
-            from app.nitris.auth_gate import on_credentials_updated
-            await on_credentials_updated(user_id)
+        # Create module_sync_schedule rows for the user
+        from app.services.scheduler_service import ensure_schedule_exists
+        from app.db.database import async_session_factory
+        for module_name in ("attendance", "inbox"):
+            await ensure_schedule_exists(async_session_factory, user_id, module_name)
 
-            # Kick off a SILENT baseline sync (inbox + timetable) on a single
-            # background login, so the user's first tap on inbox/timetable is
-            # instant and their historical inbox doesn't spam "new message"
-            # notifications. Fire-and-forget — the dashboard shows immediately.
-            # Enqueue at LOW priority so it NEVER blocks an interactive
-            # user tap on /attendance or /inbox (their own or another user's).
-            from app.nitris.job_queue import nitris_job_queue, Priority
-            await nitris_job_queue.enqueue(
-                job_type="sync_onboarding",
-                user_id=user_id,
-                priority=Priority.LOW,
-                dedup_key=f"onboarding:user:{user_id}",
-                payload={},
-            )
+        # Re-enable logins after a successful explicit verification.
+        # Bumps credentials_version, clears any prior quarantine, and resets
+        # the failure counters + gateway in-memory guard.
+        from app.nitris.auth_gate import on_credentials_updated
+        await on_credentials_updated(user_id)
+
+        # Kick off a SILENT baseline sync (inbox + timetable) on a single
+        # background login, so the user's first tap on inbox/timetable is
+        # instant and their historical inbox doesn't spam "new message"
+        # notifications. Fire-and-forget — the dashboard shows immediately.
+        # Enqueue at LOW priority so it NEVER blocks an interactive
+        # user tap on /attendance or /inbox (their own or another user's).
+        from app.nitris.job_queue import nitris_job_queue, Priority
+        await nitris_job_queue.enqueue(
+            job_type="sync_onboarding",
+            user_id=user_id,
+            priority=Priority.LOW,
+            dedup_key=f"onboarding:user:{user_id}",
+            payload={},
+        )
 
         await status_msg.edit_text(
             "✅ <b>Registration complete!</b>\n\n"
@@ -340,15 +359,8 @@ async def process_password(message: types.Message, state: FSMContext):
         await status_msg.edit_text("❌ A database error occurred during registration. Please use /start to retry.")
         await state.clear()
 
-    if is_new_user and roll:
-        try:
-            from app.bot.handlers.admin_notify import notify_admins_of_new_user
-            await notify_admins_of_new_user(message.bot, roll)
-        except Exception as notify_err:
-            logger.warning(
-                "Admin new-user notification failed (registration succeeded for roll=%s): %r",
-                roll, notify_err,
-            )
+    # (Admin notification already fired in the guaranteed post-commit slot
+    # above — right after the user row committed.)
 
 
 @router.message(Registration.waiting_for_roll, ~F.text)

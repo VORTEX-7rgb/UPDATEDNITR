@@ -157,7 +157,8 @@ async def cmd_admin_reset_qp(message: types.Message):
                             acquired_at = NULL,
                             lease_expires_at = NULL,
                             heartbeat_at = NULL,
-                            pending_file_id = NULL
+                            pending_file_id = NULL,
+                            not_available_until = NULL
                         WHERE id = :id
                         RETURNING subject_code, academic_year, exam_type
                     """),
@@ -214,6 +215,8 @@ async def _send_broadcast_one(bot, telegram_id: int, text: str, pin: bool = Fals
                         message_id=sent.message_id,
                         disable_notification=True,
                     )
+                    # Track it so /unpin can target exactly this message.
+                    _last_pinned_by_chat[telegram_id] = sent.message_id
                 except TelegramAPIError as e:
                     logger.warning("Broadcast pin failed for %d: %r", telegram_id, e)
                     return "pin_failed"
@@ -369,3 +372,133 @@ async def cmd_broadcast(message: types.Message):
 async def cmd_broadcastpin(message: types.Message):
     """Admin command: send + pin a plain-text message in every user's chat."""
     await _broadcast_common(message, pin=True, command_name="broadcastpin")
+
+
+# ── /unpin — remove the last pinned broadcast from every user's chat ────────
+
+# Chat → message_id of the most recent broadcast WE pinned in that chat.
+# Lets /unpin target exactly our own pinned message; falls back to Telegram's
+# "unpin most recent" when the map is cold (e.g. after a restart).
+_last_pinned_by_chat: dict[int, int] = {}
+
+
+async def _unpin_one(bot, telegram_id: int) -> str:
+    """Unpin the last broadcast-pinned message for one user.
+
+    Returns a status string:
+      'ok'       — unpinned successfully
+      'no_pin'   — nothing pinned in that chat
+      'blocked'  — user blocked the bot
+      'inactive' — chat not found / deactivated
+      'failed'   — unpin failed after retries
+    """
+    for attempt in range(BROADCAST_MAX_RETRIES):
+        try:
+            recorded = _last_pinned_by_chat.get(telegram_id)
+            if recorded is not None:
+                await bot.unpin_chat_message(chat_id=telegram_id, message_id=recorded)
+                _last_pinned_by_chat.pop(telegram_id, None)
+            else:
+                # Cold map (restart): unpin the MOST RECENT pinned message.
+                await bot.unpin_chat_message(chat_id=telegram_id)
+            return "ok"
+        except TelegramRetryAfter as e:
+            if attempt + 1 >= BROADCAST_MAX_RETRIES:
+                logger.warning("Unpin floodwait exhausted for %d", telegram_id)
+                return "failed"
+            await asyncio.sleep(e.retry_after + 0.5)
+        except TelegramForbiddenError:
+            return "blocked"
+        except TelegramAPIError as e:
+            msg = str(e).lower()
+            if "message to unpin" in msg and "not found" in msg:
+                return "no_pin"
+            if "chat not found" in msg or "deactivated" in msg:
+                return "inactive"
+            if attempt + 1 >= BROADCAST_MAX_RETRIES:
+                logger.warning("Unpin failed for %d: %r", telegram_id, e)
+                return "failed"
+            await asyncio.sleep(1.0 * (attempt + 1))
+    return "failed"
+
+
+async def _run_unpin_all(
+    bot, telegram_ids: list[int],
+    status_chat_id: int, status_message_id: int,
+) -> None:
+    """Background worker: unpin across all registered users and report."""
+    counts = {"ok": 0, "no_pin": 0, "blocked": 0, "inactive": 0, "failed": 0}
+    total = len(telegram_ids)
+
+    for idx, tid in enumerate(telegram_ids, start=1):
+        status = await _unpin_one(bot, tid)
+        counts[status] += 1
+
+        if idx % BROADCAST_PROGRESS_EVERY == 0:
+            try:
+                await bot.edit_message_text(
+                    chat_id=status_chat_id,
+                    message_id=status_message_id,
+                    text=(
+                        f"📌 <b>Unpinning…</b> {idx}/{total}\n"
+                        f"✅ {counts['ok']} · ⚪ {counts['no_pin']} · "
+                        f"🚫 {counts['blocked']} · 👤 {counts['inactive']} · ❌ {counts['failed']}"
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+
+        await asyncio.sleep(BROADCAST_PACING_SECONDS)
+
+    summary = (
+        f"📌 <b>Unpin complete</b>\n\n"
+        f"🎯 Target: <b>{total}</b> users\n"
+        f"✅ Unpinned: <b>{counts['ok']}</b>\n"
+        f"⚪ Nothing pinned: <b>{counts['no_pin']}</b>\n"
+        f"🚫 Blocked the bot: <b>{counts['blocked']}</b>\n"
+        f"👤 Inactive/deleted: <b>{counts['inactive']}</b>\n"
+        f"❌ Failed: <b>{counts['failed']}</b>"
+    )
+    try:
+        await bot.edit_message_text(
+            chat_id=status_chat_id, message_id=status_message_id,
+            text=summary, parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        try:
+            await bot.send_message(status_chat_id, summary, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            logger.error("Failed to deliver unpin summary to admin %d: %r", status_chat_id, e)
+
+
+@router.message(Command("unpin"), StateFilter("*"))
+async def cmd_unpin(message: types.Message):
+    """Admin command: remove the last pinned broadcast from every user's chat."""
+    if not is_admin(message.from_user.id):
+        return
+
+    # Fetch IDs in a SHORT DB session, then close before any network work.
+    async with get_db_session() as session:
+        rows = (await session.execute(select(User.telegram_id))).scalars().all()
+    telegram_ids = list(rows)
+
+    if not telegram_ids:
+        await message.answer("⚠️ No registered users to unpin for.")
+        return
+
+    status_msg = await message.answer(
+        f"📌 <b>Unpin started</b>\n\n"
+        f"👥 Target: <b>{len(telegram_ids)}</b> users\n"
+        f"⏳ Running in background — this message updates with progress.",
+        parse_mode=ParseMode.HTML,
+    )
+
+    from app.utils import spawn_tracked
+    spawn_tracked(
+        _run_unpin_all(
+            message.bot, telegram_ids,
+            status_msg.chat.id, status_msg.message_id,
+        ),
+        name=f"unpin-{len(telegram_ids)}-users",
+    )
