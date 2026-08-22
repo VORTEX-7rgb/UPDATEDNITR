@@ -267,10 +267,18 @@ async def cmd_attendance(message: types.Message):
         user.id, "attendance_refresh", cooldown_seconds=COOLDOWN_ATTENDANCE_REFRESH
     )
     if not allowed:
-        await message.answer(
-            f"⏳ You just refreshed attendance. Please wait {wait}s before trying again.",
-            parse_mode=ParseMode.HTML,
-        )
+        cached = await _load_summary(user.id)
+        if cached:
+            await message.answer(
+                _list_text(cached, f"⏳ Synced just now. Next live refresh in {wait}s."),
+                reply_markup=_kb_viewing(cached),
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await message.answer(
+                f"⏳ You just refreshed attendance. Please wait {wait}s before trying again.",
+                parse_mode=ParseMode.HTML,
+            )
         return
 
     cached = await _load_summary(user.id)

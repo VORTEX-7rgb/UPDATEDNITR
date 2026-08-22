@@ -19,6 +19,7 @@ IST = ZoneInfo("Asia/Kolkata")
 
 
 class Config:
+    IST: ZoneInfo = IST
     BOT_TOKEN = os.getenv("BOT_TOKEN", "")
     NITRIS_BASE_URL = os.getenv("NITRIS_BASE_URL", "https://eapplication.nitrkl.ac.in")
     DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:5432/collegeclaw")
