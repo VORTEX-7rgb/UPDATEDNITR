@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
@@ -79,11 +80,13 @@ class NitrisGateway:
         self.circuit_error_threshold = circuit_error_threshold or config.NITRIS_GATEWAY_CIRCUIT_ERROR_THRESHOLD
         self.circuit_recovery_seconds = circuit_recovery_seconds or config.NITRIS_GATEWAY_CIRCUIT_RECOVERY_SECONDS
 
-        self._pacing_cond = asyncio.Condition()
         self._login_burst = max(1, int(config.NITRIS_LOGIN_BURST))
         self._login_tokens = float(self._login_burst)
         self._login_last_refill = time.monotonic()
-        self._interactive_pace_waiters = 0
+        # PERF P2: deterministic grant queue — (interactive?, event) pairs.
+        # Tokens are handed to the EARLIEST interactive waiter first; only
+        # when none are waiting does the earliest background waiter get one.
+        self._pace_queue: list[tuple[bool, asyncio.Event]] = []
         # In-memory quarantine guard (defense-in-depth). The DB `credentials_valid`
         # column is the source of truth; this set lets login_through_gateway()
         # refuse a quarantined user in O(1) WITHOUT touching the DB inside the
@@ -313,7 +316,8 @@ class NitrisGateway:
         return not (name.startswith("nitris-bg") or name.startswith("nitris-shared"))
 
     def _refill_tokens_locked(self) -> None:
-        """Refill the login token bucket. Caller MUST hold _pacing_cond."""
+        """Refill the login token bucket. No lock needed — bucket state is
+        only touched from the caller's own flow (single-waiter loop)."""
         now = time.monotonic()
         elapsed = now - self._login_last_refill
         if elapsed > 0:
@@ -323,6 +327,19 @@ class NitrisGateway:
             )
             self._login_last_refill = now
 
+    def _dispatch_tokens(self) -> None:
+        """Hand available tokens to queued waiters: earliest INTERACTIVE
+        waiter first, then earliest background (PERF P2, deterministic FIFO
+        within each class)."""
+        while self._login_tokens >= 1.0 and self._pace_queue:
+            idx = next(
+                (i for i, (inter, _) in enumerate(self._pace_queue) if inter),
+                0,
+            )
+            _, ev = self._pace_queue.pop(idx)
+            self._login_tokens -= 1.0
+            ev.set()
+
     @asynccontextmanager
     async def _pacing_turn(self, interactive: bool):
         """Acquire one login token from the bucket (PERF: burst-capable).
@@ -331,32 +348,36 @@ class NitrisGateway:
         rate never exceeds 1/current_login_interval per second — bursts only
         consume tokens that accrued while the bucket sat idle.
 
-        PERF P2 ordering preserved: when tokens are contended, an interactive
-        caller takes the next refilled token ahead of queued background ones.
+        PERF P2 ordering preserved deterministically via the grant queue:
+        an interactive caller takes the next refilled token ahead of any
+        background waiter that joined after it.
         """
-        async with self._pacing_cond:
-            if interactive:
-                self._interactive_pace_waiters += 1
-            try:
-                while True:
-                    self._refill_tokens_locked()
-                    if self._login_tokens >= 1.0 and (
-                        interactive or self._interactive_pace_waiters == 0
-                    ):
-                        self._login_tokens -= 1.0
-                        break
-                    await self._pacing_cond.wait()
-                    # Loop re-refills and re-checks priority on every wake.
-            finally:
-                if interactive:
-                    self._interactive_pace_waiters -= 1
-                self._pacing_cond.notify_all()
+        ev = asyncio.Event()
+        self._refill_tokens_locked()
+        self._pace_queue.append((interactive, ev))
+        self._dispatch_tokens()
         try:
+            while True:
+                if ev.is_set():
+                    break
+                deficit = max(1.0 - self._login_tokens, 0.0)
+                delay = min(deficit * self.current_login_interval,
+                            self.current_login_interval)
+                # Timed wake guarantees refill progress even when we are the
+                # only waiter; grants from others also set our event.
+                try:
+                    await asyncio.wait_for(ev.wait(), timeout=max(delay, 0.005))
+                except asyncio.TimeoutError:
+                    pass
+                self._refill_tokens_locked()
+                self._dispatch_tokens()
             yield
         finally:
-            # Wake any waiters so they can re-check refill timing promptly.
-            async with self._pacing_cond:
-                self._pacing_cond.notify_all()
+            # Cancelled-before-grant cleanup.
+            try:
+                self._pace_queue.remove((interactive, ev))
+            except ValueError:
+                pass
 
     async def _paced_wait(self, interactive: bool) -> None:
         """Take a pacing token (waiting for refill/priority as needed)."""

@@ -92,6 +92,11 @@ async def test_p2_interactive_logins_jump_queued_background():
 
     await prime()  # first login never paces — primes last_login_time
 
+    # Force contention: drain the bucket so every login below must wait for
+    # refills — this is where P2 ordering actually matters.
+    gw._login_tokens = 0.0
+    gw._login_last_refill = time.monotonic()
+
     t_bg1 = _bg(do_login("bg1"))
     await asyncio.sleep(0.02)
     t_bg2 = _bg(do_login("bg2"))          # queued behind bg1 as background
@@ -100,11 +105,13 @@ async def test_p2_interactive_logins_jump_queued_background():
 
     await asyncio.gather(t_bg1, t_bg2, t_tap)
 
-    assert finished[0] == "bg1"
-    assert finished[1] == "tap", (
-        f"interactive tap must jump the queued background login, got {finished}"
+    # STRICT priority: the interactive tap takes the very first refilled
+    # token even though both background logins queued before it. Background
+    # work then drains in arrival order.
+    assert finished[0] == "tap", (
+        f"interactive tap must beat queued background logins, got {finished}"
     )
-    assert finished[2] == "bg2"
+    assert finished[1:] == ["bg1", "bg2"]
     assert client.login.await_count == 4
     assert gw.metrics.active_requests == 0
 

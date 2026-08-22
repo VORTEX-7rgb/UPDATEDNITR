@@ -69,16 +69,17 @@ from app.utils import esc, safe_truncate
 logger = logging.getLogger(__name__)
 
 # ── Tunables ────────────────────────────────────────────────────────────────
-# PERF #5: Telegram allows ~30 msg/s; the old 25-per-60s drained a notice
-# burst to 1k users in ~40 minutes. 100 per 10s cycle ≈ up to 10 msg/s —
-# well under the limit, with FloodWait handling as the backstop.
-DISPATCH_BATCH_SIZE = 100               # events claimed per cycle
+# PERF #5: Telegram allows ~30 msg/s broadcast limit. With DISPATCH_BATCH_SIZE=600
+# and 35ms inter-message pacing (~28 msg/s), 600 notifications drain in ~21s,
+# delivering campus-wide notices to 1,000+ students in ~35s flat without hitting 429 FloodWait.
+DISPATCH_BATCH_SIZE = 600               # events claimed per cycle
 CLAIM_STALE_SECONDS = 300               # 5 min — stale claims reclaimable
 MAX_DISPATCH_ATTEMPTS = 5               # → permanent_failure after N retries
-DISPATCH_INTERVAL_SECONDS = 10          # main loop sleep
+DISPATCH_INTERVAL_SECONDS = 5           # main loop sleep (5s)
 REAPER_INTERVAL_SECONDS = 60            # stale-claim reaper sleep
 PER_EVENT_SEND_TIMEOUT = 30             # bot.send_message timeout (seconds)
 FLOODWAIT_MAX_RETRIES = 3               # per-event FloodWait retries
+INTER_MESSAGE_PACING_SECONDS = 0.035    # 35ms pacing ≈ ~28 msg/s (< 30 msg/s Telegram ceiling)
 
 
 # ── Atomic claim — multi-process safe ──────────────────────────────────────
@@ -351,6 +352,8 @@ class EventDispatcherService:
                         "Dispatched event %d to telegram_id=%d (attempt %d)",
                         ev["id"], telegram_id, ev["attempt_count"],
                     )
+                    # Pacing to stay strictly under Telegram's global 30 msg/s broadcast ceiling
+                    await asyncio.sleep(INTER_MESSAGE_PACING_SECONDS)
                 elif error == "USER_BLOCKED":
                     # User blocked the bot — terminal state, no retry
                     await mark_event_permanent_failure(

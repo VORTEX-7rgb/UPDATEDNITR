@@ -110,6 +110,10 @@ async def test_gateway_login_pacing():
         max_concurrent=4,
         min_login_interval=0.05,  # 50ms interval
     )
+    # Token-bucket era: drain so the 3 logins consume REFILLED tokens —
+    # average rate ≤ 1/interval is the invariant, so gaps ≈ interval.
+    gw._login_tokens = 0.0
+    gw._login_last_refill = time.monotonic()
 
     login_times = []
 

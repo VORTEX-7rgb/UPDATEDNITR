@@ -142,6 +142,10 @@ async def test_m3_paced_login_does_not_starve_capacity():
     async with gw.acquire():
         await gw.login_through_gateway(client, "r", "p", user_id=1)
 
+    # Drain the token bucket so Login #2 MUST wait for a refill (~interval).
+    gw._login_tokens = 0.0
+    gw._login_last_refill = time.monotonic()
+
     # Login #2 must pace ~0.4s. While it waits, its slot must be RELEASED.
     a_done = {"flag": False}
 

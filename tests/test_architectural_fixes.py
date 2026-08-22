@@ -46,10 +46,17 @@ async def test_no_deadlock_at_max_workers():
 
 @pytest.mark.asyncio
 async def test_login_pacing_still_enforced():
-    """Login pacing interval is properly respected across sequential calls."""
+    """Login pacing interval is properly respected across sequential calls.
+    (Token-bucket era: bucket pre-drained so these two logins must consume
+    REFILLED tokens — average rate still ≤ 1/interval.)"""
     gw = NitrisGateway(max_concurrent=5, min_login_interval=0.1)
     mock_client = MagicMock()
     mock_client.login = AsyncMock()
+
+    # Drain so both logins depend on refills (burst would otherwise fire them
+    # back-to-back by design).
+    gw._login_tokens = 0.0
+    gw._login_last_refill = time.monotonic()
 
     t0 = time.monotonic()
     async with gw.acquire():
