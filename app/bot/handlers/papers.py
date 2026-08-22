@@ -283,6 +283,19 @@ async def handle_year_selected(callback: types.CallbackQuery, state: FSMContext)
     await surf.final(text, builder.as_markup())
 
 
+def _qp_nav_markup() -> types.InlineKeyboardMarkup:
+    """Post-delivery navigation (user contract: buttons after EVERY paper).
+    Reuses existing routed callbacks — zero new wiring."""
+    b = InlineKeyboardBuilder()
+    b.row(types.InlineKeyboardButton(
+        text="📚 Back to Papers", callback_data="qp_back_subjects",
+    ))
+    b.row(types.InlineKeyboardButton(
+        text="🏠 Dashboard", callback_data="inbox_back_dashboard",
+    ))
+    return b.as_markup()
+
+
 @router.callback_query(F.data.startswith("qp_dl_"))
 async def handle_paper_download(callback: types.CallbackQuery, state: FSMContext) -> None:
     if qpaper_registry.qpaper_service is None:
@@ -316,7 +329,15 @@ async def handle_paper_download(callback: types.CallbackQuery, state: FSMContext
         result: QPResult = await qpaper_registry.qpaper_service.deliver(
             cache_id, telegram_id, requester_user_id=requester_user_id,
         )
-        if not result.delivered:
+        if result.delivered:
+            # Receipt bubble with navigation — the PDF alone used to leave the
+            # student stranded with no way back to the menu.
+            await callback.message.answer(
+                ui_copy.QP_DROPPED,
+                reply_markup=_qp_nav_markup(),
+                parse_mode=ParseMode.HTML,
+            )
+        else:
             surf = Surface(await callback.message.answer("⚠️ Processing paper..."))
             await _present_qp_result(surf, result)
         return
@@ -490,6 +511,7 @@ async def handle_qp_download_all_year(callback: types.CallbackQuery, state: FSMC
         await status_msg.edit_text(
             "ℹ️ <b>No papers available</b> for any of your current subjects "
             f"in <b>{esc(selected_year)}</b>.",
+            reply_markup=_qp_nav_markup(),
             parse_mode=ParseMode.HTML,
         )
         return
@@ -535,12 +557,18 @@ async def handle_qp_download_all_year(callback: types.CallbackQuery, state: FSMC
         summary += "\n<b>Errors:</b>\n" + "\n".join(f"• {html.escape(e)}" for e in errors[:5])
         if len(errors) > 5:
             summary += f"\n... and {len(errors) - 5} more"
-    await status_msg.edit_text(summary, parse_mode=ParseMode.HTML)
+    await status_msg.edit_text(
+        summary,
+        reply_markup=_qp_nav_markup(),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def _present_qp_result(surf, result: QPResult) -> None:
     """Terminal render of a download attempt onto the SAME bubble."""
-    kb = ui_theme.footer_kb()
+    # User contract: EVERY terminal state carries Back-to-Papers + Dashboard
+    # so nobody is stranded after a paper (or a failure).
+    kb = _qp_nav_markup()
     try:
         if result.delivered:
             # File has landed in the chat; this bubble becomes the receipt.
