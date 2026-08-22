@@ -156,7 +156,7 @@ class FakeBot:
         self.send_error: Optional[Exception] = None
         self._counter = 0
 
-    async def send_document(self, chat_id: int, document: Any, caption: str = "", parse_mode: str = "HTML"):
+    async def send_document(self, chat_id: int, document: Any, caption: str = "", parse_mode: str = "HTML", reply_markup: Any = None):
         if self.upload_error and chat_id < 0:  # storage channel
             err = self.upload_error
             self.upload_error = None
@@ -709,3 +709,38 @@ async def test_no_pool_fallback_when_own_login_fails(qp_service, store, fake_bot
     assert store[21]["status"] == QPStatus.RETRYABLE_FAILURE.value
     assert res.error
 
+
+
+# ── PERF/UX: delivered PDFs carry Back-to-Papers + Dashboard buttons ────────
+
+
+@pytest.mark.asyncio
+async def test_delivered_document_carries_nav_markup(qp_service, store, fake_bot):
+    from types import SimpleNamespace as NS
+
+    captured: dict = {}
+
+    async def fake_send(**kwargs):
+        captured.update(kwargs)
+        return NS(document=NS(file_id="FID-123"))
+
+    fake_bot.send_document = fake_send
+
+    store[30] = {
+        "id": 30, "subject_code": "CS2001", "academic_year": "2024-25/Autumn",
+        "exam_type": "mid_sem", "portal_postback_target": "ctl00$x",
+        "telegram_file_id": "FID-cached",
+        "status": QPStatus.PAPER_AVAILABLE.value,
+        "not_available_until": None,
+        "file_kind": "pdf", "file_size_bytes": 1234,
+        "acquired_by": None, "acquired_at": None, "error_message": None,
+        "attempt_count": 1,
+    }
+
+    marker = object()  # sentinel nav markup
+    res = await qp_service.deliver(30, telegram_id=999, nav_markup=marker)
+
+    assert res.delivered is True
+    assert captured.get("reply_markup") is marker, (
+        "delivered PDF must carry the navigation keyboard"
+    )

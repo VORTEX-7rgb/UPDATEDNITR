@@ -328,6 +328,7 @@ async def handle_paper_download(callback: types.CallbackQuery, state: FSMContext
             pass
         result: QPResult = await qpaper_registry.qpaper_service.deliver(
             cache_id, telegram_id, requester_user_id=requester_user_id,
+            nav_markup=_qp_nav_markup(),
         )
         if result.delivered:
             # Receipt bubble with navigation — the PDF alone used to leave the
@@ -355,6 +356,7 @@ async def handle_paper_download(callback: types.CallbackQuery, state: FSMContext
     surf.poke_later(6.0, ui_copy.slow_note("acquiring"))
     result: QPResult = await qpaper_registry.qpaper_service.deliver(
         cache_id, telegram_id, requester_user_id=requester_user_id,
+        nav_markup=_qp_nav_markup(),
     )
     await _present_qp_result(surf, result)
 
@@ -524,9 +526,11 @@ async def handle_qp_download_all_year(callback: types.CallbackQuery, state: FSMC
     failed = 0
     errors: list[str] = []
 
+    nav = _qp_nav_markup()
     for i, cache_id in enumerate(cache_ids_to_deliver, start=1):
         result: QPResult = await qpaper_registry.qpaper_service.deliver(
             cache_id, telegram_id, requester_user_id=user_id,
+            nav_markup=nav,
         )
         if result.delivered:
             succeeded += 1
@@ -562,6 +566,21 @@ async def handle_qp_download_all_year(callback: types.CallbackQuery, state: FSMC
         reply_markup=_qp_nav_markup(),
         parse_mode=ParseMode.HTML,
     )
+
+    # ── Trailing navigation bubble (user contract) ─────────────────────
+    # The summary above edits the ORIGINAL status bubble, which sits ABOVE
+    # the whole PDF stream. This bubble lands BELOW the last document so the
+    # student always ends the delivery with Back-to-Papers/Dashboard buttons
+    # in thumb reach.
+    try:
+        await callback.message.answer(
+            f"📚 <b>{succeeded} paper(s) delivered</b> — {esc(selected_year)}\n"
+            f"<i>Use the buttons below to keep browsing.</i>",
+            reply_markup=_qp_nav_markup(),
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as nav_err:
+        logger.warning("Post-batch navigation bubble failed: %r", nav_err)
 
 
 async def _present_qp_result(surf, result: QPResult) -> None:

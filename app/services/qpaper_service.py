@@ -151,7 +151,8 @@ class QPaperService:
 
     # ── Public entry point ──────────────────────────────────────────
 
-    async def deliver(self, cache_id: int, telegram_id: int, requester_user_id: Optional[int] = None) -> QPResult:
+    async def deliver(self, cache_id: int, telegram_id: int, requester_user_id: Optional[int] = None,
+                      nav_markup: Optional[Any] = None) -> QPResult:
         """Deliver a paper to a Telegram user. Called by the bot QP handler.
 
         Args:
@@ -185,6 +186,7 @@ class QPaperService:
             return await self._deliver_cached(
                 cache_id, file_id, file_kind, telegram_id, sub_code, ac_year, ex_type, postback,
                 requester_user_id=requester_user_id,
+                nav_markup=nav_markup,
             )
         if status == QPStatus.PAPER_NOT_AVAILABLE.value:
             # PERMANENT negative cache — no TTL expiry, no re-check traffic.
@@ -195,6 +197,7 @@ class QPaperService:
         return await self._claim_or_wait_and_deliver(
             cache_id, telegram_id, sub_code, ac_year, ex_type, postback,
             requester_user_id=requester_user_id,
+            nav_markup=nav_markup,
         )
 
     # ── Cache read (short transaction) ──────────────────────────────
@@ -218,9 +221,11 @@ class QPaperService:
         telegram_id: int, sub_code: str, ac_year: str, ex_type: str,
         postback: Optional[str] = None,
         requester_user_id: Optional[int] = None,
+        nav_markup: Optional[Any] = None,
     ) -> QPResult:
         """Forward cached telegram_file_id to user. Bounded by delivery semaphore.
-        If file_id is invalid (e.g. from an old bot token), auto-recovers by re-acquiring."""
+        If file_id is invalid (e.g. from an old bot token), auto-recovers by re-acquiring.
+        nav_markup attaches Back-to-Papers/Dashboard buttons to the document."""
         async with self._deliver_sem:
             caption = _make_caption(sub_code, ac_year, ex_type)
             for attempt in range(DELIVERY_MAX_RETRIES):
@@ -230,6 +235,7 @@ class QPaperService:
                         document=file_id,
                         caption=caption,
                         parse_mode="HTML",
+                        reply_markup=nav_markup,
                     )
                     return QPResult(delivered=True, file_kind=file_kind)
                 except TelegramRetryAfter as e:
@@ -272,6 +278,7 @@ class QPaperService:
                         return await self._claim_or_wait_and_deliver(
                             cache_id, telegram_id, sub_code, ac_year, ex_type, postback,
                             requester_user_id=requester_user_id,
+                            nav_markup=nav_markup,
                         )
                     if "chat not found" in msg or "deactivated" in msg:
                         return QPResult(error="User account unavailable.")
@@ -287,6 +294,7 @@ class QPaperService:
         self, cache_id: int, telegram_id: int,
         sub_code: str, ac_year: str, ex_type: str, postback: str,
         requester_user_id: Optional[int] = None,
+        nav_markup: Optional[Any] = None,
     ) -> QPResult:
         """Attempt to atomically claim the row for acquisition. If someone else
         has it, wait + deliver when their acquisition completes."""
@@ -297,10 +305,12 @@ class QPaperService:
             return await self._acquire_and_deliver(
                 cache_id, telegram_id, job_id, sub_code, ac_year, ex_type, postback,
                 requester_user_id=requester_user_id,
+                nav_markup=nav_markup,
             )
         # Lost the race — wait for the other worker
         return await self._wait_and_deliver(
             cache_id, telegram_id, requester_user_id=requester_user_id,
+            nav_markup=nav_markup,
         )
 
     async def _claim_for_acquisition(self, cache_id: int, job_id: str) -> bool:
@@ -353,6 +363,7 @@ class QPaperService:
         self, cache_id: int, telegram_id: int, job_id: str,
         sub_code: str, ac_year: str, ex_type: str, postback: str,
         requester_user_id: Optional[int] = None,
+        nav_markup: Optional[Any] = None,
     ) -> QPResult:
         """Slow path — NITRIS download + Telegram upload. NO DB session held."""
         async with self._acquire_sem:
@@ -369,6 +380,7 @@ class QPaperService:
                 file_id, uploaded_to_user = await self._telegram_upload(
                     file_bytes, kind, sub_code, ac_year, ex_type,
                     fallback_chat_id=telegram_id,
+                    nav_markup=nav_markup,
                 )
                 # 3. Atomic state update → paper_available
                 await self._mark_available(cache_id, file_id, kind, len(file_bytes))
@@ -383,7 +395,8 @@ class QPaperService:
                 # 5. Otherwise (uploaded to storage channel), forward the cached
                 #    file_id to the user.
                 return await self._deliver_cached(
-                    cache_id, file_id, kind, telegram_id, sub_code, ac_year, ex_type
+                    cache_id, file_id, kind, telegram_id, sub_code, ac_year, ex_type,
+                    nav_markup=nav_markup,
                 )
             except PaperNotAvailableError as exc:
                 # NITRIS confirms no paper is uploaded -> PERMANENT negative.
@@ -431,6 +444,7 @@ class QPaperService:
     async def _wait_and_deliver(
         self, cache_id: int, telegram_id: int,
         requester_user_id: Optional[int] = None,
+        nav_markup: Optional[Any] = None,
     ) -> QPResult:
         """Poll cache status until terminal or timeout. Used when another worker
         has the row in fetch_in_progress state."""
@@ -453,6 +467,7 @@ class QPaperService:
                     cache_id, file_id, file_kind, telegram_id,
                     sub_code, ac_year, ex_type,
                     requester_user_id=requester_user_id,
+                    nav_markup=nav_markup,
                 )
             if status == QPStatus.PAPER_NOT_AVAILABLE.value:
                 return QPResult(not_available=True)
@@ -463,6 +478,7 @@ class QPaperService:
                 return await self._claim_or_wait_and_deliver(
                     cache_id, telegram_id, sub_code, ac_year, ex_type, snap[6],
                     requester_user_id=requester_user_id,
+                    nav_markup=nav_markup,
                 )
             # fetch_in_progress — keep polling
         return QPResult(
@@ -571,6 +587,7 @@ class QPaperService:
         self, file_bytes: bytes, kind: str,
         sub_code: str, ac_year: str, ex_type: str,
         fallback_chat_id: Optional[int] = None,
+        nav_markup: Optional[Any] = None,
     ) -> Tuple[str, bool]:
         """Upload the paper ONCE to the bot's private QP storage channel.
 
@@ -617,6 +634,7 @@ class QPaperService:
             document=document,
             caption=_make_caption(sub_code, ac_year, ex_type),
             parse_mode="HTML",
+            reply_markup=nav_markup,
         )
         if not msg.document or not msg.document.file_id:
             raise RuntimeError("Telegram upload returned no document file_id.")
