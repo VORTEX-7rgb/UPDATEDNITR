@@ -108,7 +108,8 @@ async def handle_subject_selected(callback: types.CallbackQuery, state: FSMConte
 
     builder.row(types.InlineKeyboardButton(text="◀️ Back to Subjects", callback_data="qp_back_subjects"))
 
-    await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode=ParseMode.HTML)
+    # PERF F1: not-modified-safe render (re-taps of the same year list are free).
+    await show(callback.message, text, reply_markup=builder.as_markup())
 
 
 @router.callback_query(F.data == "qp_back_subjects")
@@ -319,6 +320,14 @@ async def handle_paper_download(callback: types.CallbackQuery, state: FSMContext
             pass
         return
 
+    # PERF F3 — ACK FIRST: the spinner dies immediately, BEFORE any DB work.
+    # Neutral text since cached-vs-cold isn't known yet; the later specific
+    # answers were second answers on the same query (Telegram ignores those).
+    try:
+        await callback.answer("⚡ Opening paper…")
+    except Exception:
+        pass
+
     # Resolve the requesting student so cold acquisitions run under THEIR OWN
     # NITRIS account (own-creds-first policy; pool is fallback only).
     requester_user_id = None
@@ -333,10 +342,6 @@ async def handle_paper_download(callback: types.CallbackQuery, state: FSMContext
     is_cached = snap and snap[0] == "paper_available" and snap[1]
 
     if is_cached:
-        try:
-            await callback.answer("🚀 Delivering cached paper...")
-        except Exception:
-            pass
         result: QPResult = await qpaper_registry.qpaper_service.deliver(
             cache_id, telegram_id, requester_user_id=requester_user_id,
             nav_markup=_qp_nav_markup(),
@@ -353,11 +358,6 @@ async def handle_paper_download(callback: types.CallbackQuery, state: FSMContext
             surf = Surface(await callback.message.answer("⚠️ Processing paper..."))
             await _present_qp_result(surf, result)
         return
-
-    try:
-        await callback.answer("⏳ Fetching from portal...")
-    except Exception:
-        pass
 
     # ONE bubble: acquisition progress -> slow-poke persona -> receipt/error.
     surf = Surface(await callback.message.answer(
@@ -389,7 +389,8 @@ async def handle_qp_download_all_prompt(callback: types.CallbackQuery, state: FS
         builder.row(types.InlineKeyboardButton(text=label, callback_data=f"qp_dlall_yr_{code}"))
 
     builder.row(types.InlineKeyboardButton(text="◀️ Back to Subjects", callback_data="qp_back_subjects"))
-    await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode=ParseMode.HTML)
+    # PERF F1: not-modified-safe render.
+    await show(callback.message, text, reply_markup=builder.as_markup())
 
 
 @router.callback_query(F.data.startswith("qp_dlall_yr_"))
@@ -674,7 +675,8 @@ async def handle_qp_search_prompt(callback: types.CallbackQuery, state: FSMConte
     builder = InlineKeyboardBuilder()
     builder.row(types.InlineKeyboardButton(text="🚫 Cancel Search", callback_data="qp_back_subjects"))
 
-    await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode=ParseMode.HTML)
+    # PERF F1: not-modified-safe render (re-opening search prompt is free).
+    await show(callback.message, text, reply_markup=builder.as_markup())
 
 
 @router.message(QuestionPaperFlow.waiting_for_search_query, F.text)

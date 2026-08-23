@@ -23,6 +23,7 @@ from app.services.now_next_service import (
     WEEKDAY_LABELS,
 )
 from app.utils import esc
+from app.ui.surface import show
 
 logger = logging.getLogger(__name__)
 
@@ -243,10 +244,8 @@ async def cb_now_next(callback: types.CallbackQuery):
     except Exception:
         pass
     text, kb = await _handle_now_next_display(callback.from_user.id)
-    try:
-        await callback.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
-    except Exception:
-        await callback.message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    # PERF F1: not-modified-safe render with fresh-send fallback.
+    await show(callback.message, text, reply_markup=kb)
 
 
 @router.callback_query(F.data == "tt_view_full")
@@ -258,10 +257,7 @@ async def cb_view_full(callback: types.CallbackQuery):
         pass
     today_weekday = min(datetime.now(IST).weekday(), 5)
     text, kb = await _handle_day_display(callback.from_user.id, today_weekday)
-    try:
-        await callback.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
-    except Exception:
-        await callback.message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    await show(callback.message, text, reply_markup=kb)
 
 
 @router.callback_query(F.data.startswith("tt_day_"))
@@ -277,10 +273,9 @@ async def cb_select_day(callback: types.CallbackQuery):
         weekday = 0
 
     text, kb = await _handle_day_display(callback.from_user.id, weekday)
-    try:
-        await callback.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
-    except Exception:
-        pass
+    # PERF F1: not-modified-safe render + fallback. The old silent
+    # `except: pass` left the OLD day on screen with zero user feedback.
+    await show(callback.message, text, reply_markup=kb)
 
 
 @router.callback_query(F.data == "tt_sync")
@@ -296,7 +291,7 @@ async def cb_sync(callback: types.CallbackQuery):
         callback.message.message_id,
     )
     try:
-        await callback.message.edit_text(text, parse_mode=ParseMode.HTML)
+        await show(callback.message, text)
     except Exception:
         await callback.message.answer(text, parse_mode=ParseMode.HTML)
 

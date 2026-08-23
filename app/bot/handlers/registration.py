@@ -24,6 +24,7 @@ from app.config import IST
 from app.bot.fsm import Registration, Deregistration, InboxSearch
 from app.bot.common import get_dashboard_keyboard
 from app.ui.alive import render_dashboard
+from app.ui.surface import show
 from app.bot.handlers.attendance import fetch_attendance_for_callback
 from app.bot.handlers.papers import cmd_papers
 
@@ -64,6 +65,19 @@ async def cmd_forgot(message: types.Message, state: FSMContext):
 @router.message(CommandStart(), StateFilter("*"))
 async def cmd_start(message: types.Message, state: FSMContext):
     telegram_id = message.from_user.id
+
+    # PERF F6: fire-and-forget "typing…" so the chat shows activity while the
+    # dashboard renders (4-7 DB queries). Zero added latency — it never blocks.
+    from app.utils import spawn_tracked
+
+    async def _typing():
+        try:
+            await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
+        except Exception:
+            pass
+
+    spawn_tracked(_typing(), name="start-typing")
+
     async with get_db_session() as session:
         stmt = select(User).options(selectinload(User.sync_state)).where(User.telegram_id == telegram_id)
         result = await session.execute(stmt)
@@ -487,12 +501,10 @@ async def handle_cancel_deregister(callback: types.CallbackQuery, state: FSMCont
     except Exception as e:
         logger.warning("Failed to answer cancel_deregister callback: %r", e)
 
-    try:
-        await callback.message.delete()
-    except Exception:
-        pass
-
-    await callback.message.answer("🚫 <b>Deregistration cancelled.</b> Returning to your Dashboard.", parse_mode=ParseMode.HTML)
+    # PERF F4: collapse to ONE edit of the tapped bubble. The old flow was
+    # delete → fresh "cancelled" send → fresh dashboard send = 4 serial
+    # Telegram round-trips for a CANCEL tap; now it's answer + edit = 2.
+    header = "🚫 <b>Deregistration cancelled.</b>\n\n"
 
     telegram_id = callback.from_user.id
     async with get_db_session() as session:
@@ -511,9 +523,14 @@ async def handle_cancel_deregister(callback: types.CallbackQuery, state: FSMCont
             text = await render_dashboard(session, user, unread_count)
 
     if user:
-        await callback.message.answer(text, reply_markup=get_dashboard_keyboard(unread_count), parse_mode=ParseMode.HTML)
+        await show(
+            callback.message,
+            header + text,
+            reply_markup=get_dashboard_keyboard(unread_count),
+            parse_mode=ParseMode.HTML,
+        )
     else:
-        await callback.message.answer("⚠️ You are not registered. Please use /start to register.")
+        await show(callback.message, "⚠️ You are not registered. Please use /start to register.")
 
 
 @router.callback_query(F.data == "confirm_deregister")
@@ -534,12 +551,15 @@ async def handle_confirm_deregister(callback: types.CallbackQuery, state: FSMCon
                 if user:
                     await user_repo.delete_user(user.id)
 
+        # PERF F4: one EDIT of the tapped bubble instead of
+        # delete() + fresh send (2 RTTs → 1).
         try:
-            await callback.message.delete()
+            await show(
+                callback.message,
+                "✅ <b>Account successfully deregistered.</b> All your records have been purged from our databases.",
+            )
         except Exception:
             pass
-
-        await callback.message.answer("✅ <b>Account successfully deregistered.</b> All your records have been purged from our databases.", parse_mode=ParseMode.HTML)
     except Exception as e:
         logger.error("Failed to delete user %d from callback: %r", telegram_id, e)
         await callback.message.answer("❌ A database error occurred during deregistration. Please try again.")

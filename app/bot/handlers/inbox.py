@@ -16,7 +16,16 @@ from sqlalchemy.orm import selectinload
 from app.config import config
 from app.db.database import get_db_session
 from app.db.models import User, InboxMessage
-from app.utils import esc, safe_truncate
+from app.utils import esc, safe_truncate, spawn_tracked
+
+
+async def _ack_later(callback: types.CallbackQuery, text: str | None = None, **kw) -> None:
+    """Fire-and-forget callback ack. The toast RTT overlaps with the render
+    work instead of serializing ahead of it (PERF F5). All failures swallowed."""
+    try:
+        await callback.answer(text, **kw)
+    except Exception:
+        pass
 from app.ui import copy, theme
 from app.ui.surface import show, Surface
 
@@ -194,10 +203,9 @@ async def handle_inbox_list(callback: types.CallbackQuery, state: FSMContext) ->
         except ValueError:
             page = 1
 
-    try:
-        await callback.answer()
-    except Exception:
-        pass
+    # PERF F5: ack concurrently — the toast RTT overlaps with the DB/render
+    # work below instead of gating it.
+    spawn_tracked(_ack_later(callback), name="ack-inbox-list")
 
     async with get_db_session() as session:
         from app.db.repositories.user_repository import UserRepository
@@ -220,11 +228,13 @@ async def handle_inbox_list(callback: types.CallbackQuery, state: FSMContext) ->
         builder.row(types.InlineKeyboardButton(text="🔄 Refresh Now", callback_data="inbox_refresh"))
         builder.row(types.InlineKeyboardButton(text="🏠 Back to Dashboard", callback_data="inbox_back_dashboard"))
 
-        await callback.message.edit_text(
+        # PERF F1: not-modified-safe render (repeat taps cost 0 dead RTTs and
+        # can never detonate into the global error handler's alert popup).
+        await show(
+            callback.message,
             "📩 <b>Your NITRIS Inbox</b>\n\n"
             "Your inbox is currently empty. Run a sync or click Refresh below to retrieve messages from the portal.",
             reply_markup=builder.as_markup(),
-            parse_mode=ParseMode.HTML
         )
         return
 
@@ -271,11 +281,8 @@ async def handle_inbox_list(callback: types.CallbackQuery, state: FSMContext) ->
         types.InlineKeyboardButton(text="🏠 Back to Dashboard", callback_data="inbox_back_dashboard")
     )
 
-    await callback.message.edit_text(
-        text,
-        reply_markup=builder.as_markup(),
-        parse_mode=ParseMode.HTML
-    )
+    # PERF F1: not-modified-safe render (page re-taps are idempotent now).
+    await show(callback.message, text, reply_markup=builder.as_markup())
 
 
 @router.callback_query(F.data == "inbox_refresh")
@@ -510,10 +517,8 @@ async def handle_message_detail(callback: types.CallbackQuery, state: FSMContext
             pass
         return
 
-    try:
-        await callback.answer()
-    except Exception:
-        pass
+    # PERF F5: ack concurrently with the DB read + card render below.
+    spawn_tracked(_ack_later(callback), name="ack-msg-detail")
 
     async with get_db_session() as session:
         from app.db.repositories.user_repository import UserRepository
@@ -601,8 +606,19 @@ async def handle_download_attachment(callback: types.CallbackQuery, state: FSMCo
         cooldown_seconds=COOLDOWN_ATTACHMENT_DOWNLOAD,
     )
     if not allowed:
+        # NOTE: the callback was already answered with the "Processing…"
+        # toast above — Telegram IGNORES a second answer on the same query,
+        # so this alert would never display. Make the cooldown visible with
+        # a lightweight fresh bubble instead.
         try:
             await callback.answer(f"⏳ Please wait {wait}s before retrying.", show_alert=True)
+        except Exception:
+            pass
+        try:
+            await callback.message.answer(
+                f"⏳ <b>Cooldown:</b> please wait {wait}s before downloading this attachment again.",
+                parse_mode=ParseMode.HTML,
+            )
         except Exception:
             pass
         return
