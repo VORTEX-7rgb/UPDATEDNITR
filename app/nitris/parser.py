@@ -13,6 +13,7 @@ from app.nitris.constants import (
     HTML_PARSER,
 )
 from app.nitris.exceptions import AttendanceParseError, HomeParseError, InboxParseError
+from app.nitris.examination_parser import parse_question_papers_html, QuestionPaperRecord
 
 logger = logging.getLogger(__name__)
 
