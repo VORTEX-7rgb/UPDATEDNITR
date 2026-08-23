@@ -33,6 +33,9 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
+    # Widen alembic_version.version_num to prevent VARCHAR(32) truncation on long revision IDs (e.g. 0007_inbox_cache_and_attachments)
+    op.execute("ALTER TABLE alembic_version ALTER COLUMN version_num TYPE varchar(256);")
+
     # ---------------------------------------------------------------- users
     op.create_table(
         "users",
