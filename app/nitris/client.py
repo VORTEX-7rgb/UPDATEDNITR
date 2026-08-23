@@ -327,6 +327,12 @@ class NitrisClient:
                             time.monotonic() + _RESOLVED_URL_TTL_SECONDS,
                         )
                 if ok and subpage_href:
+                    # Touch on success: slide expiration window forward for active users
+                    _resolved_url_cache[key] = (
+                        launcher_href,
+                        subpage_href,
+                        time.monotonic() + _RESOLVED_URL_TTL_SECONDS,
+                    )
                     logger.info(
                         "Resolved %s via cached launcher URL (fast-path)",
                         module_name,
@@ -500,6 +506,25 @@ class NitrisClient:
             return httpx.URL(entry[1])
         return None
 
+    @staticmethod
+    def _touch_resolved_url(module_name: str, subpage_keyword: str) -> None:
+        """Extend a cached URL pair's lifetime after a successful direct use.
+
+        PERF FIX: the URL cache TTL was shorter than the session pool TTL, and
+        fast-path hits never refreshed their entry — so an ACTIVE student's
+        cached URL expired mid-session and every few taps silently degraded to
+        the full launcher-visit resolve (+1 portal round-trip). Touching on
+        success keeps continuously-used entries permanently warm while idle
+        entries still age out naturally."""
+        key = _cache_key(module_name, subpage_keyword)
+        entry = _resolved_url_cache.get(key)
+        if entry is not None:
+            _resolved_url_cache[key] = (
+                entry[0],
+                entry[1],
+                time.monotonic() + _RESOLVED_URL_TTL_SECONDS,
+            )
+
     async def _fetch_attendance_page(self, url: httpx.URL) -> tuple[str, str]:
         """Step-1 GET of the attendance page with auth/context validation.
 
@@ -607,6 +632,12 @@ class NitrisClient:
         if url is not None:
             try:
                 html, url_str = await self._fetch_attendance_page(url)
+                # PERF: keep the entry warm — successful use extends its life
+                # so active students never fall off the fast-path cliff.
+                self._touch_resolved_url(
+                    ATTENDANCE_MODULE_NAME,
+                    ATTENDANCE_SIDEBAR_LINK_KEYWORD,
+                )
                 logger.info("[step0] Fast-path hit — no launcher visit needed")
             except InvalidContextError:
                 logger.info(

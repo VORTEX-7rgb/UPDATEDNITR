@@ -170,7 +170,10 @@ class Config:
     # Per-request timeout applied to every portal call.
     NITRIS_HTTP_TIMEOUT_SECONDS = float(os.getenv("NITRIS_HTTP_TIMEOUT_SECONDS", "30.0"))
     # Resolved module-URL cache lifetime (skips Home.aspx discovery GET).
-    NITRIS_URL_CACHE_TTL_SECONDS = float(os.getenv("NITRIS_URL_CACHE_TTL_SECONDS", "600"))
+    # Aligned to the session-pool TTL (1800s): a live session should never
+    # outlive its resolved URLs, and fast-path hits refresh the entry on every
+    # successful scrape anyway.
+    NITRIS_URL_CACHE_TTL_SECONDS = float(os.getenv("NITRIS_URL_CACHE_TTL_SECONDS", "1800"))
     # Year/session probe-hint lifetime (skip redundant dropdown probes).
     NITRIS_PROBE_HINT_TTL_SECONDS = float(os.getenv("NITRIS_PROBE_HINT_TTL_SECONDS", "2700"))
 

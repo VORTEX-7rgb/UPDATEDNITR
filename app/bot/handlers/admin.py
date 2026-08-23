@@ -520,7 +520,7 @@ def _default_prewarm_year() -> str:
 
 def _normalize_year_token(token: str) -> str | None:
     """Liberal year resolution — accepts ANY of:
-      2425A · 2024-25/Autumn · 2024-25/autumn · 2025-2026 · 2025-26
+      2526A · 2425A · 2324A · 2526 · 2425 · 2024-25/Autumn · 2024-25/autumn · 2025-2026 · 2025-26
       2025-26 spring · 2025-2026/spring
     Missing season defaults to Autumn (product rule). Returns the canonical
     'YYYY-YY/Season' string, or None when nothing in YEAR_MAP matches."""
@@ -529,11 +529,22 @@ def _normalize_year_token(token: str) -> str | None:
     t = (token or "").strip().replace("_", " ")
     if not t:
         return None
-    if t in YEAR_MAP:                       # exact code ("2425A")
-        return YEAR_MAP[t]
+    if t.upper() in YEAR_MAP:
+        return YEAR_MAP[t.upper()]
     by_val = {v.lower(): v for v in YEAR_MAP.values()}
-    if t.lower() in by_val:                 # exact value
+    if t.lower() in by_val:
         return by_val[t.lower()]
+
+    m_short = re.match(r"^(\d{2})(\d{2})([asAS])?$", t)
+    if m_short:
+        y1_short, y2_short, s_short = m_short.group(1), m_short.group(2), m_short.group(3)
+        season = "Spring" if s_short and s_short.upper() == "S" else "Autumn"
+        cand = f"20{y1_short}-{y2_short}/{season}"
+        if cand.lower() in by_val:
+            return by_val[cand.lower()]
+        for v in YEAR_MAP.values():
+            if f"20{y1_short}-{y2_short}".lower() in v.lower():
+                return v
 
     m = re.match(r"^(\d{4})-(\d{2,4})(?:[/ ](autumn|spring))?$", t, re.I)
     if not m:
