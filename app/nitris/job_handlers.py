@@ -229,6 +229,12 @@ async def handle_inbox_refresh(job: NitrisJob) -> dict:
     # ── Step 2: NITRIS work — pooled authenticated session (PERF P1) ──
     try:
         from app.nitris.session_pool import with_pooled_session
+        from app.workers.sync_worker import wait_for_db_recovery
+
+        # PERF (lease hygiene): if the DB is down, wait HERE — before taking a
+        # scarce pooled portal session. Waiting inside the lease used to pin
+        # an authenticated NITRIS session for minutes while looping on SELECT 1.
+        await wait_for_db_recovery(f"Inbox-Refresh-{user_id}")
 
         async def _inbox_work(client, password):
             scraped, detail_cache, existing_by_id = await prepare_inbox_sync(client, user_id)
@@ -295,6 +301,11 @@ async def handle_sync_onboarding(job: NitrisJob) -> dict:
     timetable_scrape_error: Optional[str] = None
     try:
         from app.nitris.session_pool import with_pooled_session
+        from app.workers.sync_worker import wait_for_db_recovery
+
+        # PERF (lease hygiene): DB-recovery wait happens BEFORE the portal
+        # session lease — never hold a pooled NITRIS session during a DB outage.
+        await wait_for_db_recovery(f"Onboarding-{user_id}")
 
         async def _inbox_work(client, password):
             return await prepare_inbox_sync(client, user_id)
@@ -313,7 +324,8 @@ async def handle_sync_onboarding(job: NitrisJob) -> dict:
         async def _tt_work(client, password):
             from app.nitris.parser import parse_home_page
             home_html = await client.fetch_home_html()
-            return parse_home_page(home_html).timetable
+            parsed = await asyncio.to_thread(parse_home_page, home_html)
+            return parsed.timetable
 
         try:
             slots = await with_pooled_session(
@@ -766,7 +778,7 @@ async def handle_qp_search(job: NitrisJob) -> dict:
                 html_autumn = await client.fetch_question_papers(
                     academic_year=f"{ay}/Autumn", subject_query=query
                 )
-                records.extend(parse_question_papers_html(html_autumn))
+                records.extend(await asyncio.to_thread(parse_question_papers_html, html_autumn))
             except Exception as e_autumn:
                 logger.warning("Autumn search failed: %r", e_autumn)
 
@@ -774,7 +786,7 @@ async def handle_qp_search(job: NitrisJob) -> dict:
                 html_spring = await client.fetch_question_papers(
                     academic_year=f"{ay}/Spring", subject_query=query
                 )
-                records.extend(parse_question_papers_html(html_spring))
+                records.extend(await asyncio.to_thread(parse_question_papers_html, html_spring))
             except Exception as e_spring:
                 logger.warning("Spring search failed: %r", e_spring)
             return records

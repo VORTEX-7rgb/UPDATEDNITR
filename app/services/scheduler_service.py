@@ -260,6 +260,7 @@ async def run_scheduler_loop(bot=None) -> None:
     )
 
     while True:
+        claimed: list = []  # defined for the drain-mode check on early-failure paths
         try:
             await wait_for_db_recovery("Scheduler")
 
@@ -361,6 +362,15 @@ async def run_scheduler_loop(bot=None) -> None:
         except Exception as e:
             logger.error("Scheduler cycle error: %r", e)
             await asyncio.sleep(10)  # Brief pause before retrying
+            continue
+
+        # PERF (drain-mode): a FULL batch means more due work is likely
+        # waiting — re-loop almost immediately so a cold-start / post-downtime
+        # backlog (thousands of due rows) drains at claim speed instead of
+        # one batch per 30s. Idle cost is unchanged (empty batch → full sleep).
+        if len(claimed) >= config.SCHEDULER_BATCH_SIZE:
+            await asyncio.sleep(0.5)
+            continue
 
         await asyncio.sleep(poll_interval)
 

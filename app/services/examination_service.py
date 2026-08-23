@@ -249,7 +249,10 @@ class ExaminationService:
             html = await client.fetch_question_papers(
                 academic_year=academic_year, subject_query=cleaned_subject_code
             )
-            return parse_question_papers_html(html)
+            import asyncio
+            # Offload BS4 parsing to a worker thread — large ASP.NET pages
+            # must never be tree-built on the event loop inside a gateway slot.
+            return await asyncio.to_thread(parse_question_papers_html, html)
         finally:
             if local_client:
                 await client.close()

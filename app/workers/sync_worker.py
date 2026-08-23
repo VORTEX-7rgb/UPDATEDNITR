@@ -86,14 +86,19 @@ async def prepare_inbox_sync(client, user_id):
     from app.config import config
     from app.nitris.exceptions import SessionExpiredError
 
-    # 1. Fetch + parse the raw messages list (network, no DB session held)
+    # 1. Fetch + parse the raw messages list (network, no DB session held).
+    #    Parsing runs in a worker thread — the AllMessages page is ~700KB+ of
+    #    ASP.NET HTML and a full BS4 tree build would stall the event loop.
     list_html = await client.fetch_messages_list()
-    scraped_messages = parse_messages_list_html(list_html)
+    scraped_messages = await asyncio.to_thread(parse_messages_list_html, list_html)
     if not scraped_messages:
         logger.info("No messages found on portal for user_id=%s", user_id)
         return [], {}, {}
 
-    await wait_for_db_recovery(f"Sync-Inbox-{user_id}")
+    # NOTE: wait_for_db_recovery is deliberately NOT called here anymore.
+    # Job handlers pre-wait BEFORE acquiring the pooled portal session
+    # (lease hygiene) — waiting inside this callback used to pin an
+    # authenticated NITRIS session for minutes during a DB outage.
 
     # 2. Short DB read of already-known portal messages. This connection is
     #    released before any slow network I/O below.
@@ -125,7 +130,8 @@ async def prepare_inbox_sync(client, user_id):
         async with detail_sem:
             try:
                 detail_html = await client.fetch_message_detail(msg["token"])
-                return (msg["portal_message_id"], parse_message_detail_html(detail_html))
+                parsed = await asyncio.to_thread(parse_message_detail_html, detail_html)
+                return (msg["portal_message_id"], parsed)
             except SessionExpiredError:
                 # Propagate — caller must re-login, not silently swallow
                 raise

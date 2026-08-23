@@ -73,8 +73,21 @@ async def get_attendance_data(
         try:
             # PERF: prefer_key enables the year/session hint cache — repeat
             # scrapes for the same student skip the dropdown probe postbacks.
-            html = await client.fetch_attendance(prefer_key=username)
-            return parse_attendance_html(html)
+            # PERF (single-parse): fetch_attendance trial-parses each candidate
+            # page to validate it; when parsed_out is supplied, the winning
+            # page's AttendanceResult comes back pre-computed so we never
+            # re-parse the same HTML twice.
+            parsed_holder: dict = {}
+            html = await client.fetch_attendance(
+                prefer_key=username, parsed_out=parsed_holder
+            )
+            pre_parsed = parsed_holder.get("result")
+            if pre_parsed is not None:
+                return pre_parsed
+            # Fallback (mocked clients / alternate paths): parse here, but in a
+            # worker thread — BS4 over 100KB+ of ASP.NET HTML must never run
+            # on the event loop.
+            return await asyncio.to_thread(parse_attendance_html, html)
         except SessionExpiredError:
             # Session dropped mid-workflow — re-login and retry the WHOLE workflow.
             if relogins_used >= MAX_RELOGINS_PER_SYNC:

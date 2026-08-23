@@ -167,13 +167,18 @@ class FakeSession:
                             count += 1
                 return FakeResult([], rowcount=count)
 
-            # 6. Telegram ID lookup
+            # 6. Telegram ID lookup — single (legacy) and batched forms
             if "SELECT telegram_id FROM users" in sql:
                 uid = params.get("id")
                 tid = self.user_store.get(uid)
                 if tid is not None:
                     return FakeResult([(tid,)])
                 return FakeResult([])
+
+            if "FROM users" in sql and "ANY(:ids)" in sql:
+                ids = params.get("ids") or []
+                rows = [(uid, self.user_store[uid]) for uid in ids if uid in self.user_store]
+                return FakeResult(rows)
 
             return FakeResult([])
 

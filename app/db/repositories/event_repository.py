@@ -33,24 +33,29 @@ class EventRepository:
         return event
 
     async def has_message_event(self, user_id: int, event_type: str, message_id: int) -> bool:
-        """Check if an event of this type for this message_id already exists (prevents duplicate notification events)."""
+        """Check if an event of this type for this message_id already exists (prevents duplicate notification events).
+
+        PERF: set-based SQL EXISTS via the JSONB expression index
+        (idx_events_user_type_msgid) — the old implementation loaded EVERY
+        event row for (user, type) into Python and scanned payloads in a
+        loop, growing linearly with lifetime notifications and running inside
+        the advisory-locked inbox persist transaction.
+        """
         stmt = (
-            select(Event)
+            select(Event.id)
             .where(
                 Event.user_id == user_id,
                 Event.event_type == event_type,
+                # Portable JSON text accessor (renders ->> on Postgres).
+                Event.payload_json["message_id"].as_string() == str(message_id),
             )
+            .limit(1)
         )
         try:
             result = await self.session.execute(stmt)
-            scalars = result.scalars() if hasattr(result, "scalars") else None
-            events = scalars.all() if (scalars and hasattr(scalars, "all") and callable(scalars.all)) else []
-            for ev in events:
-                if getattr(ev, "payload_json", None) and ev.payload_json.get("message_id") == message_id:
-                    return True
+            return result.scalar_one_or_none() is not None
         except Exception:
-            pass
-        return False
+            return False
 
     async def get_unsent_events(self, limit: int = 100) -> list[Event]:
         """Fetch unsent events up to a specified limit, sorted by creation date."""

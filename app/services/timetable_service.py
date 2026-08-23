@@ -68,9 +68,11 @@ async def fetch_timetable_html_via_gateway(
     from app.nitris.parser import parse_home_page
 
     async def _work(client, _password):
+        import asyncio
         html = await client.fetch_home_html()
-        slots = parse_home_page(html).timetable
-        return html, slots
+        # Offload BS4 parsing to a worker thread (Home.aspx is ~700KB+).
+        parsed = await asyncio.to_thread(parse_home_page, html)
+        return html, parsed.timetable
 
     # PERF P1: pooled authenticated session — warm runs skip the paced login.
     return await with_pooled_session(

@@ -288,16 +288,24 @@ async def process_password(message: types.Message, state: FSMContext):
         # schedules) can never suppress an admin notification for a real
         # registration.
         if is_new_user and roll:
+            # PERF: fire-and-forget — admin notifications (sequential Telegram
+            # sends, ~0.3-1s per admin) must not sit inline between a student's
+            # successful verification and their dashboard render. The notifier
+            # itself never raises; spawn_tracked surfaces crashes to logs.
             try:
                 from app.bot.handlers.admin_notify import notify_admins_of_new_user
-                await notify_admins_of_new_user(
-                    message.bot,
-                    roll,
-                    student_name=getattr(data, "student_info", None),
+                from app.utils import spawn_tracked
+                spawn_tracked(
+                    notify_admins_of_new_user(
+                        message.bot,
+                        roll,
+                        student_name=getattr(data, "student_info", None),
+                    ),
+                    name=f"admin-notify-{roll}",
                 )
             except Exception as notify_err:
                 logger.warning(
-                    "Admin new-user notification failed (registration succeeded for roll=%s): %r",
+                    "Admin new-user notification failed to schedule (registration succeeded for roll=%s): %r",
                     roll, notify_err,
                 )
 

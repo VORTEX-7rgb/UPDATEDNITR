@@ -6,6 +6,7 @@ import os
 import re
 import time
 import urllib.parse
+import asyncio
 from datetime import datetime
 from typing import Optional
 
@@ -233,8 +234,12 @@ class NitrisClient:
                     logger.info("Session finalized via home page")
                     # PERF (Waste #2): mine module launcher URLs from the Home
                     # HTML we are already holding — saves a discovery GET later.
+                    # Offloaded to a thread: BS4 over Home.aspx (~700KB+) is
+                    # pure CPU and must not stall the event loop mid-login.
                     try:
-                        self._seed_module_urls_from_home(resp.text)
+                        await asyncio.to_thread(
+                            self._seed_module_urls_from_home, resp.text
+                        )
                     except Exception as seed_err:
                         logger.debug("URL seeding skipped: %r", seed_err)
 
@@ -311,7 +316,9 @@ class NitrisClient:
                 if ok and not subpage_href:
                     # Partial entry (launcher seeded from a login-time Home
                     # visit) — resolve the sub-page link now and complete it.
-                    found = self._find_subpage_link(l_resp.text, subpage_keyword)
+                    found = await asyncio.to_thread(
+                        self._find_subpage_link, l_resp.text, subpage_keyword
+                    )
                     if found:
                         subpage_href = found
                         _resolved_url_cache[key] = (
@@ -355,7 +362,9 @@ class NitrisClient:
         # Step 2: Find the module launcher URL in the home sidebar by display name.
         # The sidebar shows module names as link text and launcher URLs as href.
         # The launcher URL is: /nitris/Student/Default.aspx?AppID=<...>&AppName=<...>
-        launcher_url = self._find_launcher_by_module_name(home_html, module_name)
+        launcher_url = await asyncio.to_thread(
+            self._find_launcher_by_module_name, home_html, module_name
+        )
         if not launcher_url:
             raise AttendanceWorkflowError(
                 f"Could not find module launcher URL for '{module_name}' in Home.aspx sidebar. "
@@ -385,7 +394,9 @@ class NitrisClient:
             )
 
         # Step 4: Find the sub-page URL in the module launcher's sidebar.
-        subpage_url = self._find_subpage_link(launcher_html, subpage_keyword)
+        subpage_url = await asyncio.to_thread(
+            self._find_subpage_link, launcher_html, subpage_keyword
+        )
         if not subpage_url:
             raise AttendanceWorkflowError(
                 f"Could not find sub-page URL containing '{subpage_keyword}' "
@@ -478,7 +489,13 @@ class NitrisClient:
 
     # ── Attendance Workflow ─────────────────────────────────────
 
-    async def fetch_attendance(self, semester: Optional[str] = None, *, prefer_key: Optional[str] = None) -> str:
+    async def fetch_attendance(
+        self,
+        semester: Optional[str] = None,
+        *,
+        prefer_key: Optional[str] = None,
+        parsed_out: Optional[dict] = None,
+    ) -> str:
         """Execute the full ASP.NET postback workflow to get the attendance table HTML.
 
         Permanent fix: the attendance sub-page URL is resolved DYNAMICALLY from
@@ -491,12 +508,19 @@ class NitrisClient:
         FIRST, skipping the usual probe round-trips. Wrong hints fall through
         to the normal probe order automatically.
 
+        PERF (single-parse): step 4 trial-parses each candidate page to prove
+        it has valid rows. When `parsed_out` (a dict) is supplied, that already-
+        computed AttendanceResult for the WINNING page is stored under
+        parsed_out["result"] so the caller never has to re-parse the same HTML.
+        Callers that omit parsed_out behave exactly as before.
+
         Args:
             semester: Optional preferred semester type ("Spring" or "Autumn").
                 If None (default), the current semester is auto-detected from
                 today's date — Jul-Dec = Autumn, Jan-Jun = Spring. This
                 prevents the bot from returning last-year's attendance data.
             prefer_key: Optional stable per-user key for the hint cache.
+            parsed_out: Optional dict receiving {"result": AttendanceResult}.
 
         Returns:
             Final HTML page containing the attendance table.
@@ -580,8 +604,8 @@ class NitrisClient:
         # Step 2: POST semester selection — SKIPPED when the page already has
         # the desired semester selected server-side (PERF Waste #3: saves a
         # full postback round-trip on every scrape).
-        form_state = extract_form_fields(html)
-        sem_options = extract_dropdown_options(html, CTL_SEMESTER)
+        form_state = await asyncio.to_thread(extract_form_fields, html)
+        sem_options = await asyncio.to_thread(extract_dropdown_options, html, CTL_SEMESTER)
         sem_value = self._pick_option(sem_options, semester, fallback_idx=-1)
         current_sem = form_state.get(CTL_SEMESTER)
         if current_sem and sem_value and current_sem == sem_value:
@@ -602,8 +626,8 @@ class NitrisClient:
             )
 
         # Step 3: Iterate through academic years (latest first)
-        form_state = extract_form_fields(html)
-        year_options = extract_dropdown_options(html, CTL_ACADEMIC_YEAR)
+        form_state = await asyncio.to_thread(extract_form_fields, html)
+        year_options = await asyncio.to_thread(extract_dropdown_options, html, CTL_ACADEMIC_YEAR)
         if not year_options:
             raise AttendanceWorkflowError(
                 "Academic year dropdown not populated after step 2."
@@ -621,15 +645,26 @@ class NitrisClient:
         for year_value, year_text in _prioritize(valid_years, hint_year):
             logger.info("[step3] Probing year: %s (%s)", year_value, year_text)
             try:
-                temp_html = await submit_postback(
-                    self.client,
-                    url,
-                    form_state,
-                    CTL_ACADEMIC_YEAR,
-                    {CTL_ACADEMIC_YEAR: year_value},
-                    f"step3_year_{year_value}",
-                    self._debug,
-                )
+                if form_state.get(CTL_ACADEMIC_YEAR) == year_value:
+                    # PERF (skip-if-selected): the page already has this exact
+                    # academic year selected server-side (typical on a warm
+                    # hint-hit) — the HTML in hand IS that year's response.
+                    # Saves a full postback round-trip (~0.5-1.5s).
+                    temp_html = html
+                    logger.info(
+                        "[step3] Year %s already selected server-side — skipping postback",
+                        year_text,
+                    )
+                else:
+                    temp_html = await submit_postback(
+                        self.client,
+                        url,
+                        form_state,
+                        CTL_ACADEMIC_YEAR,
+                        {CTL_ACADEMIC_YEAR: year_value},
+                        f"step3_year_{year_value}",
+                        self._debug,
+                    )
 
                 if not has_session_dropdown(temp_html):
                     logger.warning(
@@ -657,8 +692,8 @@ class NitrisClient:
 
         # Step 4: Iterate through sessions — prefer the current semester type, then
         # sort remaining by recency (latest first) to avoid picking stale sessions.
-        form_state = extract_form_fields(html)
-        session_options = extract_dropdown_options(html, CTL_SESSION)
+        form_state = await asyncio.to_thread(extract_form_fields, html)
+        session_options = await asyncio.to_thread(extract_dropdown_options, html, CTL_SESSION)
         if not session_options:
             raise AttendanceWorkflowError(
                 "Session dropdown not populated after valid year selected."
@@ -676,15 +711,25 @@ class NitrisClient:
         for session_value, session_text in _prioritize(prioritized_sessions, hint_session):
             logger.info("[step4] Probing session: %s (%s)", session_value, session_text)
             try:
-                temp_html = await submit_postback(
-                    self.client,
-                    url,
-                    form_state,
-                    CTL_SESSION,
-                    {CTL_SESSION: session_value},
-                    f"step4_session_{session_value}",
-                    self._debug,
-                )
+                if form_state.get(CTL_SESSION) == session_value:
+                    # PERF (skip-if-selected): server already has this exact
+                    # session selected — skip the postback round-trip and
+                    # validate the HTML we are holding directly.
+                    temp_html = html
+                    logger.info(
+                        "[step4] Session %s already selected server-side — skipping postback",
+                        session_text,
+                    )
+                else:
+                    temp_html = await submit_postback(
+                        self.client,
+                        url,
+                        form_state,
+                        CTL_SESSION,
+                        {CTL_SESSION: session_value},
+                        f"step4_session_{session_value}",
+                        self._debug,
+                    )
 
                 if not has_attendance_table(temp_html):
                     logger.warning(
@@ -699,15 +744,14 @@ class NitrisClient:
                         )
                     continue
 
-                # Try parsing the table to ensure valid rows exist
+                # Try parsing the table to ensure valid rows exist. The parse
+                # runs in a worker thread — a full BS4 tree build over ~100KB+
+                # of ASP.NET HTML must never stall the event loop while we
+                # hold a scarce gateway slot. (PERF: event-loop offload)
                 try:
-                    parse_attendance_html(temp_html)
-                    final_html = temp_html
-                    selected_session_value = session_value
-                    logger.info(
-                        "[step4] Successfully selected session: %s", session_text
+                    parsed_candidate = await asyncio.to_thread(
+                        parse_attendance_html, temp_html
                     )
-                    break
                 except AttendanceParseError as e:
                     logger.warning(
                         "[step4] Session %s has table but parse failed: %s. Skipping.",
@@ -725,6 +769,17 @@ class NitrisClient:
                             f"failed_session_parse_{session_value}",
                         )
                     continue
+
+                # Single-parse contract: hand the already-computed result to
+                # the caller so the winning page is parsed exactly ONCE.
+                if parsed_out is not None:
+                    parsed_out["result"] = parsed_candidate
+                final_html = temp_html
+                selected_session_value = session_value
+                logger.info(
+                    "[step4] Successfully selected session: %s", session_text
+                )
+                break
 
             except InvalidContextError:
                 logger.warning(
@@ -945,7 +1000,7 @@ class NitrisClient:
         """
         # 1. Fetch current list page to get fresh __VIEWSTATE and form fields
         list_html = await self.fetch_messages_list()
-        form_state = extract_form_fields(list_html)
+        form_state = await asyncio.to_thread(extract_form_fields, list_html)
 
         # 2. Build postback payload
         payload = {
@@ -1110,8 +1165,10 @@ class NitrisClient:
             )
 
         # Step 2: Select Academic Year dropdown
-        form_state = extract_form_fields(html)
-        year_options = extract_dropdown_options(html, CTL_QP_ACADEMIC_YEAR)
+        form_state = await asyncio.to_thread(extract_form_fields, html)
+        year_options = await asyncio.to_thread(
+            extract_dropdown_options, html, CTL_QP_ACADEMIC_YEAR
+        )
 
         selected_year_value = self._pick_option(
             year_options, academic_year, fallback_idx=0
@@ -1136,7 +1193,7 @@ class NitrisClient:
         )
 
         # Step 3: Populate Subject Search and trigger Search Button
-        form_state = extract_form_fields(html)
+        form_state = await asyncio.to_thread(extract_form_fields, html)
 
         form_updates = {
             CTL_QP_ACADEMIC_YEAR: selected_year_value,
@@ -1144,7 +1201,9 @@ class NitrisClient:
         }
 
         if department_value:
-            dept_options = extract_dropdown_options(html, CTL_QP_DEPARTMENT)
+            dept_options = await asyncio.to_thread(
+                extract_dropdown_options, html, CTL_QP_DEPARTMENT
+            )
             selected_dept = self._pick_option(
                 dept_options, department_value, fallback_idx=-1
             )
@@ -1186,7 +1245,7 @@ class NitrisClient:
         search_html = await self.fetch_question_papers(
             academic_year=academic_year, subject_query=subject_query
         )
-        form_state = extract_form_fields(search_html)
+        form_state = await asyncio.to_thread(extract_form_fields, search_html)
 
         # 2. Build postback payload
         payload = {

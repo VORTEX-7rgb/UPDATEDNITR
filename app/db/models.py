@@ -3,7 +3,7 @@
 from datetime import datetime, time
 from typing import Optional, Any
 from enum import Enum
-from sqlalchemy import BigInteger, String, ForeignKey, DateTime, Boolean, Index, JSON, Integer, Text, UniqueConstraint, SmallInteger, Time
+from sqlalchemy import BigInteger, String, ForeignKey, DateTime, Boolean, Index, JSON, Integer, Text, UniqueConstraint, SmallInteger, Time, text
 
 class EventType(str, Enum):
     NEW_SUBJECT_ADDED = "new_subject_added"
@@ -218,6 +218,15 @@ Index("idx_events_created_at", Event.created_at)
 Index("idx_events_event_type", Event.event_type)
 # PERF #4: composite index for briefing COUNT/group-by + absence payload fetch
 Index("idx_events_user_type_created", Event.user_id, Event.event_type, Event.created_at)
+# PERF: duplicate-notification guard (has_message_event) — expression index so
+# the JSONB message_id lookup is an index hit instead of a per-user row scan
+# inside the advisory-locked inbox persist transaction.
+Index(
+    "idx_events_user_type_msgid",
+    Event.user_id,
+    Event.event_type,
+    text("(payload_json->>'message_id')"),
+)
 
 
 class InboxMessage(Base):
@@ -280,6 +289,15 @@ class InboxMessage(Base):
 # Stable unique constraint per user + message, plus non-unique token lookup index
 Index("idx_inbox_user_portal_msg_id", InboxMessage.user_id, InboxMessage.portal_message_id, unique=True)
 Index("ix_inbox_messages_user_token", InboxMessage.user_id, InboxMessage.token)
+# PERF: inbox list pages ORDER BY sent_on DESC per user — composite covers the
+# sort instead of a per-query sort of all the user's rows.
+Index("idx_inbox_user_sent_on", InboxMessage.user_id, InboxMessage.sent_on.desc())
+# PERF: unread badge count + mark_all_as_read target scan (partial — tiny).
+Index(
+    "idx_inbox_user_unread",
+    InboxMessage.user_id,
+    postgresql_where=InboxMessage.is_read == False,
+)
 
 
 class AttachmentCache(Base):

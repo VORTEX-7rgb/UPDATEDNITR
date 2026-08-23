@@ -101,6 +101,10 @@ class NitrisJobQueue:
 
         self._job_event = asyncio.Event()
         self._handlers: Dict[str, HandlerFunc] = {}
+        # PERF: inspect.signature() is computed ONCE per handler at
+        # registration instead of on EVERY job execution (it is surprisingly
+        # expensive and this runs for all ~thousands of jobs/hour).
+        self._handler_min_params: Dict[str, int] = {}
         self._in_flight: Dict[str, asyncio.Future] = {}
         self._workers: list[asyncio.Task] = []
         self._lock = asyncio.Lock()
@@ -110,6 +114,10 @@ class NitrisJobQueue:
     def register_handler(self, job_type: str, handler: HandlerFunc) -> None:
         """Register an async handler for a given job type."""
         self._handlers[job_type] = handler
+        try:
+            self._handler_min_params[job_type] = len(inspect.signature(handler).parameters)
+        except (TypeError, ValueError):
+            self._handler_min_params[job_type] = 2  # assume payload+bot contract
 
     def handler(self, job_type: str):
         """Decorator to register a handler for a job type."""
@@ -274,8 +282,15 @@ class NitrisJobQueue:
             except Exception:
                 pass
 
-            sig = inspect.signature(handler)
-            if len(sig.parameters) >= 2:
+            min_params = self._handler_min_params.get(job.job_type)
+            if min_params is None:
+                # Handler swapped in without register_handler — compute once now.
+                try:
+                    min_params = len(inspect.signature(handler).parameters)
+                except (TypeError, ValueError):
+                    min_params = 2
+                self._handler_min_params[job.job_type] = min_params
+            if min_params >= 2:
                 result = await handler(job.payload, self._bot)
             else:
                 result = await handler(job)
@@ -295,9 +310,21 @@ class NitrisJobQueue:
             except Exception:
                 pass
 
-            # Phase 6.4: Retry with exponential backoff for transient errors
-            from app.nitris.exceptions import LoginError, CredentialsQuarantinedError
-            is_permanent = isinstance(e, (LoginError, CredentialsQuarantinedError))
+            # Phase 6.4: Retry with exponential backoff for transient errors.
+            # PERF (retry-storm fix): LoginUnavailableError is deliberately
+            # PERMANENT here. client.login() already retries the portal 3×
+            # internally while HOLDING a gateway slot; queue-level retries on
+            # top of that used to multiply into ~9 full login sequences per
+            # operation during an outage. Work-phase transient errors (timeouts,
+            # workflow faults after a successful login) still retry normally.
+            from app.nitris.exceptions import (
+                LoginError,
+                CredentialsQuarantinedError,
+                LoginUnavailableError,
+            )
+            is_permanent = isinstance(
+                e, (LoginError, CredentialsQuarantinedError, LoginUnavailableError)
+            )
             attempt_count = job.payload.get("_retry_attempt", 0)
             if is_permanent or attempt_count >= config.JOB_MAX_RETRIES:
                 logger.error(

@@ -229,13 +229,27 @@ async def reap_stale_claims(
 async def get_telegram_id_for_user(
     session_factory: async_sessionmaker[AsyncSession], user_id: int
 ) -> Optional[int]:
-    """Look up the telegram_id for a user_id. Short DB session."""
+    """Look up the telegram_id for a single user_id. Short DB session."""
     async with session_factory() as session:
         result = await session.execute(text(
             "SELECT telegram_id FROM users WHERE id = :id"
         ), {"id": user_id})
         row = result.first()
         return int(row[0]) if row else None
+
+
+async def get_telegram_ids_for_users(
+    session_factory: async_sessionmaker[AsyncSession], user_ids: list[int]
+) -> dict[int, int]:
+    """Batched telegram_id lookup — ONE query per dispatch cycle instead of
+    one per event (up to 600 extra round-trips/cycle under backlog)."""
+    if not user_ids:
+        return {}
+    async with session_factory() as session:
+        result = await session.execute(text(
+            "SELECT id, telegram_id FROM users WHERE id = ANY(:ids)"
+        ), {"ids": user_ids})
+        return {int(r[0]): int(r[1]) for r in result.fetchall()}
 
 
 # ── Main dispatcher ────────────────────────────────────────────────────────
@@ -289,14 +303,23 @@ class EventDispatcherService:
             await asyncio.sleep(REAPER_INTERVAL_SECONDS)
 
     async def run_forever(self) -> None:
-        """Main dispatcher loop. Call via asyncio.create_task from main.py."""
+        """Main dispatcher loop. Call via asyncio.create_task from main.py.
+
+        PERF (drain-mode): when a cycle dispatched at least one event, loop
+        IMMEDIATELY instead of sleeping the full interval — backlogs drain
+        continuously (N×5s → near-zero) while idle cost stays one cheap
+        claim query per 5s.
+        """
         logger.info("EventDispatcherService started (worker_id=%s)", self.worker_id)
         self.start_reaper()
         while not self._stop:
             try:
-                await self._dispatch_once()
+                dispatched = await self._dispatch_once()
             except Exception as e:
                 logger.error("Dispatcher cycle failed: %r", e)
+                dispatched = 0
+            if dispatched > 0 and not self._stop:
+                continue
             await asyncio.sleep(DISPATCH_INTERVAL_SECONDS)
 
     async def stop(self) -> None:
@@ -313,13 +336,15 @@ class EventDispatcherService:
 
         logger.info("Dispatcher claimed %d event(s)", len(claimed))
 
+        # PERF: ONE batched telegram_id lookup for the whole cycle.
+        telegram_ids = await get_telegram_ids_for_users(
+            self.session_factory, list({ev["user_id"] for ev in claimed})
+        )
+
         sent_count = 0
         for ev in claimed:
             try:
-                # Look up telegram_id (short DB session, not held during send)
-                telegram_id = await get_telegram_id_for_user(
-                    self.session_factory, ev["user_id"]
-                )
+                telegram_id = telegram_ids.get(ev["user_id"])
                 if telegram_id is None:
                     # User was deleted (orphaned event) — mark permanent
                     await mark_event_permanent_failure(
