@@ -549,8 +549,13 @@ class AttachmentService:
         """Poll DB while acquiring worker downloads and uploads."""
         deadline = asyncio.get_event_loop().time() + self.wait_timeout
 
+        # PERF (check-first): poll IMMEDIATELY on entry, then between checks —
+        # mirrors the QP service fix. A download that finished an instant ago
+        # must not cost the waiter a full poll interval of dead waiting.
+        poll_delay = 0.0
         while asyncio.get_event_loop().time() < deadline:
-            await asyncio.sleep(self.wait_poll_interval)
+            await asyncio.sleep(poll_delay)
+            poll_delay = self.wait_poll_interval
             status, file_id, file_kind = await self._read_cache(cache_id)
 
             if status == AttachmentStatus.AVAILABLE.value and file_id:

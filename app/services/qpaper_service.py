@@ -451,8 +451,15 @@ class QPaperService:
         has the row in fetch_in_progress state."""
         start = time.monotonic()
         last_status = None
+        # PERF (check-first): poll IMMEDIATELY on entry, then between checks.
+        # The old sleep-first ordering stalled every waiter a full interval
+        # even when the acquiring worker had already finished. First sleep is
+        # a bare yield so terminal states set in the microseconds since the
+        # caller's claim attempt are caught without any dead waiting.
+        poll_delay = 0.0
         while time.monotonic() - start < WAIT_TIMEOUT_SEC:
-            await asyncio.sleep(WAIT_POLL_INTERVAL_SEC)
+            await asyncio.sleep(poll_delay)
+            poll_delay = WAIT_POLL_INTERVAL_SEC
             snap = await self._read_cache(cache_id)
             if snap is None:
                 return QPResult(error="Record disappeared during wait.")

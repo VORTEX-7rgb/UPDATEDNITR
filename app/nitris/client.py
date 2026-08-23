@@ -489,72 +489,24 @@ class NitrisClient:
 
     # ── Attendance Workflow ─────────────────────────────────────
 
-    async def fetch_attendance(
-        self,
-        semester: Optional[str] = None,
-        *,
-        prefer_key: Optional[str] = None,
-        parsed_out: Optional[dict] = None,
-    ) -> str:
-        """Execute the full ASP.NET postback workflow to get the attendance table HTML.
+    @staticmethod
+    def _peek_cached_subpage_url(module_name: str, subpage_keyword: str) -> Optional[httpx.URL]:
+        """Return the cached sub-page URL WITHOUT any HTTP traffic, if a FRESH
+        full (launcher+subpage) entry exists. Used by the attendance fast-path:
+        the direct GET either works (saving the launcher round-trip) or raises
+        InvalidContextError, which triggers the full self-healing resolve."""
+        entry = _resolved_url_cache.get(_cache_key(module_name, subpage_keyword))
+        if entry is not None and entry[1] and entry[2] > time.monotonic():
+            return httpx.URL(entry[1])
+        return None
 
-        Permanent fix: the attendance sub-page URL is resolved DYNAMICALLY from
-        the Attendance module's sidebar at runtime, so it survives NITRIS's
-        periodic token rotation. The module launcher is visited FIRST to set
-        Session['CurrentModule'], which prevents 503 errors.
+    async def _fetch_attendance_page(self, url: httpx.URL) -> tuple[str, str]:
+        """Step-1 GET of the attendance page with auth/context validation.
 
-        PERF: `prefer_key` (typically the student's roll number) enables a
-        year/session hint cache — the values that worked last time are tried
-        FIRST, skipping the usual probe round-trips. Wrong hints fall through
-        to the normal probe order automatically.
-
-        PERF (single-parse): step 4 trial-parses each candidate page to prove
-        it has valid rows. When `parsed_out` (a dict) is supplied, that already-
-        computed AttendanceResult for the WINNING page is stored under
-        parsed_out["result"] so the caller never has to re-parse the same HTML.
-        Callers that omit parsed_out behave exactly as before.
-
-        Args:
-            semester: Optional preferred semester type ("Spring" or "Autumn").
-                If None (default), the current semester is auto-detected from
-                today's date — Jul-Dec = Autumn, Jan-Jun = Spring. This
-                prevents the bot from returning last-year's attendance data.
-            prefer_key: Optional stable per-user key for the hint cache.
-            parsed_out: Optional dict receiving {"result": AttendanceResult}.
-
-        Returns:
-            Final HTML page containing the attendance table.
+        Returns (html, url_str). Raises SessionExpiredError (auth drop),
+        InvalidContextError (module context lost — safe to fall back to the
+        full module resolve), or AttendanceWorkflowError for anything else.
         """
-        # Step 0: Resolve the attendance URL dynamically from the module sidebar.
-        # This visits Home.aspx → Attendance module launcher → finds ClassAttendance
-        # link with current valid tokens. Permanent fix for stale-URL 503s.
-        url = await self._resolve_module_subpage_url(
-            ATTENDANCE_MODULE_NAME,
-            ATTENDANCE_SIDEBAR_LINK_KEYWORD,
-        )
-        url_str = str(url)
-
-        # Determine the preferred semester based on today's date if not specified.
-        if semester is None:
-            semester = self._current_semester_type()
-        logger.info("Using semester preference: %s", semester)
-
-        hint_year = hint_session = None
-        if prefer_key:
-            _h = _probe_hints.get(prefer_key)
-            if _h and _h[2] > time.monotonic():
-                hint_year, hint_session, _ = _h
-                logger.info(
-                    "[hint] %s → year=%r session=%r (trying these first)",
-                    prefer_key, hint_year, hint_session,
-                )
-            else:
-                _probe_hints.pop(prefer_key, None)
-
-        selected_year_value: Optional[str] = None
-        selected_session_value: Optional[str] = None
-
-        # Step 1: GET initial attendance page
         logger.info("[step1] GET attendance page")
         headers = {"Referer": f"{self.base_url}/nitris/Student/Home/Home.aspx"}
         # follow_redirects=False to catch auth drops and 503 errors explicitly
@@ -593,13 +545,103 @@ class NitrisClient:
                 {
                     "step": "step1_initial",
                     "status": 200,
-                    "url": url_str,
+                    "url": str(url),
                     "response_size": len(html),
                     "viewstate_present": "__VIEWSTATE" in html,
                     "table_found": ATTENDANCE_TABLE_ID in html,
                 },
                 "step1_initial",
             )
+
+        return html, str(url)
+
+    async def fetch_attendance(
+        self,
+        semester: Optional[str] = None,
+        *,
+        prefer_key: Optional[str] = None,
+        parsed_out: Optional[dict] = None,
+    ) -> str:
+        """Execute the full ASP.NET postback workflow to get the attendance table HTML.
+
+        Permanent fix: the attendance sub-page URL is resolved DYNAMICALLY from
+        the Attendance module's sidebar at runtime, so it survives NITRIS's
+        periodic token rotation. A FRESH cached URL is tried directly first
+        (fast-path — no launcher visit); only on context loss (503) does the
+        launcher visit run to re-set Session['CurrentModule'].
+
+        PERF: `prefer_key` (typically the student's roll number) enables a
+        year/session hint cache — the values that worked last time are tried
+        FIRST, skipping the usual probe round-trips. Wrong hints fall through
+        to the normal probe order automatically.
+
+        PERF (single-parse): step 4 trial-parses each candidate page to prove
+        it has valid rows. When `parsed_out` (a dict) is supplied, that already-
+        computed AttendanceResult for the WINNING page is stored under
+        parsed_out["result"] so the caller never has to re-parse the same HTML.
+        Callers that omit parsed_out behave exactly as before.
+
+        Args:
+            semester: Optional preferred semester type ("Spring" or "Autumn").
+                If None (default), the current semester is auto-detected from
+                today's date — Jul-Dec = Autumn, Jan-Jun = Spring. This
+                prevents the bot from returning last-year's attendance data.
+            prefer_key: Optional stable per-user key for the hint cache.
+            parsed_out: Optional dict receiving {"result": AttendanceResult}.
+
+        Returns:
+            Final HTML page containing the attendance table.
+        """
+        # ── Step 0: Obtain the attendance page ──
+        # PERF (fast-path): when we hold a FRESH full (launcher+subpage) URL
+        # pair, try the attendance GET DIRECTLY — skipping the launcher visit
+        # that normally re-sets Server['CurrentModule'] (~0.5-1s per scrape).
+        # If the portal lost module context, the GET raises InvalidContextError
+        # and we fall back to the full self-healing resolve exactly once.
+        # SessionExpiredError intentionally propagates (no retry can fix it).
+        url = self._peek_cached_subpage_url(
+            ATTENDANCE_MODULE_NAME,
+            ATTENDANCE_SIDEBAR_LINK_KEYWORD,
+        )
+        html: Optional[str] = None
+        if url is not None:
+            try:
+                html, url_str = await self._fetch_attendance_page(url)
+                logger.info("[step0] Fast-path hit — no launcher visit needed")
+            except InvalidContextError:
+                logger.info(
+                    "[step0] Module context lost on fast-path — full resolve fallback"
+                )
+
+        if html is None:
+            url = await self._resolve_module_subpage_url(
+                ATTENDANCE_MODULE_NAME,
+                ATTENDANCE_SIDEBAR_LINK_KEYWORD,
+            )
+            html, url_str = await self._fetch_attendance_page(url)
+
+        # Determine the preferred semester based on today's date if not specified.
+        if semester is None:
+            semester = self._current_semester_type()
+        logger.info("Using semester preference: %s", semester)
+
+        hint_year = hint_session = None
+        if prefer_key:
+            _h = _probe_hints.get(prefer_key)
+            if _h and _h[2] > time.monotonic():
+                hint_year, hint_session, _ = _h
+                logger.info(
+                    "[hint] %s → year=%r session=%r (trying these first)",
+                    prefer_key, hint_year, hint_session,
+                )
+            else:
+                _probe_hints.pop(prefer_key, None)
+
+        selected_year_value: Optional[str] = None
+        selected_session_value: Optional[str] = None
+
+        # (Step 1 — the initial GET + auth/context validation — now lives in
+        # _fetch_attendance_page(), invoked above via the fast-path/fallback.)
 
         # Step 2: POST semester selection — SKIPPED when the page already has
         # the desired semester selected server-side (PERF Waste #3: saves a
