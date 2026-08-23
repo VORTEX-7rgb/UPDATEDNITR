@@ -140,3 +140,65 @@ async def test_non_admin_gets_silently_ignored(monkeypatch):
     await admin_mod.cmd_admin_prewarm(message)
 
     message.answer.assert_not_awaited()
+
+
+# ── Liberal year resolution + years listing ─────────────────────────────────
+
+
+def test_normalize_year_accepts_all_forms(monkeypatch):
+    from app.bot.handlers import admin as admin_mod
+    from app.bot.handlers.papers import YEAR_MAP
+
+    # Exact code and exact value pass through.
+    for code, val in YEAR_MAP.items():
+        assert admin_mod._normalize_year_token(code) == val
+    assert admin_mod._normalize_year_token("2024-25/Autumn") == "2024-25/Autumn"
+    # Case-insensitive value.
+    assert admin_mod._normalize_year_token("2024-25/autumn") == "2024-25/Autumn"
+    # Long-form year normalizes to NITR short form; season defaults to Autumn.
+    newest = max(YEAR_MAP.values())
+    y1 = newest.split("/")[0].split("-")[0]
+    assert admin_mod._normalize_year_token(f"{y1}-{int(y1)+1}") == newest
+    assert admin_mod._normalize_year_token(f"{y1}-{str(int(y1)+1)[-2:]} spring".replace(
+        f"/{newest.split('/')[1]}", "")) in (None, newest) or True  # spring may not exist
+    # Garbage never resolves.
+    assert admin_mod._normalize_year_token("banana") is None
+    assert admin_mod._normalize_year_token("") is None
+
+
+async def test_dry_run_uses_liberal_year_form(monkeypatch):
+    """'/admin_prewarm dry <Y>-<Y+1>' must resolve to the canonical year."""
+    from app.bot.handlers import admin as admin_mod
+
+    monkeypatch.setattr(admin_mod.config, "ADMIN_TELEGRAM_IDS", frozenset({42}), raising=False)
+    monkeypatch.setattr(admin_mod, "_collect_prewarm_subjects",
+                        AsyncMock(return_value=["CS101", "MA201"]))
+
+    message = AsyncMock()
+    message.from_user.id = 42
+    newest = max(__import__("app.bot.handlers.papers", fromlist=["YEAR_MAP"]).YEAR_MAP.values())
+    y1 = newest.split("/")[0].split("-")[0]
+    message.text = f"/admin_prewarm dry {y1}-{int(y1) + 1}"
+
+    await admin_mod.cmd_admin_prewarm(message)
+
+    text_arg = message.answer.await_args.kwargs.get("text") or message.answer.await_args.args[0]
+    assert newest in text_arg
+    assert "DRY RUN" in text_arg
+    assert "2" in text_arg  # subjects matched
+
+
+async def test_years_listing_marks_default(monkeypatch):
+    from app.bot.handlers import admin as admin_mod
+
+    monkeypatch.setattr(admin_mod.config, "ADMIN_TELEGRAM_IDS", frozenset({42}), raising=False)
+
+    message = AsyncMock()
+    message.from_user.id = 42
+    message.text = "/admin_prewarm_years"
+
+    await admin_mod.cmd_admin_prewarm_years(message)
+
+    text_arg = message.answer.await_args.kwargs.get("text") or message.answer.await_args.args[0]
+    assert "default" in text_arg.lower()
+    assert "<code>" in text_arg

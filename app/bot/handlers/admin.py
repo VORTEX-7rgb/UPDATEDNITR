@@ -3,6 +3,7 @@
 import logging
 import asyncio
 import html
+import re
 
 from aiogram import Router, types
 from aiogram.filters import Command, StateFilter
@@ -517,6 +518,55 @@ def _default_prewarm_year() -> str:
     return max(YEAR_MAP.values())
 
 
+def _normalize_year_token(token: str) -> str | None:
+    """Liberal year resolution — accepts ANY of:
+      2425A · 2024-25/Autumn · 2024-25/autumn · 2025-2026 · 2025-26
+      2025-26 spring · 2025-2026/spring
+    Missing season defaults to Autumn (product rule). Returns the canonical
+    'YYYY-YY/Season' string, or None when nothing in YEAR_MAP matches."""
+    from app.bot.handlers.papers import YEAR_MAP
+
+    t = (token or "").strip().replace("_", " ")
+    if not t:
+        return None
+    if t in YEAR_MAP:                       # exact code ("2425A")
+        return YEAR_MAP[t]
+    by_val = {v.lower(): v for v in YEAR_MAP.values()}
+    if t.lower() in by_val:                 # exact value
+        return by_val[t.lower()]
+
+    m = re.match(r"^(\d{4})-(\d{2,4})(?:[/ ](autumn|spring))?$", t, re.I)
+    if not m:
+        return None
+    y1, y2_raw, season = m.group(1), m.group(2), m.group(3)
+    y2 = y2_raw[-2:]                        # "2026" → "26"
+    base = f"{y1}-{y2}"
+    season = season.capitalize() if season else "Autumn"   # default Autumn
+    cand = f"{base}/{season}"
+    return by_val.get(cand.lower())
+
+
+@router.message(Command("admin_prewarm_years"), StateFilter("*"))
+async def cmd_admin_prewarm_years(message: types.Message):
+    """/admin_prewarm_years — list every usable year token for /admin_prewarm."""
+    if not is_admin(message.from_user.id):
+        return
+    from app.bot.handlers.papers import YEAR_MAP
+    default_year = _default_prewarm_year()
+    lines = []
+    for code, val in YEAR_MAP.items():
+        mark = "  ⬅️ default" if val == default_year else ""
+        lines.append(f"• <code>{code}</code> → {val}{mark}")
+    await message.answer(
+        "📅 <b>Usable pre-warm years</b>\n\n" + "\n".join(lines) +
+        "\n\n<i>Any of these forms work:</i>\n"
+        "<code>/admin_prewarm 2425A</code>\n"
+        "<code>/admin_prewarm 2024-25/Autumn</code>\n"
+        "<code>/admin_prewarm 2025-2026</code>  <i>(season defaults to Autumn)</i>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
 async def _collect_prewarm_subjects(extra_codes: list[str]) -> list[str]:
     """Union of subject codes seen in any attendance snapshot + admin extras."""
     from sqlalchemy import text as sql_text
@@ -540,7 +590,10 @@ async def _collect_prewarm_subjects(extra_codes: list[str]) -> list[str]:
 
 @router.message(Command("admin_prewarm"), StateFilter("*"))
 async def cmd_admin_prewarm(message: types.Message):
-    """/admin_prewarm [dry|stop|status|yearcode|YYYY-YY/Season] [CODE1 CODE2...]
+    """/admin_prewarm [dry|stop|status|YEAR] [CODE1 CODE2...]
+
+    YEAR accepts liberal forms: 2425A · 2024-25/Autumn · 2025-2026
+    (missing season defaults to Autumn). See /admin_prewarm_years.
 
     Fills the QP cache ahead of student demand: for every known subject ×
     {mid,end} → metadata (if missing) → download under the ADMIN's account →
@@ -565,16 +618,18 @@ async def cmd_admin_prewarm(message: types.Message):
     if dry:
         parts = parts[1:]
 
-    # Year resolution: explicit YEAR_MAP key, explicit "YYYY-YY/Season" string,
-    # or default = newest served year.
+    # Year resolution: liberal token parsing (code / full string / "2025-2026"
+    # with optional season — missing season defaults to Autumn).
     from app.bot.handlers.papers import YEAR_MAP
     year = _default_prewarm_year()
-    if parts and parts[0] in YEAR_MAP:
-        year = YEAR_MAP[parts[0]]
-        parts = parts[1:]
-    elif parts and "/" in parts[0]:
-        year = parts[0]
-        parts = parts[1:]
+    if parts:
+        resolved = _normalize_year_token(parts[0])
+        if resolved:
+            year = resolved
+            parts = parts[1:]
+        elif "/" in parts[0]:
+            year = parts[0]     # free-form passthrough (admin knows best)
+            parts = parts[1:]
 
     extra_codes = [p.upper() for p in parts]
     subjects = await _collect_prewarm_subjects(extra_codes)
@@ -622,7 +677,7 @@ async def cmd_admin_prewarm(message: types.Message):
         await message.answer("❌ You must be registered (/start) so downloads can run under your account.", parse_mode=ParseMode.HTML)
         return
 
-    prewarm_state.start_run(year)
+    prewarm_state.start_run(year, total_subjects=len(subjects))
 
     # Enqueue in queue-headroom-respecting batches.
     enqueued = 0

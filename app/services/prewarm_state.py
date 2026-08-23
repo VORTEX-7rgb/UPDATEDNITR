@@ -25,6 +25,7 @@ class PrewarmState:
         self.running: bool = False
         self.started_at: Optional[float] = None
         self.academic_year: str = ""
+        self.total_subjects: int = 0
         self.counters: dict[str, int] = {
             "subjects_done": 0,
             "available": 0,
@@ -33,11 +34,12 @@ class PrewarmState:
             "skipped": 0,
         }
 
-    def start_run(self, academic_year: str) -> None:
+    def start_run(self, academic_year: str, total_subjects: int = 0) -> None:
         self.stop_event.clear()
         self.running = True
         self.started_at = time.monotonic()
         self.academic_year = academic_year
+        self.total_subjects = total_subjects
         self.counters = {
             "subjects_done": 0,
             "available": 0,
@@ -46,8 +48,14 @@ class PrewarmState:
             "skipped": 0,
         }
 
+    def record_subject_done(self) -> None:
+        self.counters["subjects_done"] += 1
+        if self.total_subjects > 0 and self.counters["subjects_done"] >= self.total_subjects:
+            self.running = False
+
     def stop(self) -> None:
         self.stop_event.set()
+        self.running = False
 
     @property
     def stopped(self) -> bool:

@@ -1008,7 +1008,7 @@ async def handle_qp_prewarm_subject(payload: dict, bot) -> dict:
         else:  # already / negative / busy / missing / no-target
             prewarm_state.counters["skipped"] += 1
 
-    prewarm_state.counters["subjects_done"] += 1
+    prewarm_state.record_subject_done()
     return {"success": True, "results": results}
 
 
