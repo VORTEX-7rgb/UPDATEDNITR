@@ -188,3 +188,22 @@ async def test_invalid_suffix_rejected(monkeypatch):
     await handle_qp_download_all_go(callback, AsyncMock())
 
     assert callback.answer.await_count >= 1  # answered, never executed
+
+
+async def test_paper_not_available_does_not_trigger_portal_sync(monkeypatch):
+    """Subject with paper_not_available row in DB must not be treated as uncached."""
+    not_avail = SimpleNamespace(id=33, status="paper_not_available")
+    courses = [{"subject_code": "LAB101"}]
+    rows = {("LAB101", "mid_sem"): not_avail}
+    _, exam_instance = _run_go_mocks(monkeypatch, courses, rows)
+
+    callback = _cb("qp_dlall_go_2425A_m")
+    await handle_qp_download_all_go(callback, AsyncMock())
+
+    status_edits = callback.message.answer.return_value.edit_text.await_args_list
+    final_text = status_edits[-1]
+    text_arg = final_text.kwargs.get("text") or final_text.args[0]
+    # Instantly resolved without NITRIS metadata sync timeout
+    assert "No papers available" in text_arg
+    assert "Mid Sem" in text_arg
+

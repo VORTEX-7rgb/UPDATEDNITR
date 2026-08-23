@@ -514,15 +514,16 @@ async def handle_qp_download_all_go(callback: types.CallbackQuery, state: FSMCon
             sub_code = course.get("subject_code") or ""
             if not sub_code:
                 continue
-            found_any = False
+            has_unknown_type = False
             for exam_t in types_to_check:
                 cache_row = await exam_service.get_cached_paper(sub_code, selected_year, exam_t)
-                if cache_row and cache_row.status != "paper_not_available":
+                if cache_row is None:
+                    has_unknown_type = True
+                elif cache_row.status != "paper_not_available":
                     cache_ids_to_deliver.append(cache_row.id)
-                    found_any = True
-            # Subject is "uncached" only when the SELECTED type(s) have no
-            # usable row — not when merely the other exam type is missing.
-            if not found_any:
+            # Subject is "uncached" only when a selected exam type has NO database row at all.
+            # If the row already exists with 'paper_not_available', we already know NITRIS has no paper.
+            if has_unknown_type:
                 uncached_courses.append(course)
 
     if uncached_courses:
