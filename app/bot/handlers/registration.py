@@ -22,7 +22,7 @@ from app.db.models import User, SyncState
 from app.config import IST
 
 from app.bot.fsm import Registration, Deregistration, InboxSearch
-from app.bot.common import get_dashboard_keyboard
+from app.bot.common import get_dashboard_keyboard, build_start_reply_keyboard, START_BUTTON_TEXT
 from app.ui.alive import render_dashboard
 from app.ui.surface import show
 from app.bot.handlers.attendance import fetch_attendance_for_callback
@@ -103,7 +103,23 @@ async def cmd_start(message: types.Message, state: FSMContext):
     if user:
         await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
     else:
-        await message.answer(f"👋 Welcome to NitrClaw!\n\nPlease enter your NITRIS Roll Number (e.g. {SIGNATURE_ROLLS_PLAIN}):")
+        # Persistent floating 🏠 Start bar is attached here — chat-level, so
+        # it stays pinned above the input field for the lifetime of the chat.
+        await message.answer(
+            f"👋 Welcome to NitrClaw!\n\nPlease enter your NITRIS Roll Number (e.g. {SIGNATURE_ROLLS_PLAIN}):",
+            reply_markup=build_start_reply_keyboard(),
+        )
+
+
+@router.message(F.text == START_BUTTON_TEXT, StateFilter("*"))
+async def start_button_tap(message: types.Message, state: FSMContext):
+    """Floating 🏠 Start bar tapped → dashboard, from ANY state.
+
+    Registered BEFORE every FSM text-catcher so the bar always wins — even
+    mid-registration / while typing a password. Clears any active flow first.
+    """
+    await state.clear()
+    await cmd_start(message, state)
 
 
 # --- FSM Command Shielding ---
@@ -353,7 +369,10 @@ async def process_password(message: types.Message, state: FSMContext):
         await status_msg.edit_text(
             "✅ <b>Registration complete!</b>\n\n"
             "Initial attendance fetched successfully. Rendering your dashboard...",
-            parse_mode=ParseMode.HTML
+            parse_mode=ParseMode.HTML,
+            # Attach/pin the floating 🏠 Start bar at the moment every new
+            # student finishes onboarding (chat-level, persists afterwards).
+            reply_markup=build_start_reply_keyboard(),
         )
 
         async with get_db_session() as session:

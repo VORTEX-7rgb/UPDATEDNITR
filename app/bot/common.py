@@ -6,7 +6,7 @@ pulling in the whole bot wiring.
 """
 
 from aiogram import types
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
 from app.utils import esc
 from app.config import IST
@@ -83,6 +83,26 @@ def format_dashboard_text(user, unread_count: int = 0) -> str:
         f"Choose an action from the options below:"
     )
     return msg
+
+
+# ── Persistent floating Start button (chat-level reply keyboard) ────────────
+START_BUTTON_TEXT = "🏠 Start"
+
+
+def build_start_reply_keyboard() -> types.ReplyKeyboardMarkup:
+    """Always-visible 🏠 Start bar pinned above the text input.
+
+    Reply keyboards are CHAT-LEVEL: once set, the bar persists across every
+    later message (even ones carrying inline keyboards) until the user
+    collapses it. is_persistent=True keeps it expanded permanently.
+    """
+    builder = ReplyKeyboardBuilder()
+    builder.row(types.KeyboardButton(text=START_BUTTON_TEXT))
+    return builder.as_markup(
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Tap 🏠 Start for your dashboard",
+    )
 
 
 def get_dashboard_keyboard(unread_count: int = 0) -> types.InlineKeyboardMarkup:

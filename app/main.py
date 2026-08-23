@@ -53,6 +53,23 @@ async def main():
     )
     logging.info("Starting Telegram Bot...")
 
+    # Idempotent command menu — keeps Start discoverable via the ☰ button
+    # for users who collapsed/never received the floating reply bar.
+    from aiogram.types import BotCommand
+    try:
+        await bot.set_my_commands([
+            BotCommand(command="start", description="🏠 Open Dashboard"),
+            BotCommand(command="attendance", description="📊 Attendance"),
+            BotCommand(command="inbox", description="📬 Inbox"),
+            BotCommand(command="timetable", description="📅 Timetable"),
+            BotCommand(command="now", description="⏰ Current class"),
+            BotCommand(command="next", description="⏭ Next class"),
+            BotCommand(command="papers", description="📝 Question papers"),
+            BotCommand(command="forgot", description="🔑 Update NITRIS password"),
+        ])
+    except Exception as e:
+        logging.warning("set_my_commands failed (non-fatal): %r", e)
+
     # ── Credential quarantine gate (auth_gate) ──────────────────────────
     # Must be initialized before any handler can send notifications, and the
     # in-memory gateway guard must be seeded before any login can run.
