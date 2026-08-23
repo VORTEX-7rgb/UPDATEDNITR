@@ -209,6 +209,10 @@ class Config:
     # ── DB engine housekeeping ───────────────────────────────────────────────
     DB_POOL_DISPOSE_DEBOUNCE_SECONDS = float(os.getenv("DB_POOL_DISPOSE_DEBOUNCE_SECONDS", "60"))
 
+    # ── Pre-warm (admin-driven QP cache filling) ─────────────────────────
+    # Max SUBJECTS per /admin_prewarm run (each subject = mid+end papers).
+    PREWARM_MAX_ITEMS = int(os.getenv("PREWARM_MAX_ITEMS", "300"))
+
     # ── Debug mode (Phase 0 security) ───────────────────────────────────────
     # When True, NITRIS HTML snapshots are saved to disk for debugging.
     # MUST be False in production — snapshots contain student PII, and the

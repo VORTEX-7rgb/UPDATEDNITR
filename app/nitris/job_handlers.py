@@ -69,6 +69,7 @@ def init_job_handlers(bot) -> None:
     nitris_job_queue.register_handler("attachment_download", handle_attachment_download)
     nitris_job_queue.register_handler("qp_search", handle_qp_search)
     nitris_job_queue.register_handler("timetable_sync", handle_timetable_sync)
+    nitris_job_queue.register_handler("qp_prewarm_subject", handle_qp_prewarm_subject)
 
     logger.info(
         "Registered NITRIS job handlers: %s",
@@ -921,5 +922,93 @@ async def handle_timetable_sync(job: NitrisJob) -> dict:
             logger.warning("timetable_sync: could not edit callback message: %r", e)
 
     return result
+
+
+async def handle_qp_prewarm_subject(payload: dict, bot) -> dict:
+    """Pre-warm BOTH exam types for one subject (admin-driven cache filling).
+
+    Payload: {subject_code, academic_year, donor_user_id}
+    - Ensures catalog rows exist (metadata fetch under the DONOR's pooled
+      session, only when a row is missing)
+    - For each exam type: claim → download (donor) → CHANNEL-only upload →
+      mark available. Never touches any student's chat.
+    - Honors prewarm_state.stop_event between every item.
+    """
+    from app.services.prewarm_state import prewarm_state
+
+    subject_code = payload.get("subject_code") or ""
+    ac_year = payload.get("academic_year") or ""
+    donor_user_id = payload.get("donor_user_id")
+
+    if prewarm_state.stopped:
+        return {"success": False, "stopped": True}
+
+    from app.bot import qpaper_registry
+    svc = qpaper_registry.qpaper_service
+    if svc is None:
+        return {"success": False, "error": "QPaperService not initialized"}
+
+    from app.db.database import get_db_session
+    from app.services.examination_service import ExaminationService
+
+    # ── Phase 1: ensure cache rows exist for both exam types ──────────
+    row_ids: dict[str, Optional[int]] = {"mid_sem": None, "end_sem": None}
+    async with get_db_session() as session:
+        exam_service = ExaminationService(session)
+        for et in ("mid_sem", "end_sem"):
+            row = await exam_service.get_cached_paper(subject_code, ac_year, et)
+            row_ids[et] = row.id if row else None
+
+    need_meta = any(v is None for v in row_ids.values())
+    if need_meta and not prewarm_state.stopped:
+        try:
+            records = await svc._fetch_metadata_via_pool(donor_user_id, ac_year, subject_code)
+            async with get_db_session() as session:
+                es = ExaminationService(session)
+                persisted = await es.persist_subject_metadata(
+                    parsed_records=records,
+                    academic_year=ac_year,
+                    subject_code=subject_code,
+                )
+                await session.commit()
+                for r in persisted:
+                    if getattr(r, "exam_type", None) in row_ids:
+                        row_ids[r.exam_type] = r.id
+        except Exception as e:
+            logger.warning(
+                "prewarm: metadata sync failed for %s %s: %r",
+                subject_code, ac_year, e,
+            )
+            # Continue — whatever rows already exist still get pre-warmed.
+
+    # ── Phase 2: acquire each exam type (stop-aware, concurrency-capped) ──
+    results: list[str] = []
+    for et in ("mid_sem", "end_sem"):
+        if prewarm_state.stopped:
+            break
+        cache_id = row_ids.get(et)
+        if cache_id is None:
+            prewarm_state.counters["skipped"] += 1
+            results.append(f"{subject_code}:{et}:no-row")
+            continue
+
+        async with prewarm_state.semaphore:
+            if prewarm_state.stopped:
+                prewarm_state.counters["skipped"] += 1
+                continue
+            res = await svc.prewarm_one(cache_id, donor_user_id)
+
+        results.append(f"{subject_code}:{et}:{res}")
+        if res == "available":
+            prewarm_state.counters["available"] += 1
+        elif res == "not_available":
+            prewarm_state.counters["not_available"] += 1
+        elif res in ("failed", "permanent-failed", "donor-creds", "channel-down"):
+            prewarm_state.counters["failed"] += 1
+        else:  # already / negative / busy / missing / no-target
+            prewarm_state.counters["skipped"] += 1
+
+    prewarm_state.counters["subjects_done"] += 1
+    return {"success": True, "results": results}
 
 

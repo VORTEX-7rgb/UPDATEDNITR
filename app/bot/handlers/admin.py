@@ -502,3 +502,161 @@ async def cmd_unpin(message: types.Message):
         ),
         name=f"unpin-{len(telegram_ids)}-users",
     )
+
+
+# ── Pre-warm: one-shot paper cache filling (admin) ──────────────────────────
+
+
+def _default_prewarm_year() -> str:
+    """Newest year the portal actually serves per YEAR_MAP — NOT the calendar
+    current year (the portal lags the calendar by design)."""
+    from app.bot.handlers.papers import YEAR_MAP
+    if not YEAR_MAP:
+        from app.utils import current_academic_year
+        return current_academic_year()
+    return max(YEAR_MAP.values())
+
+
+async def _collect_prewarm_subjects(extra_codes: list[str]) -> list[str]:
+    """Union of subject codes seen in any attendance snapshot + admin extras."""
+    from sqlalchemy import text as sql_text
+    codes: set[str] = {c.strip().upper() for c in extra_codes if c.strip()}
+    async with get_db_session() as session:
+        rows = await session.execute(sql_text("""
+            SELECT DISTINCT rec->>'subject_code' AS code
+            FROM snapshots s,
+                 jsonb_array_elements(s.snapshot_json->'records') AS rec
+            WHERE s.module_name = 'attendance'
+              AND jsonb_typeof(s.snapshot_json->'records') = 'array'
+              AND rec->>'subject_code' IS NOT NULL
+              AND rec->>'subject_code' <> ''
+        """))
+        for r in rows.fetchall():
+            code = (r[0] or "").strip().upper()
+            if code:
+                codes.add(code)
+    return sorted(codes)
+
+
+@router.message(Command("admin_prewarm"), StateFilter("*"))
+async def cmd_admin_prewarm(message: types.Message):
+    """/admin_prewarm [dry|stop|status|yearcode|YYYY-YY/Season] [CODE1 CODE2...]
+
+    Fills the QP cache ahead of student demand: for every known subject ×
+    {mid,end} → metadata (if missing) → download under the ADMIN's account →
+    upload to the storage channel. Students afterwards get 🚀 instant hits.
+    """
+    if not is_admin(message.from_user.id):
+        return
+
+    from app.services.prewarm_state import prewarm_state
+    from app.nitris.job_queue import nitris_job_queue, Priority
+
+    parts = (message.text or "").split()[1:]
+    if parts and parts[0].lower() == "status":
+        await message.answer(prewarm_state.snapshot_text(), parse_mode=ParseMode.HTML)
+        return
+    if parts and parts[0].lower() == "stop":
+        prewarm_state.stop()
+        await message.answer("🛑 Pre-warm stop requested — finishing in-flight item only.", parse_mode=ParseMode.HTML)
+        return
+
+    dry = bool(parts) and parts[0].lower() == "dry"
+    if dry:
+        parts = parts[1:]
+
+    # Year resolution: explicit YEAR_MAP key, explicit "YYYY-YY/Season" string,
+    # or default = newest served year.
+    from app.bot.handlers.papers import YEAR_MAP
+    year = _default_prewarm_year()
+    if parts and parts[0] in YEAR_MAP:
+        year = YEAR_MAP[parts[0]]
+        parts = parts[1:]
+    elif parts and "/" in parts[0]:
+        year = parts[0]
+        parts = parts[1:]
+
+    extra_codes = [p.upper() for p in parts]
+    subjects = await _collect_prewarm_subjects(extra_codes)
+
+    cap = config.PREWARM_MAX_ITEMS
+    capped = False
+    if len(subjects) > cap:
+        subjects = subjects[:cap]
+        capped = True
+
+    if dry:
+        await message.answer(
+            f"🔍 <b>Pre-warm DRY RUN</b>\n"
+            f"📅 Year: <b>{esc(year)}</b>\n"
+            f"📚 Subjects matched: <b>{len(subjects)}</b>"
+            f"{' (capped)' if capped else ''}\n"
+            f"📝 Papers targeted ≈ <b>{len(subjects) * 2}</b> (mid+end)\n\n"
+            f"Run <code>/admin_prewarm</code> to execute.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if prewarm_state.running:
+        await message.answer(
+            "⚠️ A pre-warm run is already active.\n" + prewarm_state.snapshot_text(),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if not subjects:
+        await message.answer("⚠️ No subject codes found yet — register students / sync attendance first.", parse_mode=ParseMode.HTML)
+        return
+    if not config.QP_STORAGE_CHAT_ID:
+        await message.answer("❌ QP_STORAGE_CHAT_ID is not configured — pre-warm uploads must go to the storage channel.", parse_mode=ParseMode.HTML)
+        return
+
+    donor_user_id_row = None
+    async with get_db_session() as session:
+        from sqlalchemy import text as _sql_text
+        row = (await session.execute(
+            _sql_text("SELECT id FROM users WHERE telegram_id = :tid"),
+            {"tid": message.from_user.id},
+        )).first()
+        donor_user_id_row = int(row[0]) if row else None
+    if donor_user_id_row is None:
+        await message.answer("❌ You must be registered (/start) so downloads can run under your account.", parse_mode=ParseMode.HTML)
+        return
+
+    prewarm_state.start_run(year)
+
+    # Enqueue in queue-headroom-respecting batches.
+    enqueued = 0
+    for i, code in enumerate(subjects):
+        while nitris_job_queue.get_queue_depth() >= config.SCHEDULER_MAX_QUEUE_DEPTH:
+            await asyncio.sleep(2.0)
+            if prewarm_state.stopped:
+                break
+        try:
+            await nitris_job_queue.enqueue(
+                job_type="qp_prewarm_subject",
+                user_id=donor_user_id_row,
+                priority=Priority.LOW,
+                dedup_key=f"qp_prewarm:{year}:{code}",
+                payload={
+                    "subject_code": code,
+                    "academic_year": year,
+                    "donor_user_id": donor_user_id_row,
+                },
+            )
+            enqueued += 1
+        except RuntimeError:
+            break  # queue hard-capped — stop feeding
+        except Exception as e:
+            logger.warning("prewarm enqueue failed for %s: %r", code, e)
+        if i % 20 == 19:
+            await asyncio.sleep(0.5)  # gentle on the loop
+
+    status_msg = (
+        f"🔥 <b>Pre-warm started</b>\n"
+        f"📅 Year: <b>{esc(year)}</b> · 📝 mid+end\n"
+        f"📚 Subjects queued: <b>{enqueued}/{len(subjects)}</b>"
+        f"{' (capped)' if capped else ''}\n"
+        f"🚦 Concurrency: 2 · LOW priority · circuit-open auto-pauses via normal gateway rules\n\n"
+        f"<code>/admin_prewarm_status</code> · <code>/admin_prewarm_stop</code>"
+    )
+    await message.answer(status_msg, parse_mode=ParseMode.HTML)

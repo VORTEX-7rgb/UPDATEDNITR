@@ -775,6 +775,117 @@ class QPaperService:
             except asyncio.CancelledError:
                 pass
 
+    # ── Pre-warm (admin-driven cache filling) ────────────────────────
+
+    async def _fetch_metadata_via_pool(
+        self, donor_user_id: int, ac_year: str, subject_code: str,
+    ) -> list:
+        """Fetch + parse the QP catalog for one subject via the donor's pooled
+        portal session. Returns parsed records (NOT persisted)."""
+        own = await self._load_own_credentials(donor_user_id)
+        if own is None:
+            from app.nitris.exceptions import CredentialsQuarantinedError
+            raise CredentialsQuarantinedError(
+                f"Pre-warm donor user_id={donor_user_id} has no valid credentials."
+            )
+        roll, user_id, encrypted_password = own
+        from app.nitris.session_pool import with_pooled_session
+
+        async def _work(client: NitrisClient, password: str):
+            from app.services.examination_service import ExaminationService
+            return await ExaminationService.fetch_subject_metadata_from_portal(
+                username=roll,
+                password=password,
+                academic_year=ac_year,
+                subject_code=subject_code,
+                client=client,
+            )
+
+        return await with_pooled_session(
+            user_id=user_id,
+            roll_number=roll,
+            encrypted_password=encrypted_password,
+            work=_work,
+        )
+
+    async def prewarm_one(self, cache_id: int, donor_user_id: int) -> str:
+        """Pre-warm ONE cache row: download under the DONOR's creds and upload
+        to the storage CHANNEL ONLY — never to any student's chat.
+
+        Composes the exact same helpers as a normal cold acquisition
+        (claim → download → channel upload → mark_available), so CAS safety
+        and portal/Telegram rate-limit posture are identical.
+
+        Returns one of:
+          'available' | 'not_available' | 'already' | 'negative' | 'busy'
+          | 'missing' | 'no-target' | 'channel-down' | 'donor-creds'
+          | 'failed' | 'permanent-failed'
+        """
+        job_id = f"prewarm-{cache_id}-{uuid.uuid4().hex[:6]}"
+        snap = await self._read_cache(cache_id)
+        if snap is None:
+            return "missing"
+        status, _fid, _kind, sub_code, ac_year, ex_type, postback, _err, _nau = snap
+        if status == QPStatus.PAPER_AVAILABLE.value and _fid:
+            return "already"
+        if status == QPStatus.PAPER_NOT_AVAILABLE.value:
+            return "negative"
+        if not postback:
+            return "no-target"
+
+        if not await self._claim_for_acquisition(cache_id, job_id):
+            return "busy"
+
+        async with self._acquire_sem:
+            try:
+                file_bytes, kind = await self._nitris_download(
+                    sub_code, ac_year, ex_type, postback, donor_user_id,
+                )
+                try:
+                    file_id, uploaded_to_user = await self._telegram_upload(
+                        file_bytes, kind, sub_code, ac_year, ex_type,
+                        fallback_chat_id=None,  # CHANNEL-ONLY by design
+                    )
+                except RuntimeError as exc:
+                    # Channel down/unset & user fallback disabled → leave the
+                    # row retryable so a later run (or a real student) can
+                    # retry when the channel is healthy again.
+                    await self._mark_failure(
+                        cache_id, QPStatus.RETRYABLE_FAILURE.value, exc,
+                    )
+                    logger.warning(
+                        "Pre-warm %d: storage channel unavailable (%r) — left retryable",
+                        cache_id, exc,
+                    )
+                    return "channel-down"
+                await self._mark_available(cache_id, file_id, kind, len(file_bytes))
+                logger.info(
+                    "Pre-warmed QP cache_id=%d (%s %s %s) size=%d",
+                    cache_id, sub_code, ac_year, ex_type, len(file_bytes),
+                )
+                return "available"
+            except PaperNotAvailableError as exc:
+                await self._mark_not_available(cache_id, exc)
+                return "not_available"
+            except CredentialsQuarantinedError as exc:
+                # Donor's creds unusable — do NOT poison the shared row;
+                # keep it retryable so another donor/run can pick it up.
+                await self._mark_failure(
+                    cache_id, QPStatus.RETRYABLE_FAILURE.value, exc,
+                )
+                return "donor-creds"
+            except Exception as exc:
+                permanent = _is_permanent_error(exc)
+                attempts = await self._get_attempt_count(cache_id)
+                if attempts >= ACQUIRE_PERMANENT_AFTER:
+                    permanent = True
+                new_status = (
+                    QPStatus.PERMANENT_FAILURE.value if permanent
+                    else QPStatus.RETRYABLE_FAILURE.value
+                )
+                await self._mark_failure(cache_id, new_status, exc)
+                logger.warning("Pre-warm %d failed: %r", cache_id, exc)
+                return "permanent-failed" if permanent else "failed"
 
 # ── Helpers ────────────────────────────────────────────────────────
 
