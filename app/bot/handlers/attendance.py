@@ -191,45 +191,41 @@ def _kb_detail():
 
 # ── Core refresh flow (single bubble lifecycle) ────────────────────────────
 
-async def _run_flow(surf: Surface, user_id: int, cached: AttendanceSummary | None) -> None:
+async def _run_flow(
+    surf: Surface, user_id: int, cached: AttendanceSummary | None,
+    chat_id: int | None = None, message_id: int | None = None,
+) -> None:
+    """LAYER 2 (timetable pattern): enqueue and RETURN immediately.
+
+    The job renders this same bubble itself on success AND failure — no
+    inline await, no 120s hang, no poke. The interactive worker frees in
+    milliseconds, so bursts of taps can never pile up handlers.
+    """
     has_cache = bool(cached and cached.subjects)
     await surf.edit(
         _list_text(cached, copy.UPDATING if has_cache else "⏳ <i>Fetching from NITRIS…</i>"),
         _kb_busy(),
     )
-    base = _list_text(cached) if has_cache else ""
-    if base:
-        surf.poke_later(SLOW_AFTER_SECONDS, f"{base}\n\n{copy.slow_note('checking')}")
 
     from app.nitris.job_queue import nitris_job_queue, Priority
     from app.nitris.gateway import NitrisCircuitOpenError
 
     try:
-        future = await nitris_job_queue.enqueue(
+        await nitris_job_queue.enqueue(
             job_type="attendance_refresh",
             user_id=user_id,
             priority=Priority.HIGH,
             dedup_key=f"attendance_refresh:user:{user_id}",
-            payload={},
+            payload={
+                "callback_chat_id": chat_id,
+                "callback_message_id": message_id,
+            },
         )
-        try:
-            result = await asyncio.wait_for(future, timeout=120.0)
-            if result.get("success") and result.get("data"):
-                fresh = summarize(_records_from_result(result["data"]))
-                await surf.final(_list_text(fresh, copy.UPDATED_JUST_NOW), _kb_viewing(fresh))
-            else:
-                await surf.final(
-                    _list_text(cached, "⚠️ Couldn't update right now — showing last known."),
-                    _kb_viewing(cached),
-                )
-        except asyncio.TimeoutError:
-            await surf.final(_list_text(cached, copy.STILL_RUNNING), _kb_viewing(cached))
-
     except NitrisCircuitOpenError:
         await surf.final(_list_text(cached, copy.CIRCUIT_DOWN), _kb_viewing(cached))
     except RuntimeError as e:
-        # Queue-full rejection (hard depth cap) — tell the user instead of dying.
-        logger.warning("Attendance enqueue rejected: %r", e)
+        # Queue-full rejection — answer the user instead of dying silently.
+        logger.warning("Attendance refresh enqueue rejected: %r", e)
         await surf.final(_list_text(cached, copy.QUEUE_BUSY), _kb_viewing(cached))
 
 
@@ -255,7 +251,9 @@ async def fetch_attendance_for_callback(callback: types.CallbackQuery, user: Use
         )
         return
 
-    await _run_flow(surf, user.id, cached)
+    await _run_flow(surf, user.id, cached,
+                    chat_id=callback.message.chat.id,
+                    message_id=callback.message.message_id)
 
 
 @router.message(Command("attendance"), StateFilter(None))
@@ -298,7 +296,9 @@ async def cmd_attendance(message: types.Message):
         reply_markup=_kb_busy(),
     )
     surf = Surface(first)
-    await _run_flow(surf, user.id, cached)
+    await _run_flow(surf, user.id, cached,
+                    chat_id=first.chat.id,
+                    message_id=first.message_id)
 
 
 # ── Cached navigation (Back targets — zero portal traffic) ─────────────────

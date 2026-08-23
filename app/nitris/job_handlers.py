@@ -70,6 +70,7 @@ def init_job_handlers(bot) -> None:
     nitris_job_queue.register_handler("qp_search", handle_qp_search)
     nitris_job_queue.register_handler("timetable_sync", handle_timetable_sync)
     nitris_job_queue.register_handler("qp_prewarm_subject", handle_qp_prewarm_subject)
+    nitris_job_queue.register_handler("session_warm", handle_session_warm)
 
     logger.info(
         "Registered NITRIS job handlers: %s",
@@ -190,6 +191,26 @@ async def handle_attendance_refresh(job: NitrisJob) -> dict:
     except Exception as e:
         logger.error("Failed to save attendance snapshot: %r", e)
         # Don't fail the whole job — we still have fresh data to show
+
+    # ── Step 4 (LAYER 2): render the fresh list directly into the bubble ──
+    # Timetable-pattern: the JOB finishes the UX. No handler waits inline,
+    # interactive workers free instantly, bursts can never hang.
+    if callback_chat_id and callback_message_id:
+        try:
+            from app.bot.handlers.attendance import (
+                _list_text as _att_list_text,
+                _kb_viewing as _att_kb_viewing,
+                summarize as _att_summarize,
+            )
+            records = (data.to_dict() or {}).get("records") or []
+            fresh_summary = _att_summarize(records)
+            await _edit_callback_message(
+                callback_chat_id, callback_message_id,
+                _att_list_text(fresh_summary, "🟢 Updated just now."),
+                reply_markup=_att_kb_viewing(fresh_summary),
+            )
+        except Exception as e:
+            logger.warning("attendance_refresh: success self-render failed: %r", e)
 
     return {
         "success": True,
@@ -823,6 +844,7 @@ async def _edit_callback_message(
     chat_id: Optional[int],
     message_id: Optional[int],
     text: str,
+    reply_markup=None,
 ) -> None:
     """Edit a Telegram message if chat_id and message_id are provided."""
     if not _bot or not chat_id or not message_id:
@@ -833,6 +855,7 @@ async def _edit_callback_message(
             message_id=message_id,
             text=text,
             parse_mode=ParseMode.HTML,
+            reply_markup=reply_markup,
         )
     except Exception as e:
         logger.warning("Failed to edit callback message: %r", e)
@@ -1010,5 +1033,19 @@ async def handle_qp_prewarm_subject(payload: dict, bot) -> dict:
 
     prewarm_state.record_subject_done()
     return {"success": True, "results": results}
+
+
+async def handle_session_warm(payload: dict, bot) -> dict:
+    """LAYER 1: silently warm a user's pooled portal session (login now so the
+    next tap skips paced-login entirely). Fired from dashboard/inbox/timetable
+    touchpoints; dedup + throttle live in session_warmer.request_session_warm.
+    """
+    user_id = payload.get("user_id")
+    if not user_id:
+        return {"success": False, "error": "missing user_id"}
+
+    from app.services.session_warmer import warm_now
+    ok = await warm_now(int(user_id))
+    return {"success": bool(ok)}
 
 

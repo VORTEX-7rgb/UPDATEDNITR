@@ -767,8 +767,13 @@ async def process_search_query(message: types.Message, state: FSMContext) -> Non
         user = await user_repo.get_by_telegram_id(telegram_id)
 
         if not user:
-            await message.answer("⚠️ You are not registered. Use /start to register.")
+            await callback.message.answer("⚠️ You are not registered. Use /start to register.")
             return
+
+        # LAYER 1: warm the pooled session while the student browses.
+        from app.utils import spawn_tracked
+        from app.services.session_warmer import request_session_warm
+        spawn_tracked(request_session_warm(user.id), name=f"sw-inbox-{user.id}")
 
         from app.db.repositories.inbox_repository import InboxRepository
         inbox_repo = InboxRepository(session)

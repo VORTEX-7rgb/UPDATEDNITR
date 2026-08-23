@@ -88,6 +88,17 @@ def _client_is_usable(entry: _Entry) -> bool:
         return False
 
 
+def is_session_warm(user_id: int) -> bool:
+    """True when a usable pooled session exists for this user with a healthy
+    remaining lifetime. Used by the Layer-1 session warmer to skip jobs."""
+    entry = _pool.get(user_id)
+    return (
+        entry is not None
+        and entry.expires > time.monotonic() + 60
+        and _client_is_usable(entry)
+    )
+
+
 async def _evict_if_over_cap() -> None:
     if len(_pool) < MAX_POOLED_SESSIONS:
         return

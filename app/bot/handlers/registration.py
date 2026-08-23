@@ -93,6 +93,11 @@ async def cmd_start(message: types.Message, state: FSMContext):
         # checks out a fresh pool connection that nothing ever closes again.
         if user:
             await state.clear()
+            # LAYER 1: fire-and-forget session warm — by the time the student
+            # reads the dashboard and taps a module, login is already done.
+            from app.utils import spawn_tracked as _spawn
+            from app.services.session_warmer import request_session_warm
+            _spawn(request_session_warm(user.id), name=f"sw-{user.id}")
             # Text-only dashboard (PNG photo card removed by design decision).
             text = await render_dashboard(session, user, unread_count)
             kb = get_dashboard_keyboard(unread_count)

@@ -133,6 +133,11 @@ async def _handle_day_display(telegram_user_id: int, weekday: int) -> tuple[str,
                 types.InlineKeyboardMarkup(inline_keyboard=[]),
             )
 
+        # LAYER 1: keep the portal session warm while browsing the schedule.
+        from app.utils import spawn_tracked
+        from app.services.session_warmer import request_session_warm
+        spawn_tracked(request_session_warm(user.id), name=f"sw-tt-{user.id}")
+
         tt_repo = TimetableRepository(session)
         entries = await tt_repo.get_user_timetable(user.id)
         last_synced = max((e.synced_at for e in entries if e.synced_at is not None), default=None)
