@@ -31,10 +31,10 @@ from app.services.lock_service import user_lock
 
 logger = logging.getLogger(__name__)
 
-# Semaphores and intervals
-SYNC_SEMAPHORE_LIMIT = 10
-SYNC_INTERVAL_SECONDS = 7200  # Sync all users every 2 hours
-DISPATCH_INTERVAL_SECONDS = 60  # Poll and send Telegram notifications every 60 seconds
+# NOTE: The legacy SYNC_SEMAPHORE_LIMIT / SYNC_INTERVAL_SECONDS /
+# DISPATCH_INTERVAL_SECONDS constants were removed — they were superseded by
+# the Phase-5 durable scheduler (MODULE_TTL_SECONDS + SCHEDULER_* in
+# app/config.py) and nothing imported them.
 
 
 async def wait_for_db_recovery(worker_name: str) -> None:

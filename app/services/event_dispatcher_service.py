@@ -63,23 +63,24 @@ from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, Teleg
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram import types
 
+from app.config import config
 from app.db.models import Event, EventType
 from app.utils import esc, safe_truncate
 
 logger = logging.getLogger(__name__)
 
-# ── Tunables ────────────────────────────────────────────────────────────────
+# ── Tunables (env-driven via app.config — single source of truth) ───────────
 # PERF #5: Telegram allows ~30 msg/s broadcast limit. With DISPATCH_BATCH_SIZE=600
 # and 35ms inter-message pacing (~28 msg/s), 600 notifications drain in ~21s,
 # delivering campus-wide notices to 1,000+ students in ~35s flat without hitting 429 FloodWait.
-DISPATCH_BATCH_SIZE = 600               # events claimed per cycle
-CLAIM_STALE_SECONDS = 300               # 5 min — stale claims reclaimable
-MAX_DISPATCH_ATTEMPTS = 5               # → permanent_failure after N retries
-DISPATCH_INTERVAL_SECONDS = 5           # main loop sleep (5s)
-REAPER_INTERVAL_SECONDS = 60            # stale-claim reaper sleep
-PER_EVENT_SEND_TIMEOUT = 30             # bot.send_message timeout (seconds)
-FLOODWAIT_MAX_RETRIES = 3               # per-event FloodWait retries
-INTER_MESSAGE_PACING_SECONDS = 0.035    # 35ms pacing ≈ ~28 msg/s (< 30 msg/s Telegram ceiling)
+DISPATCH_BATCH_SIZE = config.DISPATCH_BATCH_SIZE               # events claimed per cycle
+CLAIM_STALE_SECONDS = config.DISPATCH_CLAIM_STALE_SECONDS      # 5 min — stale claims reclaimable
+MAX_DISPATCH_ATTEMPTS = config.DISPATCH_MAX_ATTEMPTS           # → permanent_failure after N retries
+DISPATCH_INTERVAL_SECONDS = config.DISPATCH_INTERVAL_SECONDS   # main loop sleep (5s)
+REAPER_INTERVAL_SECONDS = config.DISPATCH_REAPER_INTERVAL_SECONDS  # stale-claim reaper sleep
+PER_EVENT_SEND_TIMEOUT = config.DISPATCH_SEND_TIMEOUT_SECONDS  # bot.send_message timeout (seconds)
+FLOODWAIT_MAX_RETRIES = config.DISPATCH_FLOODWAIT_MAX_RETRIES  # per-event FloodWait retries
+INTER_MESSAGE_PACING_SECONDS = config.DISPATCH_PACING_SECONDS  # 35ms pacing ≈ ~28 msg/s
 
 
 # ── Atomic claim — multi-process safe ──────────────────────────────────────

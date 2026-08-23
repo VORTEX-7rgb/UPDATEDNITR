@@ -1,8 +1,9 @@
 """Event persistence repository using SQLAlchemy async sessions."""
 
 import logging
+from datetime import datetime
 from typing import Any
-from sqlalchemy import select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Event
@@ -61,4 +62,28 @@ class EventRepository:
         )
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
+
+    async def purge_terminal_batch(self, older_than: datetime, limit: int = 5000) -> int:
+        """Delete ONE batch of terminal events (sent or permanent-failure) older than cutoff.
+
+        Pending/in-flight events are never touched — only rows whose delivery
+        state machine reached a terminal outcome AND aged past ``older_than``.
+        Callers own transaction boundaries; run repeatedly until it returns
+        less than ``limit`` to drain fully (see RetentionService).
+        """
+        if limit < 1:
+            return 0
+        victim_ids = (
+            select(Event.id)
+            .where(
+                or_(Event.sent.is_(True), Event.permanent_failure.is_(True)),
+                Event.created_at < older_than,
+            )
+            .limit(limit)
+        )
+        result = await self.session.execute(delete(Event).where(Event.id.in_(victim_ids)))
+        deleted = result.rowcount or 0
+        if deleted:
+            logger.info("Retention: purged %d terminal event(s) this batch.", deleted)
+        return deleted
 

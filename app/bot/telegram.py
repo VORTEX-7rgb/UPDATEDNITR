@@ -47,9 +47,19 @@ from app.bot.qpaper_registry import init_qpaper_service, shutdown_qpaper_service
 
 # --- Global error handler ----------------------------------------------------
 
+_GENERIC_ERROR_TEXT = (
+    "🦀 <b>Something broke on our side.</b>\n\n"
+    "Your existing data is still safe. Try again in a moment."
+)
+
+
 @dp.errors()
 async def db_error_handler(event: ErrorEvent):
-    """Global error handler for database connection/offline issues."""
+    """Global error handler: DB-offline nicety + catch-all so NO update dies silently.
+
+    Previously non-DB exceptions returned False and vanished — users tapped a
+    button and got zero feedback while the only trace was an internal log line.
+    """
     exception = event.exception
     if is_db_connection_error(exception):
         logger.error("Database offline error intercepted: %r", exception)
@@ -77,7 +87,30 @@ async def db_error_handler(event: ErrorEvent):
         except Exception as send_err:
             logger.error("Failed to notify user of DB offline status: %r", send_err)
         return True
-    return False
+
+    # ── Catch-all: log with full traceback, answer the user, stop propagation.
+    logger.error(
+        "Unhandled handler error on update_id=%s: %r",
+        getattr(event.update, "update_id", "?"),
+        exception,
+        exc_info=exception,
+    )
+    update = event.update
+    try:
+        if update.message:
+            await update.message.answer(_GENERIC_ERROR_TEXT, parse_mode=ParseMode.HTML)
+        elif update.callback_query:
+            try:
+                await update.callback_query.answer(
+                    "🦀 Something went wrong. Please try again.", show_alert=True
+                )
+            except Exception:
+                await update.callback_query.message.answer(
+                    _GENERIC_ERROR_TEXT, parse_mode=ParseMode.HTML
+                )
+    except Exception as send_err:
+        logger.error("Failed to deliver generic error notice: %r", send_err)
+    return True
 
 
 # --- Backward-compatibility re-exports --------------------------------------

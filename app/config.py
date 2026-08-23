@@ -128,10 +128,95 @@ class Config:
     # cold-start / post-downtime thundering herd (all 5k users due at once).
     SCHEDULER_MAX_QUEUE_DEPTH = int(os.getenv("SCHEDULER_MAX_QUEUE_DEPTH", "50"))
 
+    # ── Per-user operation cooldowns (rate_limiter) ─────────────────────────
+    # Minimum seconds between repeated user-triggered operations. These are
+    # UX/abuse guards, not portal protection — the gateway handles that.
+    COOLDOWN_ATTENDANCE_REFRESH = int(os.getenv("COOLDOWN_ATTENDANCE_REFRESH", "60"))
+    COOLDOWN_INBOX_REFRESH = int(os.getenv("COOLDOWN_INBOX_REFRESH", "60"))
+    COOLDOWN_ATTACHMENT_DOWNLOAD = int(os.getenv("COOLDOWN_ATTACHMENT_DOWNLOAD", "10"))
+    COOLDOWN_PAPERS_SEARCH = int(os.getenv("COOLDOWN_PAPERS_SEARCH", "10"))
+    # Prune expired cooldown entries every N writes — the bounded-memory sweep.
+    RATE_LIMITER_PRUNE_EVERY = int(os.getenv("RATE_LIMITER_PRUNE_EVERY", "256"))
+
+    # ── Retention sweeper (snapshots + events) ──────────────────────────────
+    # The snapshots table is append-only by design; consumers only ever read
+    # the LATEST row per (user, module). This sweeper deletes superseded rows
+    # so the table cannot grow unbounded at scale. Same idea for terminal
+    # (sent / permanent-failure) events past a grace window.
+    # How often the sweeper wakes up.
+    RETENTION_INTERVAL_SECONDS = int(os.getenv("RETENTION_INTERVAL_SECONDS", str(6 * 3600)))
+    # Newest N snapshots kept per (user_id, module_name). Rank 1..N always survive,
+    # so every consumer reading "latest snapshot" is unaffected.
+    RETENTION_SNAPSHOT_KEEP = int(os.getenv("RETENTION_SNAPSHOT_KEEP", "10"))
+    # Terminal events older than this many days are purged.
+    RETENTION_EVENT_DAYS = int(os.getenv("RETENTION_EVENT_DAYS", "14"))
+    # Rows deleted per statement/transaction — keeps every txn short so locks
+    # are brief and autovacuum keeps up (never one giant DELETE).
+    RETENTION_DELETE_BATCH = int(os.getenv("RETENTION_DELETE_BATCH", "5000"))
+    # Pause between delete batches — yields to other work and smooths WAL churn.
+    RETENTION_BATCH_PAUSE_SECONDS = float(os.getenv("RETENTION_BATCH_PAUSE_SECONDS", "0.5"))
+
+    # ── NITRIS session pool (per-user authenticated clients) ───────────────
+    NITRIS_SESSION_TTL_SECONDS = float(os.getenv("NITRIS_SESSION_TTL_SECONDS", "1800"))
+    NITRIS_SESSION_POOL_MAX = int(os.getenv("NITRIS_SESSION_POOL_MAX", "256"))
+
+    # ── NITRIS gateway extras ────────────────────────────────────────────────
+    # Cooldown after which a quarantined/failed credential may retry login.
+    NITRIS_CREDENTIAL_COOLDOWN_SECONDS = int(os.getenv("NITRIS_CREDENTIAL_COOLDOWN_SECONDS", "3600"))
+    # Background work leaves this many gateway slots free for interactive taps.
+    NITRIS_RESERVED_INTERACTIVE_SLOTS = int(os.getenv("NITRIS_RESERVED_INTERACTIVE_SLOTS", "2"))
+
+    # ── NITRIS client HTTP behavior ──────────────────────────────────────────
+    # Per-request timeout applied to every portal call.
+    NITRIS_HTTP_TIMEOUT_SECONDS = float(os.getenv("NITRIS_HTTP_TIMEOUT_SECONDS", "30.0"))
+    # Resolved module-URL cache lifetime (skips Home.aspx discovery GET).
+    NITRIS_URL_CACHE_TTL_SECONDS = float(os.getenv("NITRIS_URL_CACHE_TTL_SECONDS", "600"))
+    # Year/session probe-hint lifetime (skip redundant dropdown probes).
+    NITRIS_PROBE_HINT_TTL_SECONDS = float(os.getenv("NITRIS_PROBE_HINT_TTL_SECONDS", "2700"))
+
+    # ── Event dispatcher ─────────────────────────────────────────────────────
+    # Telegram allows ~30 msg/s broadcast limit. With DISPATCH_BATCH_SIZE=600 and
+    # 35ms inter-message pacing (~28 msg/s), 600 notifications drain in ~21s,
+    # delivering campus-wide notices to 1,000+ students in ~35s flat without
+    # hitting 429 FloodWait.
+    DISPATCH_BATCH_SIZE = int(os.getenv("DISPATCH_BATCH_SIZE", "600"))
+    DISPATCH_CLAIM_STALE_SECONDS = int(os.getenv("DISPATCH_CLAIM_STALE_SECONDS", "300"))
+    DISPATCH_MAX_ATTEMPTS = int(os.getenv("DISPATCH_MAX_ATTEMPTS", "5"))
+    DISPATCH_INTERVAL_SECONDS = int(os.getenv("DISPATCH_INTERVAL_SECONDS", "5"))
+    DISPATCH_REAPER_INTERVAL_SECONDS = int(os.getenv("DISPATCH_REAPER_INTERVAL_SECONDS", "60"))
+    DISPATCH_SEND_TIMEOUT_SECONDS = int(os.getenv("DISPATCH_SEND_TIMEOUT_SECONDS", "30"))
+    DISPATCH_FLOODWAIT_MAX_RETRIES = int(os.getenv("DISPATCH_FLOODWAIT_MAX_RETRIES", "3"))
+    DISPATCH_PACING_SECONDS = float(os.getenv("DISPATCH_PACING_SECONDS", "0.035"))
+
+    # ── Question-paper cache service (mirrors the ATTACHMENT_* block) ───────
+    QP_MAX_CONCURRENT_ACQUISITIONS = int(os.getenv("QP_MAX_CONCURRENT_ACQUISITIONS", "8"))
+    QP_MAX_CONCURRENT_DELIVERIES = int(os.getenv("QP_MAX_CONCURRENT_DELIVERIES", "25"))
+    QP_ACQUIRE_STALE_SECONDS = int(os.getenv("QP_ACQUIRE_STALE_SECONDS", "300"))
+    QP_PERMANENT_AFTER = int(os.getenv("QP_PERMANENT_AFTER", "5"))
+    QP_WAIT_POLL_INTERVAL_SECONDS = float(os.getenv("QP_WAIT_POLL_INTERVAL_SECONDS", "2.0"))
+    QP_WAIT_TIMEOUT_SECONDS = float(os.getenv("QP_WAIT_TIMEOUT_SECONDS", "60.0"))
+    QP_FLOODWAIT_MAX_RETRIES = int(os.getenv("QP_FLOODWAIT_MAX_RETRIES", "3"))
+    QP_DELIVERY_MAX_RETRIES = int(os.getenv("QP_DELIVERY_MAX_RETRIES", "3"))
+    QP_DELIVERY_RETRY_BASE_DELAY = float(os.getenv("QP_DELIVERY_RETRY_BASE_DELAY", "1.0"))
+
+    # ── Broadcast / UX timings ───────────────────────────────────────────────
+    BROADCAST_MAX_RETRIES = int(os.getenv("BROADCAST_MAX_RETRIES", "3"))
+    BROADCAST_PACING_SECONDS = float(os.getenv("BROADCAST_PACING_SECONDS", "0.05"))
+    BROADCAST_PROGRESS_EVERY = int(os.getenv("BROADCAST_PROGRESS_EVERY", "250"))
+    ATTENDANCE_SLOW_AFTER_SECONDS = float(os.getenv("ATTENDANCE_SLOW_AFTER_SECONDS", "3.5"))
+    COOLDOWN_TIMETABLE_SYNC = int(os.getenv("COOLDOWN_TIMETABLE_SYNC", "60"))
+
+    # ── DB engine housekeeping ───────────────────────────────────────────────
+    DB_POOL_DISPOSE_DEBOUNCE_SECONDS = float(os.getenv("DB_POOL_DISPOSE_DEBOUNCE_SECONDS", "60"))
+
     # ── Debug mode (Phase 0 security) ───────────────────────────────────────
     # When True, NITRIS HTML snapshots are saved to disk for debugging.
-    # MUST be False in production — snapshots contain student PII.
+    # MUST be False in production — snapshots contain student PII, and the
+    # disk writes are synchronous/blocking inside the event loop.
+    # Booting with DEBUG=true requires ALSO setting ALLOW_DEBUG_IN_PROD=1
+    # (enforced in app.main) so a stray .env can never ship PII dumps silently.
     DEBUG = os.getenv("DEBUG", "").lower() in ("1", "true", "yes")
+    ALLOW_DEBUG_IN_PROD = os.getenv("ALLOW_DEBUG_IN_PROD", "").lower() in ("1", "true", "yes")
 
     # ── Timetable feature (Phase 6) ────────────────────────────────────────
     # Lookahead window for the "next class" search when there are no more

@@ -57,16 +57,17 @@ from app.utils import esc
 
 logger = logging.getLogger(__name__)
 
-# Tunables — exposed as module-level for tests + ops tuning.
-MAX_CONCURRENT_ACQUISITIONS = 8       # caps NITRIS load + memory (8 × ~5MB PDFs = 40MB)
-MAX_CONCURRENT_DELIVERIES = 25        # under Telegram's ~30/sec bot rate limit
-ACQUIRE_STALE_SECONDS = 300            # 5 min — stale locks become reclaimable
-ACQUIRE_PERMANENT_AFTER = 5           # retryable_failure becomes permanent_failure after N attempts
-WAIT_POLL_INTERVAL_SEC = 2.0
-WAIT_TIMEOUT_SEC = 60.0
-FLOODWAIT_MAX_RETRIES = 3
-DELIVERY_MAX_RETRIES = 3
-DELIVERY_RETRY_BASE_DELAY = 1.0
+# Tunables — env-driven via app.config (single source of truth), re-exported
+# as module-level names so tests and call sites stay stable.
+MAX_CONCURRENT_ACQUISITIONS = config.QP_MAX_CONCURRENT_ACQUISITIONS   # caps NITRIS load + memory
+MAX_CONCURRENT_DELIVERIES = config.QP_MAX_CONCURRENT_DELIVERIES       # under Telegram's ~30/sec bot rate limit
+ACQUIRE_STALE_SECONDS = config.QP_ACQUIRE_STALE_SECONDS               # 5 min — stale locks become reclaimable
+ACQUIRE_PERMANENT_AFTER = config.QP_PERMANENT_AFTER                   # retryable_failure → permanent_failure after N attempts
+WAIT_POLL_INTERVAL_SEC = config.QP_WAIT_POLL_INTERVAL_SECONDS
+WAIT_TIMEOUT_SEC = config.QP_WAIT_TIMEOUT_SECONDS
+FLOODWAIT_MAX_RETRIES = config.QP_FLOODWAIT_MAX_RETRIES
+DELIVERY_MAX_RETRIES = config.QP_DELIVERY_MAX_RETRIES
+DELIVERY_RETRY_BASE_DELAY = config.QP_DELIVERY_RETRY_BASE_DELAY
 
 
 @dataclass

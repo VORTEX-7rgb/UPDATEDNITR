@@ -49,7 +49,7 @@ def is_db_connection_error(e: Exception) -> bool:
 # Disposing the whole engine pool from each of them tears down connections
 # other tasks are still using and multiplies the churn. The dispose now runs
 # at most once per debounce window, under a lock.
-_POOL_DISPOSE_DEBOUNCE_SECONDS = 60.0
+_POOL_DISPOSE_DEBOUNCE_SECONDS = config.DB_POOL_DISPOSE_DEBOUNCE_SECONDS
 _last_pool_dispose = 0.0
 _dispose_lock = asyncio.Lock()
 

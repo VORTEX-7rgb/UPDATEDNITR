@@ -68,7 +68,7 @@ logger = logging.getLogger(__name__)
 # Context-safety note: the launcher visit still happens on EVERY cache hit
 # (inside _resolve_module_subpage_url), because that visit is what sets the
 # PER-SESSION Server['CurrentModule'] — only the Home discovery is skipped.
-_RESOLVED_URL_TTL_SECONDS = 600.0  # 10 minutes
+_RESOLVED_URL_TTL_SECONDS = config.NITRIS_URL_CACHE_TTL_SECONDS  # 10 minutes
 _resolved_url_cache: dict[tuple[str, str], tuple[str, str, float]] = {}
 # key -> (launcher_href, subpage_href, expires_at_monotonic)
 
@@ -118,7 +118,7 @@ async def close_shared_transport() -> None:
 # worked for this student. The NEXT scrape tries them FIRST, skipping the
 # usual probe round-trips (~0.5–2s). Wrong/stale hints degrade gracefully:
 # they simply fail the existing skip-checks and the normal probe order runs.
-_PROBE_HINT_TTL_SECONDS = 2700.0  # 45 min
+_PROBE_HINT_TTL_SECONDS = config.NITRIS_PROBE_HINT_TTL_SECONDS  # 45 min
 _probe_hints: dict[str, tuple[str, str, float]] = {}
 
 
@@ -148,7 +148,7 @@ class NitrisClient:
         self.client = httpx.AsyncClient(
             base_url=self.base_url,
             headers=DEFAULT_HEADERS,
-            timeout=30.0,
+            timeout=config.NITRIS_HTTP_TIMEOUT_SECONDS,
             follow_redirects=True,
             limits=limits,
             # PERF #3: shared process-wide connection pool. Per-request

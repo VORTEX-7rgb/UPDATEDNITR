@@ -185,10 +185,10 @@ async def cmd_admin_reset_qp(message: types.Message):
 
 # --- Broadcast ---
 
-BROADCAST_MAX_RETRIES = 3      # per-user FloodWait/transient retries
-BROADCAST_PACING_SECONDS = 0.05  # ~20 msg/s, under Telegram's ~30/s global limit
-BROADCAST_MAX_LEN = 4000        # Telegram hard limit is 4096; leave headroom
-BROADCAST_PROGRESS_EVERY = 250  # edit status message every N sends
+BROADCAST_MAX_RETRIES = config.BROADCAST_MAX_RETRIES        # per-user FloodWait/transient retries
+BROADCAST_PACING_SECONDS = config.BROADCAST_PACING_SECONDS  # ~20 msg/s, under Telegram's ~30/s global limit
+BROADCAST_MAX_LEN = 4000        # Telegram hard limit is 4096; leave headroom (protocol constant)
+BROADCAST_PROGRESS_EVERY = config.BROADCAST_PROGRESS_EVERY  # edit status message every N sends
 
 
 async def _send_broadcast_one(bot, telegram_id: int, text: str, pin: bool = False) -> str:

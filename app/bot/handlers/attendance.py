@@ -18,6 +18,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
+from app.config import config
 from app.db.database import get_db_session
 from app.db.models import User
 from app.services.attendance_health import (
@@ -34,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 router = Router(name="attendance_router")
 
-SLOW_AFTER_SECONDS = 3.5
+SLOW_AFTER_SECONDS = config.ATTENDANCE_SLOW_AFTER_SECONDS
 ATTLIST_CB = "ui|attlist"
 ATTSUB_PREFIX = "ui|attsub|"
 
@@ -226,6 +227,10 @@ async def _run_flow(surf: Surface, user_id: int, cached: AttendanceSummary | Non
 
     except NitrisCircuitOpenError:
         await surf.final(_list_text(cached, copy.CIRCUIT_DOWN), _kb_viewing(cached))
+    except RuntimeError as e:
+        # Queue-full rejection (hard depth cap) — tell the user instead of dying.
+        logger.warning("Attendance enqueue rejected: %r", e)
+        await surf.final(_list_text(cached, copy.QUEUE_BUSY), _kb_viewing(cached))
 
 
 # ── Entry points ────────────────────────────────────────────────────────────

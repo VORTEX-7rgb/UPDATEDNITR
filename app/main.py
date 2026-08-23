@@ -8,6 +8,7 @@ from aiogram.enums import ParseMode
 from app.config import config
 from app.bot.telegram import dp, init_qpaper_service, shutdown_qpaper_service
 from app.services.attachment_service import init_attachment_service, shutdown_attachment_service
+from app.services.retention_service import init_retention_service, shutdown_retention_service
 from app.db.database import async_session_factory
 from app.workers.sync_worker import (
     run_dispatch_worker,
@@ -32,6 +33,16 @@ logging.basicConfig(
 async def main():
     if not config.BOT_TOKEN:
         logging.error("BOT_TOKEN is not set in .env")
+        return
+
+    # ── Production safety: DEBUG mode writes full NITRIS HTML (student PII)
+    # to disk synchronously inside the event loop. Never boot with it unless
+    # it was requested explicitly via ALLOW_DEBUG_IN_PROD=1.
+    if config.DEBUG and not config.ALLOW_DEBUG_IN_PROD:
+        logging.error(
+            "Refusing to start: DEBUG=true dumps student PII to disk. "
+            "Set DEBUG=false (or ALLOW_DEBUG_IN_PROD=1 if you really mean it)."
+        )
         return
 
     session = AiohttpSession(timeout=300)
@@ -68,6 +79,9 @@ async def main():
     # Initialize Event Dispatcher service & start background stale-claim reaper
     await init_event_dispatcher(bot)
 
+    # Initialize Retention sweeper & start bounded purge of snapshots/events
+    init_retention_service(async_session_factory)
+
     # ── Phase 5: Start the durable scheduler (replaces run_sync_worker) ──
     scheduler_task = asyncio.create_task(run_scheduler_loop(bot))
     
@@ -99,6 +113,7 @@ async def main():
         await shutdown_qpaper_service()
         await shutdown_attachment_service()
         await shutdown_event_dispatcher()
+        await shutdown_retention_service()
         
         scheduler_task.cancel()
         dispatch_worker_task.cancel()

@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 router = Router(name="timetable_router")
 
-COOLDOWN_TIMETABLE_SYNC = 60  # seconds
+COOLDOWN_TIMETABLE_SYNC = config.COOLDOWN_TIMETABLE_SYNC  # seconds (env-tunable)
 
 
 # ── Keyboards ────────────────────────────────────────────────────────────────
@@ -167,25 +167,33 @@ async def _enqueue_sync(
             return False, "⚠️ Your credentials are marked invalid. Use /forgot to update them."
         user_id = user.id
 
-    # Check anti-spam cooldown (proper async await)
+    # Check anti-spam cooldown BEFORE enqueueing...
     allowed, wait = await operation_cooldown.check(
         user_id, "timetable_sync", cooldown_seconds=COOLDOWN_TIMETABLE_SYNC
     )
     if not allowed:
         return False, f"⏳ Please wait <b>{wait}s</b> before syncing timetable again."
 
-    # Enqueue job to NitrisJobQueue
+    # ...but RELEASE it if the enqueue fails — a rejected job must never
+    # leave the user locked out with nothing scheduled.
     dedup_key = f"{config.TIMETABLE_SYNC_DEDUP_PREFIX}:{user_id}"
-    await nitris_job_queue.enqueue(
-        job_type="timetable_sync",
-        user_id=user_id,
-        priority=Priority.HIGH,
-        payload={
-            "callback_chat_id": callback_chat_id,
-            "callback_message_id": callback_message_id,
-        },
-        dedup_key=dedup_key,
-    )
+    try:
+        await nitris_job_queue.enqueue(
+            job_type="timetable_sync",
+            user_id=user_id,
+            priority=Priority.HIGH,
+            payload={
+                "callback_chat_id": callback_chat_id,
+                "callback_message_id": callback_message_id,
+            },
+            dedup_key=dedup_key,
+        )
+    except RuntimeError as e:
+        await operation_cooldown.clear(user_id, "timetable_sync")
+        logger.warning("Timetable sync enqueue rejected: %r", e)
+        from app.ui.copy import QUEUE_BUSY
+        return False, QUEUE_BUSY
+
     return True, "🔄 <b>Syncing timetable with NITRIS...</b>\n<i>Please wait a few seconds.</i>"
 
 

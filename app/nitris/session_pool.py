@@ -26,6 +26,7 @@ import logging
 import time
 from typing import Any, Awaitable, Callable, Optional, TypeVar
 
+from app.config import config
 from app.db.crypto import decrypt_password
 from app.nitris.client import NitrisClient
 
@@ -37,8 +38,8 @@ T = TypeVar("T")
 # server-side (sliding), so a 30-min client TTL stays inside that window and
 # background syncs mostly stop re-logging entirely. A stale reuse is harmless:
 # SessionExpiredError drops the entry and the next run re-authenticates.
-SESSION_TTL_SECONDS = 1800.0      # 30 min, sliding on every successful run
-MAX_POOLED_SESSIONS = 256         # safe with the SHARED httpx transport (#3)
+SESSION_TTL_SECONDS = config.NITRIS_SESSION_TTL_SECONDS   # 30 min, sliding on every successful run
+MAX_POOLED_SESSIONS = config.NITRIS_SESSION_POOL_MAX      # safe with the SHARED httpx transport (#3)
 
 from app.nitris.exceptions import (  # noqa: E402
     CredentialsQuarantinedError,

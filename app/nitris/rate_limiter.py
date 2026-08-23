@@ -5,10 +5,21 @@ import asyncio
 import time
 from typing import Dict, Tuple, Optional
 
-COOLDOWN_ATTENDANCE_REFRESH = 60
-COOLDOWN_INBOX_REFRESH = 60
-COOLDOWN_ATTACHMENT_DOWNLOAD = 10
-COOLDOWN_PAPERS_SEARCH = 10
+from app.config import config
+
+# Cooldown windows are env-tunable via config (source of truth) and re-exported
+# here so handler imports stay stable.
+COOLDOWN_ATTENDANCE_REFRESH = config.COOLDOWN_ATTENDANCE_REFRESH
+COOLDOWN_INBOX_REFRESH = config.COOLDOWN_INBOX_REFRESH
+COOLDOWN_ATTACHMENT_DOWNLOAD = config.COOLDOWN_ATTACHMENT_DOWNLOAD
+COOLDOWN_PAPERS_SEARCH = config.COOLDOWN_PAPERS_SEARCH
+
+# Sweep cadence: prune expired entries every N successful writes. Keeps the
+# dict bounded without holding the lock for long (one O(n) pass per N cheap
+# writes is amortized O(1)). Without this, keys accumulate forever — each
+# user/operation/per-object combo (e.g. "{uid}:attachment_download:{msg_id}")
+# would otherwise leak until restart.
+_PRUNE_EVERY_WRITES = config.RATE_LIMITER_PRUNE_EVERY
 
 
 class OperationCooldown:
@@ -17,6 +28,14 @@ class OperationCooldown:
     def __init__(self):
         self._cooldowns: Dict[str, float] = {}
         self._lock = asyncio.Lock()
+        self._writes_since_prune = 0
+
+    def _prune_expired(self, now: float) -> int:
+        """Drop expired entries. Caller must hold the lock. Returns pruned count."""
+        expired = [k for k, exp in self._cooldowns.items() if now >= exp]
+        for k in expired:
+            del self._cooldowns[k]
+        return len(expired)
 
     async def check(
         self,
@@ -34,7 +53,12 @@ class OperationCooldown:
         lookup_key = f"{user_id}:{operation}" if key is None else f"{user_id}:{operation}:{key}"
 
         async with self._lock:
-            # Prune expired keys occasionally
+            # Prune expired keys periodically (bounded-memory guarantee).
+            self._writes_since_prune += 1
+            if self._writes_since_prune >= _PRUNE_EVERY_WRITES:
+                self._writes_since_prune = 0
+                self._prune_expired(now)
+
             expires_at = self._cooldowns.get(lookup_key)
             if expires_at is not None and now < expires_at:
                 remaining = int(expires_at - now) + 1
@@ -50,19 +74,31 @@ class OperationCooldown:
         async with self._lock:
             self._cooldowns.pop(lookup_key, None)
 
-    def get_stats(self) -> dict:
-        """Return diagnostic count of active cooldowns."""
+    async def prune_expired(self) -> int:
+        """Force-prune expired entries. Returns number removed (diagnostics/tests)."""
         now = time.monotonic()
-        active = [k for k, exp in self._cooldowns.items() if now < exp]
+        async with self._lock:
+            return self._prune_expired(now)
+
+    def get_stats(self) -> dict:
+        """Return diagnostic count of ACTIVE cooldowns, pruning stale entries first."""
+        now = time.monotonic()
+        # Best-effort prune without the lock (dict comprehension over a snapshot;
+        # single-threaded event loop makes this safe — check()/clear() mutate
+        # under the lock but we only delete already-expired keys).
+        expired = [k for k, exp in list(self._cooldowns.items()) if now >= exp]
+        for k in expired:
+            self._cooldowns.pop(k, None)
         return {
-            "active_cooldowns": len(active),
+            "active_cooldowns": len(self._cooldowns),
         }
 
 
 operation_cooldown = OperationCooldown()
 
 
-# Backward-compatible sync helpers
+# Backward-compatible sync helpers (no awaitable context). Kept pruned on read
+# so even this legacy path cannot grow without bound.
 _sync_cooldowns: Dict[Tuple[int, str], float] = {}
 
 def check_and_set_cooldown(user_id: int, operation: str, cooldown_seconds: int = 60) -> Tuple[bool, int]:

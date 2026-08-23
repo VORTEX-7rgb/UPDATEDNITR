@@ -137,6 +137,11 @@ async def render_single_message(event, user: User, msg: InboxMessage, session=No
         except NitrisCircuitOpenError:
             await surf.final(copy.CIRCUIT_DOWN, _fail_kb())
             return
+        except RuntimeError as e:
+            # Queue-full rejection — answer the user instead of an unhandled crash.
+            logger.warning("Inbox detail enqueue rejected: %r", e)
+            await surf.final(copy.QUEUE_BUSY, _fail_kb())
+            return
 
     sent_str = msg.sent_on.strftime("%d %b %Y")
     if msg.body is not None:
@@ -495,7 +500,15 @@ async def handle_inbox_back_dashboard(callback: types.CallbackQuery, state: FSMC
 @router.callback_query(F.data.startswith("msg_"))
 async def handle_message_detail(callback: types.CallbackQuery, state: FSMContext) -> None:
     telegram_id = callback.from_user.id
-    msg_id = int(callback.data.split("_")[1])
+    try:
+        msg_id = int(callback.data.split("_")[1])
+    except (IndexError, ValueError):
+        # Stale/malformed callback payload — ack it so the spinner stops.
+        try:
+            await callback.answer("This notice link has expired.", show_alert=False)
+        except Exception:
+            pass
+        return
 
     try:
         await callback.answer()
@@ -528,7 +541,14 @@ async def handle_message_detail(callback: types.CallbackQuery, state: FSMContext
 async def handle_download_attachment(callback: types.CallbackQuery, state: FSMContext) -> None:
     """Deliver an attachment via the GLOBAL AttachmentService."""
     telegram_id = callback.from_user.id
-    msg_id = int(callback.data.split("_")[1])
+    try:
+        msg_id = int(callback.data.split("_")[1])
+    except (IndexError, ValueError):
+        try:
+            await callback.answer("This attachment link has expired.", show_alert=False)
+        except Exception:
+            pass
+        return
 
     try:
         await callback.answer("⏳ Processing attachment...", show_alert=False)

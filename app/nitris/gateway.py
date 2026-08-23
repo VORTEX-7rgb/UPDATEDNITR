@@ -24,7 +24,7 @@ from app.nitris.exceptions import NitrisError, LoginError, SessionExpiredError, 
 
 logger = logging.getLogger(__name__)
 
-CREDENTIAL_COOLDOWN_SECONDS = 3600
+CREDENTIAL_COOLDOWN_SECONDS = config.NITRIS_CREDENTIAL_COOLDOWN_SECONDS
 
 
 class CircuitState(str, Enum):
@@ -40,7 +40,7 @@ class CircuitBreakerOpenError(NitrisError):
 
 # PERF P5: background work (scheduler syncs etc.) leaves this many gateway
 # slots free so an interactive tap never queues behind a sync storm.
-RESERVED_INTERACTIVE_SLOTS = 2
+RESERVED_INTERACTIVE_SLOTS = config.NITRIS_RESERVED_INTERACTIVE_SLOTS
 
 
 # Alias for backward and test compatibility

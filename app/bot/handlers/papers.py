@@ -219,6 +219,10 @@ async def handle_year_selected(callback: types.CallbackQuery, state: FSMContext)
         except NitrisCircuitOpenError:
             await surf.final(ui_copy.CIRCUIT_DOWN, _kb_back_year())
             return
+        except RuntimeError as e:
+            logger.warning("QP metadata enqueue rejected: %r", e)
+            await surf.final(ui_copy.QUEUE_BUSY, _kb_back_year())
+            return
 
         try:
             async with get_db_session() as session:
@@ -306,7 +310,14 @@ async def handle_paper_download(callback: types.CallbackQuery, state: FSMContext
         return
 
     telegram_id = callback.from_user.id
-    cache_id = int(callback.data.split("_")[-1])
+    try:
+        cache_id = int(callback.data.split("_")[-1])
+    except (IndexError, ValueError):
+        try:
+            await callback.answer("This paper link has expired.", show_alert=False)
+        except Exception:
+            pass
+        return
 
     # Resolve the requesting student so cold acquisitions run under THEIR OWN
     # NITRIS account (own-creds-first policy; pool is fallback only).
@@ -747,6 +758,11 @@ async def process_qp_search_query(message: types.Message, state: FSMContext) -> 
 
     except NitrisCircuitOpenError:
         await surf.final(ui_copy.CIRCUIT_DOWN, ui_theme.footer_kb())
+        await state.clear()
+        return
+    except RuntimeError as e:
+        logger.warning("QP search enqueue rejected: %r", e)
+        await surf.final(ui_copy.QUEUE_BUSY, ui_theme.footer_kb())
         await state.clear()
         return
 

@@ -23,6 +23,11 @@ GENERIC_ERROR = (
     "🦀 <b>Something broke on our side.</b>\n\n"
     "Your existing data is still safe. Try again in a moment."
 )
+QUEUE_BUSY = (
+    "🚦 <b>Claw's queue is jammed right now.</b>\n\n"
+    "Too many students are hitting the portal at once.\n"
+    "<i>Give it a few seconds and tap again.</i>"
+)
 
 # ── Attendance glossary (plain-English translations of NITRIS jargon) ──────
 GLOSSARY_TITLE = "📖 What NITRIS actually means"
