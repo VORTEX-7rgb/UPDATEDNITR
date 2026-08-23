@@ -396,6 +396,12 @@ async def handle_qp_download_all_prompt(callback: types.CallbackQuery, state: FS
 
 @router.callback_query(F.data.startswith("qp_dlall_yr_"))
 async def handle_qp_download_all_year(callback: types.CallbackQuery, state: FSMContext) -> None:
+    """Year tapped → render the Mid/End/Both chooser (does NOT execute yet).
+
+    Previously this launched the full batch immediately; now the student
+    picks which exam type they want. Old message bubbles keep working — their
+    year buttons land here and get the chooser gracefully.
+    """
     if qpaper_registry.qpaper_service is None:
         try:
             await callback.answer("❌ Service not initialized. Restart bot.", show_alert=True)
@@ -403,19 +409,77 @@ async def handle_qp_download_all_year(callback: types.CallbackQuery, state: FSMC
             pass
         return
 
-    telegram_id = callback.from_user.id
-    year_code = callback.data.split("_")[-1]
-    selected_year = YEAR_MAP.get(year_code)
-
     try:
         await callback.answer()
     except Exception:
         pass
 
+    year_code = callback.data.split("_")[-1]
+    selected_year = YEAR_MAP.get(year_code)
     if not selected_year:
-        await callback.message.answer("❌ Invalid academic year selected.")
+        await show(callback.message, "❌ Invalid academic year selected.")
         return
 
+    builder = InlineKeyboardBuilder()
+    builder.row(types.InlineKeyboardButton(text="📝 Mid Sem only", callback_data=f"qp_dlall_go_{year_code}_m"))
+    builder.row(types.InlineKeyboardButton(text="📗 End Sem only", callback_data=f"qp_dlall_go_{year_code}_e"))
+    builder.row(types.InlineKeyboardButton(text="📚 Both (everything)", callback_data=f"qp_dlall_go_{year_code}_b"))
+    builder.row(types.InlineKeyboardButton(text="◀️ Back to Years", callback_data="qp_dlall_prompt"))
+
+    text = (
+        f"📅 <b>{esc(selected_year)}</b> — what do you want?\n\n"
+        f"Pick which exam's papers to download for ALL your current subjects."
+    )
+    # PERF F1: not-modified-safe render.
+    await show(callback.message, text, reply_markup=builder.as_markup())
+
+
+# Exam-type filter suffixes for the batch executor.
+_EXAM_FILTER_MAP = {"m": "mid_sem", "e": "end_sem", "b": None}  # None = both
+_EXAM_FILTER_LABEL = {"m": "Mid Sem", "e": "End Sem", "b": "All papers"}
+
+
+@router.callback_query(F.data.startswith("qp_dlall_go_"))
+async def handle_qp_download_all_go(callback: types.CallbackQuery, state: FSMContext) -> None:
+    if qpaper_registry.qpaper_service is None:
+        try:
+            await callback.answer("❌ Service not initialized. Restart bot.", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    raw = callback.data.removeprefix("qp_dlall_go_")
+    try:
+        year_code, suffix = raw.rsplit("_", 1)
+    except ValueError:
+        try:
+            await callback.answer("This button has expired.", show_alert=False)
+        except Exception:
+            pass
+        return
+
+    target_exam = _EXAM_FILTER_MAP.get(suffix)
+    type_label = _EXAM_FILTER_LABEL.get(suffix)
+    if target_exam is None and suffix != "b":
+        try:
+            await callback.answer("This button has expired.", show_alert=False)
+        except Exception:
+            pass
+        return
+
+    selected_year = YEAR_MAP.get(year_code)
+
+    # PERF F3 — ACK FIRST: spinner dies before any DB work.
+    try:
+        await callback.answer("⚡ Starting batch…")
+    except Exception:
+        pass
+
+    if not selected_year:
+        await show(callback.message, "❌ Invalid academic year selected.")
+        return
+
+    telegram_id = callback.from_user.id
     status_msg = await callback.message.answer("⏳ Resolving current semester courses...")
 
     async with get_db_session() as session:
@@ -445,17 +509,20 @@ async def handle_qp_download_all_year(callback: types.CallbackQuery, state: FSMC
 
     async with get_db_session() as session:
         exam_service = ExaminationService(session)
+        types_to_check = ("mid_sem", "end_sem") if target_exam is None else (target_exam,)
         for course in courses:
             sub_code = course.get("subject_code") or ""
             if not sub_code:
                 continue
-            mid_cache = await exam_service.get_cached_paper(sub_code, selected_year, "mid_sem")
-            end_cache = await exam_service.get_cached_paper(sub_code, selected_year, "end_sem")
-            if mid_cache and mid_cache.status != "paper_not_available":
-                cache_ids_to_deliver.append(mid_cache.id)
-            if end_cache and end_cache.status != "paper_not_available":
-                cache_ids_to_deliver.append(end_cache.id)
-            if not mid_cache and not end_cache:
+            found_any = False
+            for exam_t in types_to_check:
+                cache_row = await exam_service.get_cached_paper(sub_code, selected_year, exam_t)
+                if cache_row and cache_row.status != "paper_not_available":
+                    cache_ids_to_deliver.append(cache_row.id)
+                    found_any = True
+            # Subject is "uncached" only when the SELECTED type(s) have no
+            # usable row — not when merely the other exam type is missing.
+            if not found_any:
                 uncached_courses.append(course)
 
     if uncached_courses:
@@ -518,6 +585,8 @@ async def handle_qp_download_all_year(callback: types.CallbackQuery, state: FSMC
                         subject_code=sub_code,
                     )
                     for rec in persisted:
+                        if target_exam is not None and rec.exam_type != target_exam:
+                            continue
                         if rec.status != "paper_not_available" and rec.id not in cache_ids_to_deliver:
                             cache_ids_to_deliver.append(rec.id)
                 await session.commit()
@@ -525,7 +594,7 @@ async def handle_qp_download_all_year(callback: types.CallbackQuery, state: FSMC
     if not cache_ids_to_deliver:
         await status_msg.edit_text(
             "ℹ️ <b>No papers available</b> for any of your current subjects "
-            f"in <b>{esc(selected_year)}</b>.",
+            f"in <b>{esc(selected_year)}</b> ({esc(type_label)}).",
             reply_markup=_qp_nav_markup(),
             parse_mode=ParseMode.HTML,
         )
@@ -566,6 +635,7 @@ async def handle_qp_download_all_year(callback: types.CallbackQuery, state: FSMC
     summary = (
         f"📋 <b>Batch download complete</b>\n\n"
         f"📅 Year: <b>{esc(selected_year)}</b>\n"
+        f"📝 Type: <b>{esc(type_label)}</b>\n"
         f"✅ Delivered: <b>{succeeded}</b>\n"
         f"ℹ️ No paper available: <b>{not_available}</b>\n"
         f"❌ Failed: <b>{failed}</b>\n"

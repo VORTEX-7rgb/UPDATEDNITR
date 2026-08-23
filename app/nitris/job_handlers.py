@@ -449,9 +449,11 @@ async def handle_qp_metadata_fetch(job: NitrisJob) -> dict:
         return {"success": False, "error": f"DB lookup failed: {e}"}
 
     # ── Step 2: NITRIS work — pooled authenticated session (PERF P1) ────
+    # NOTE: a dead `from app.nitris.parser import parse_question_papers_html`
+    # used to live here and raised ImportError on every batch metadata fetch
+    # (the name lives in examination_parser; this function never used it).
     try:
         from app.nitris.session_pool import with_pooled_session
-        from app.nitris.parser import parse_question_papers_html
 
         async def _work(client, password):
             from app.services.examination_service import ExaminationService
