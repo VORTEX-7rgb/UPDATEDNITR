@@ -7,3 +7,6 @@ python-dotenv==1.0.1
 cryptography>=42.0.0
 asyncpg>=0.29.0
 alembic>=1.13.1
+# IANA tz database — Windows (and minimal containers) ship no zoneinfo data;
+# app.config hard-requires Asia/Kolkata at import time.
+tzdata>=2024.1

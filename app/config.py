@@ -245,6 +245,14 @@ class Config:
     # Single-flight dedup key prefix for timetable sync jobs.
     TIMETABLE_SYNC_DEDUP_PREFIX = "timetable_sync"
 
+    # ── Predictive class-end sync (attendance) ──────────────────────────────
+    # When enabled, fires one background attendance sync per student shortly
+    # after their last class of the day ends. Default FALSE (opt-in).
+    ATTENDANCE_PREDICTIVE_SYNC_ENABLED = os.getenv("ATTENDANCE_PREDICTIVE_SYNC_ENABLED", "").lower() in ("1", "true", "yes")
+    PREDICTIVE_SYNC_DELAY_MINUTES = int(os.getenv("PREDICTIVE_SYNC_DELAY_MINUTES", "15"))
+    PREDICTIVE_SYNC_WINDOW_MINUTES = int(os.getenv("PREDICTIVE_SYNC_WINDOW_MINUTES", "20"))
+    PREDICTIVE_SYNC_BATCH_SIZE = int(os.getenv("PREDICTIVE_SYNC_BATCH_SIZE", "20"))
+
     # ── Phase 7: Inbox Cache-First + Global Attachment Cache config ─────────
     # Attachment acquisition staleness — a worker's lock lease expires after
     # this many seconds. Mirrors QP_CACHE_STALE_SECONDS.

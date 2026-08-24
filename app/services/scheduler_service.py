@@ -372,6 +372,14 @@ async def run_scheduler_loop(bot=None) -> None:
             await asyncio.sleep(0.5)
             continue
 
+        # Predictive class-end attendance sync pass (opt-in via env)
+        if config.ATTENDANCE_PREDICTIVE_SYNC_ENABLED:
+            try:
+                from app.services.class_end_sync import run_class_end_sync_cycle
+                await run_class_end_sync_cycle()
+            except Exception as e:
+                logger.warning("Predictive sync cycle failed (non-fatal): %r", e)
+
         await asyncio.sleep(poll_interval)
 
 

@@ -21,6 +21,29 @@ logger = logging.getLogger(__name__)
 
 DEBUG_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "debug_html")
 
+# ── PERF (single-parse memo) ────────────────────────────────────────────────
+# The attendance workflow calls extract_form_fields() + extract_dropdown_options()
+# up to 6 times over the SAME page HTML when zero postbacks fire (warm hint-hit
+# path). Each call used to rebuild a full BeautifulSoup tree — ~20-80ms of CPU
+# per parse on 100KB+ ASP.NET pages, ALL on the critical path of the student's
+# refresh. This tiny bounded memo makes consecutive extract_* calls over
+# identical HTML reuse one parsed tree. Bounded (≤4 entries, cleared FIFO-style)
+# so memory stays flat; keyed by string VALUE so identical content always hits.
+_soup_memo: dict[str, "BeautifulSoup"] = {}
+_SOUP_MEMO_MAX = 4
+
+
+def _soup_for(html: str):
+    """Return a (cached) BeautifulSoup tree for this exact page HTML."""
+    hit = _soup_memo.get(html)
+    if hit is not None:
+        return hit
+    soup = BeautifulSoup(html, HTML_PARSER)
+    if len(_soup_memo) >= _SOUP_MEMO_MAX:
+        _soup_memo.clear()
+    _soup_memo[html] = soup
+    return soup
+
 
 def is_error_page(html: str, response: httpx.Response = None) -> bool:
     """Check if the response is an IIS/ASP.NET error page (e.g. 503.aspx)."""
@@ -56,7 +79,7 @@ def extract_form_fields(html: str, exclude_placeholders: bool = True) -> dict[st
             server may reject as inconsistent. The caller is then expected to
             supply real values via form_updates in submit_postback.
     """
-    soup = BeautifulSoup(html, HTML_PARSER)
+    soup = _soup_for(html)
     form = soup.find("form")
     if not form:
         raise HiddenFieldExtractionError("No <form> found in HTML.")
@@ -110,7 +133,7 @@ def extract_form_fields(html: str, exclude_placeholders: bool = True) -> dict[st
 
 def extract_dropdown_options(html: str, select_name: str) -> list[tuple[str, str]]:
     """Extract (value, text) pairs from a <select> dropdown by name attribute."""
-    soup = BeautifulSoup(html, HTML_PARSER)
+    soup = _soup_for(html)
     select = soup.find("select", {"name": select_name})
     if not select:
         return []

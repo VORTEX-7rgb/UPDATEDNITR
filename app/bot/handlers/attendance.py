@@ -16,7 +16,6 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command, StateFilter
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import select
-from sqlalchemy.orm import selectinload
 
 from app.config import config
 from app.db.database import get_db_session
@@ -63,6 +62,36 @@ async def _load_summary(user_id: int) -> AttendanceSummary | None:
     if not isinstance(records, list):
         return None
     return summarize(records)
+
+
+def _summary_from_snapshot(snap) -> AttendanceSummary | None:
+    """Render-ready summary from an already-loaded Snapshot row (or None)."""
+    if not snap or not getattr(snap, "snapshot_json", None):
+        return None
+    records = snap.snapshot_json.get("records") or []
+    if not isinstance(records, list):
+        return None
+    return summarize(records)
+
+
+async def _load_user_and_summary(telegram_id: int):
+    """PERF: ONE session/round trip for (User, latest attendance summary).
+
+    Every attendance entry point previously paid two serial DB sessions
+    (user lookup, then snapshot load). Merged — first paint gets ~1 RTT
+    faster on every tap.
+    """
+    from app.db.repositories.snapshot_repository import SnapshotRepository
+    async with get_db_session() as session:
+        stmt = select(User.id).where(User.telegram_id == telegram_id)
+        uid = (await session.execute(stmt)).scalar_one_or_none()
+        snap = (
+            await SnapshotRepository(session).get_latest_snapshot(uid, "attendance")
+            if uid is not None else None
+        )
+    if uid is None:
+        return None, None
+    return uid, _summary_from_snapshot(snap)
 
 
 def _records_from_result(data) -> list[dict]:
@@ -222,9 +251,15 @@ async def _run_flow(
             },
         )
     except NitrisCircuitOpenError:
+        # PERF (fairness): the tap never produced a sync — give the user their
+        # cooldown back so a retry after the portal recovers isn't blocked.
+        from app.nitris.rate_limiter import operation_cooldown
+        await operation_cooldown.clear(user_id, "attendance_refresh")
         await surf.final(_list_text(cached, copy.CIRCUIT_DOWN), _kb_viewing(cached))
     except RuntimeError as e:
         # Queue-full rejection — answer the user instead of dying silently.
+        from app.nitris.rate_limiter import operation_cooldown
+        await operation_cooldown.clear(user_id, "attendance_refresh")
         logger.warning("Attendance refresh enqueue rejected: %r", e)
         await surf.final(_list_text(cached, copy.QUEUE_BUSY), _kb_viewing(cached))
 
@@ -260,23 +295,21 @@ async def fetch_attendance_for_callback(callback: types.CallbackQuery, user: Use
 async def cmd_attendance(message: types.Message):
     telegram_id = message.from_user.id
 
-    async with get_db_session() as session:
-        stmt = select(User).options(selectinload(User.sync_state)).where(
-            User.telegram_id == telegram_id
-        )
-        res = await session.execute(stmt)
-        user = res.scalar_one_or_none()
-
-    if not user:
+    # PERF: user + latest snapshot in ONE round trip (was two serial sessions).
+    user_id, cached = await _load_user_and_summary(telegram_id)
+    if user_id is None:
         await message.answer("⚠️ You haven't registered yet! Please use /start to register.")
         return
 
+    # Warm-on-interaction registry seed (see app/bot/middlewares.py).
+    from app.bot.middlewares import note_registered_user
+    note_registered_user(telegram_id, user_id)
+
     from app.nitris.rate_limiter import operation_cooldown, COOLDOWN_ATTENDANCE_REFRESH
     allowed, wait = await operation_cooldown.check(
-        user.id, "attendance_refresh", cooldown_seconds=COOLDOWN_ATTENDANCE_REFRESH
+        user_id, "attendance_refresh", cooldown_seconds=COOLDOWN_ATTENDANCE_REFRESH
     )
     if not allowed:
-        cached = await _load_summary(user.id)
         if cached:
             await message.answer(
                 _list_text(cached, f"⏳ Synced just now. Next live refresh in {wait}s."),
@@ -290,13 +323,12 @@ async def cmd_attendance(message: types.Message):
             )
         return
 
-    cached = await _load_summary(user.id)
     first = await message.answer(
         _list_text(cached, copy.UPDATING if cached and cached.subjects else None),
         reply_markup=_kb_busy(),
     )
     surf = Surface(first)
-    await _run_flow(surf, user.id, cached,
+    await _run_flow(surf, user_id, cached,
                     chat_id=first.chat.id,
                     message_id=first.message_id)
 
@@ -310,14 +342,12 @@ async def cb_attendance_list(callback: types.CallbackQuery):
     except Exception:
         pass
 
-    async with get_db_session() as session:
-        stmt = select(User).where(User.telegram_id == callback.from_user.id)
-        user = (await session.execute(stmt)).scalar_one_or_none()
-    if not user:
+    # PERF: one round trip (was user lookup + snapshot load).
+    user_id, summary = await _load_user_and_summary(callback.from_user.id)
+    if user_id is None:
         await show(callback.message, "⚠️ Not registered. Send /start.")
         return
 
-    summary = await _load_summary(user.id)
     await show(callback.message, _list_text(summary), _kb_viewing(summary))
 
 
@@ -330,14 +360,12 @@ async def cb_attendance_subject(callback: types.CallbackQuery):
 
     code = callback.data[len(ATTSUB_PREFIX):]
 
-    async with get_db_session() as session:
-        stmt = select(User).where(User.telegram_id == callback.from_user.id)
-        user = (await session.execute(stmt)).scalar_one_or_none()
-    if not user:
+    # PERF: one round trip (was user lookup + snapshot load).
+    user_id, summary = await _load_user_and_summary(callback.from_user.id)
+    if user_id is None:
         await show(callback.message, "⚠️ Not registered. Send /start.")
         return
 
-    summary = await _load_summary(user.id)
     target = next(
         (s for s in (summary.subjects if summary else []) if s.code.upper() == code.upper()),
         None,

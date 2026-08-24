@@ -45,7 +45,10 @@ async def main():
         )
         return
 
-    session = AiohttpSession(timeout=300)
+    # PERF: 90s (was 300s). A hung Telegram API call used to pin an interactive
+    # worker for 5 full minutes. 90s still comfortably covers worst-case large
+    # storage-channel uploads while bounding worst-case worker starvation.
+    session = AiohttpSession(timeout=90)
     bot = Bot(
         token=config.BOT_TOKEN, 
         session=session,

@@ -45,7 +45,7 @@ from app.services.attendance_service import get_attendance_data
 from app.services.snapshot_service import SnapshotService
 from app.workers.sync_worker import prepare_inbox_sync, persist_inbox_sync
 from app.nitris.auth_gate import on_login_failure
-from app.utils import esc
+from app.utils import esc, spawn_tracked
 
 from aiogram.enums import ParseMode
 
@@ -176,25 +176,12 @@ async def handle_attendance_refresh(job: NitrisJob) -> dict:
         )
         return {"success": False, "error": str(e), "data": None}
 
-    # ── Step 3: Save snapshot + fire events — OUTSIDE gateway slot ───
-    try:
-        async with get_db_session() as session:
-            async with session.begin():
-                snapshot_service = SnapshotService(session)
-                await snapshot_service.create_snapshot_if_changed(
-                    user_id=user_id,
-                    module_name="attendance",
-                    attendance_result=data,
-                )
-        # Update sync_state to reflect this manual refresh
-        await _update_sync_state(user_id, success=True)
-    except Exception as e:
-        logger.error("Failed to save attendance snapshot: %r", e)
-        # Don't fail the whole job — we still have fresh data to show
-
-    # ── Step 4 (LAYER 2): render the fresh list directly into the bubble ──
-    # Timetable-pattern: the JOB finishes the UX. No handler waits inline,
-    # interactive workers free instantly, bursts can never hang.
+    # ── Step 3 (LAYER 2): render the fresh list FIRST — before any DB writes ──
+    # PERF (render-first): the student's bubble updates the instant fresh data
+    # is in memory. Snapshot + SyncState persistence moved to a tracked
+    # background task so two sequential DB transactions no longer sit on the
+    # perceived-latency path. Persistence failures remain non-fatal and are
+    # logged exactly as before.
     if callback_chat_id and callback_message_id:
         try:
             from app.bot.handlers.attendance import (
@@ -211,6 +198,26 @@ async def handle_attendance_refresh(job: NitrisJob) -> dict:
             )
         except Exception as e:
             logger.warning("attendance_refresh: success self-render failed: %r", e)
+
+    # ── Step 4: persist snapshot + sync state — OFF the perceived path ────
+    def _spawn_persist() -> None:
+        async def _persist() -> None:
+            try:
+                async with get_db_session() as session:
+                    async with session.begin():
+                        snapshot_service = SnapshotService(session)
+                        await snapshot_service.create_snapshot_if_changed(
+                            user_id=user_id,
+                            module_name="attendance",
+                            attendance_result=data,
+                        )
+                # Update sync_state to reflect this manual refresh
+                await _update_sync_state(user_id, success=True)
+            except Exception as e:
+                logger.error("Failed to save attendance snapshot: %r", e)
+        spawn_tracked(_persist(), name=f"att-persist-{user_id}")
+
+    _spawn_persist()
 
     return {
         "success": True,

@@ -33,6 +33,9 @@ logger = logging.getLogger(__name__)
 
 dp = Dispatcher()
 
+from app.bot.middlewares import WarmSessionMiddleware
+dp.update.outer_middleware(WarmSessionMiddleware())
+
 dp.include_router(timetable_router)
 dp.include_router(registration_router)
 dp.include_router(attendance_router)
