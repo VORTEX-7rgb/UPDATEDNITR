@@ -49,13 +49,17 @@ from app.nitris.exceptions import (  # noqa: E402
 
 
 class _Entry:
-    __slots__ = ("client", "lock", "expires", "user_id")
+    __slots__ = ("client", "lock", "expires", "user_id", "needs_login")
 
     def __init__(self, client: NitrisClient, user_id: int) -> None:
         self.client = client
         self.user_id = user_id
         self.lock = asyncio.Lock()
         self.expires = time.monotonic() + SESSION_TTL_SECONDS
+        # True until a login completes for this client. Late-joining waiters
+        # read this under the lock, so two concurrent cold-starts for the same
+        # user share ONE login instead of racing duplicate entries.
+        self.needs_login = True
 
 
 _pool: dict[int, _Entry] = {}
@@ -131,31 +135,42 @@ async def with_pooled_session(
     global _pool  # noqa: F841  (module dict mutated in place; kept for clarity)
 
     # ── Validate/reap any existing entry ────────────────────────────────
+    # Never reap/close an entry whose lock is held: closing the client under
+    # a live scrape causes transport errors. An expired-but-busy entry falls
+    # through to reuse; if the portal session truly died, the existing
+    # SessionExpiredError → drop → re-auth path self-heals on the next run.
     entry = _pool.get(user_id)
-    if entry is not None and (
-        entry.expires <= time.monotonic() or not _client_is_usable(entry)
+    if (
+        entry is not None
+        and (entry.expires <= time.monotonic() or not _client_is_usable(entry))
+        and not entry.lock.locked()
     ):
         await drop_session(user_id)
         entry = None
 
     if entry is None:
         await _evict_if_over_cap()
+        # _evict_if_over_cap() is an await point — a concurrent cold-start for
+        # the same user (different dedup keys) may have inserted an entry in
+        # the meantime. Re-get to avoid orphaning that authenticated client.
+        entry = _pool.get(user_id)
+
+    if entry is None:
         entry = _Entry(NitrisClient(), user_id)
         _pool[user_id] = entry
-        needs_login = True
         logger.debug("session_pool: NEW session for user_id=%d", user_id)
     else:
-        needs_login = False
         logger.debug("session_pool: REUSE session for user_id=%d", user_id)
 
     async with entry.lock:                       # serialize same-account jobs
         async with _gateway_acquire():           # single slot: [login?] + work
             password = decrypt_password(encrypted_password)   # JIT inside slot
-            if needs_login:
+            if entry.needs_login:
                 from app.nitris.gateway import nitris_gateway
                 await nitris_gateway.login_through_gateway(
                     entry.client, roll_number, password, user_id=user_id,
                 )
+                entry.needs_login = False
             try:
                 result = await work(entry.client, password)
             except (LoginError, SessionExpiredError, CredentialsQuarantinedError):

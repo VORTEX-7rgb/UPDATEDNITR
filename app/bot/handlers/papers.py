@@ -537,10 +537,18 @@ async def handle_qp_download_all_go(callback: types.CallbackQuery, state: FSMCon
         from app.nitris.gateway import NitrisCircuitOpenError
         from app.services.examination_service import _clean_code
 
-        for course in uncached_courses:
+        # PERF: these fetches are independent (per-subject dedup keys) and the
+        # portal side is already bounded by the gateway + background workers,
+        # so fan them out concurrently instead of paying N × job latency
+        # serially. The semaphore keeps client-side pacing modest.
+        sem = asyncio.Semaphore(4)
+        circuit_open = False
+
+        async def _fetch_one(course: dict):
+            nonlocal circuit_open
             sub_code = course.get("subject_code") or ""
             if not sub_code:
-                continue
+                return None
             try:
                 clean_subj = _clean_code(sub_code)
                 dedup_key = f"qp_metadata:{clean_subj}:{selected_year}"
@@ -558,24 +566,36 @@ async def handle_qp_download_all_go(callback: types.CallbackQuery, state: FSMCon
                     timeout=90.0,
                 )
 
-                try:
-                    result = await asyncio.wait_for(future, timeout=90.0)
-                    if result.get("success"):
-                        records = result.get("parsed_records", [])
-                        all_parsed.append((sub_code, records))
-                    else:
-                        logger.warning(
-                            "Batch metadata fetch failed for %s %s: %s",
-                            sub_code, selected_year, result.get("error", "unknown"),
-                        )
-                except asyncio.TimeoutError:
-                    logger.warning("Metadata fetch timed out for %s %s", sub_code, selected_year)
-
+                result = await asyncio.wait_for(future, timeout=90.0)
+                if result.get("success"):
+                    records = result.get("parsed_records", [])
+                    return (sub_code, records)
+                logger.warning(
+                    "Batch metadata fetch failed for %s %s: %s",
+                    sub_code, selected_year, result.get("error", "unknown"),
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Metadata fetch timed out for %s %s", sub_code, selected_year)
             except NitrisCircuitOpenError:
                 logger.warning("Circuit open during batch metadata fetch — stopping")
-                break
+                circuit_open = True
             except Exception as e:
                 logger.warning("Batch metadata fetch failed for %s %s: %r", sub_code, selected_year, e)
+            return None
+
+        async def _bounded(course: dict):
+            async with sem:
+                if circuit_open:   # breaker tripped mid-batch — skip the rest
+                    return None
+                return await _fetch_one(course)
+
+        batch_results = await asyncio.gather(
+            *(_bounded(c) for c in uncached_courses), return_exceptions=True
+        )
+        all_parsed = [r for r in batch_results if isinstance(r, tuple)]
+        for r in batch_results:
+            if isinstance(r, BaseException):
+                logger.warning("Batch metadata fetch crashed for one subject: %r", r)
 
         if all_parsed:
             async with get_db_session() as session:

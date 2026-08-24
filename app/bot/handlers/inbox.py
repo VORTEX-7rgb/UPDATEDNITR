@@ -767,7 +767,7 @@ async def process_search_query(message: types.Message, state: FSMContext) -> Non
         user = await user_repo.get_by_telegram_id(telegram_id)
 
         if not user:
-            await callback.message.answer("⚠️ You are not registered. Use /start to register.")
+            await message.answer("⚠️ You are not registered. Use /start to register.")
             return
 
         # LAYER 1: warm the pooled session while the student browses.

@@ -81,6 +81,13 @@ class Config:
     # circuit breaker. 5 simultaneous detail fetches per inbox sync.
     INBOX_DETAIL_FETCH_CONCURRENCY = int(os.getenv("INBOX_DETAIL_FETCH_CONCURRENCY", "5"))
 
+    # Cap on detail-page fetches per inbox sync: only the NEWEST N missing
+    # messages get their bodies during a sync. Older messages are persisted
+    # header-only (body=None + stale body_fetched_at) and lazily fetched on
+    # first open via the cache-first inbox path. Bounds first-sync cost
+    # (a 70-notice backlog → 15 detail fetches).
+    INBOX_SYNC_DETAIL_LIMIT = int(os.getenv("INBOX_SYNC_DETAIL_LIMIT", "15"))
+
     # Reduced from 6h → 30min. With parallel detail fetches,
     # re-fetching bodies is cheap. Fresher data > fewer requests.
     INBOX_BODY_TTL_SECONDS = int(os.getenv("INBOX_BODY_TTL_SECONDS", str(30 * 60)))

@@ -73,13 +73,31 @@ async def test_welcome_message_carries_persistent_bar(monkeypatch):
     assert START_BUTTON_TEXT in _kb_button_texts(kb)
 
 
-def test_registration_complete_pins_the_bar():
-    """Every new signup's completion bubble attaches the persistent bar —
-    this is how the ENTIRE incoming cohort gets it automatically."""
+def test_registration_complete_does_not_break_the_bar():
+    """The completion bubble must NOT attach the reply keyboard.
+
+    editMessageText only accepts InlineKeyboardMarkup — passing the reply
+    keyboard there raised a pydantic ValidationError ("1 validation error for
+    EditMessageText") that the generic handler mislabeled as "A database
+    error occurred during registration" on EVERY registration
+    (incident 2026-08-24, VM logs 06:21:22 UTC).
+
+    The bar still reaches every signup: it is pinned chat-wide by the
+    unregistered /start welcome (pinned by
+    test_welcome_message_carries_persistent_bar), which every student passes
+    through before registering, and reply keyboards persist for the chat's
+    lifetime."""
     src = (REPO_ROOT / "app/bot/handlers/registration.py").read_text(encoding="utf-8")
     anchor = src.index("Registration complete!")
     window = src[anchor:anchor + 400]
-    assert "reply_markup=build_start_reply_keyboard()" in window
+    assert "reply_markup=build_start_reply_keyboard()" not in window, (
+        "editMessageText rejects ReplyKeyboardMarkup — attaching the bar to "
+        "the completion edit crashes every registration with a fake DB error"
+    )
+    # The bar's chat-wide entry point for the incoming cohort is intact and
+    # lives upstream of the completion path.
+    assert "reply_markup=build_start_reply_keyboard()" in src
+    assert src.index("reply_markup=build_start_reply_keyboard()") < anchor
 
 
 def test_button_handler_registered_before_fsm_text_catchers():

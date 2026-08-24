@@ -1,8 +1,9 @@
-"""Tests for Phase 4: Parallel inbox detail fetching, semaphore bounds, and error handling."""
+"""Tests for Phase 4: Parallel inbox detail fetching, semaphore bounds, error handling,
+and the INBOX_SYNC_DETAIL_LIMIT newest-N cap."""
 import asyncio
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
@@ -136,3 +137,62 @@ async def test_persist_inbox_sync_stale_timestamp_on_failed_detail():
     now = datetime.now(timezone.utc)
     diff = (now - created_message.body_fetched_at).total_seconds()
     assert diff >= config.INBOX_BODY_TTL_SECONDS, f"Expected stale timestamp, got diff={diff}s"
+
+
+@pytest.mark.asyncio
+async def test_prepare_inbox_sync_caps_detail_fetches_to_newest_15(monkeypatch):
+    """Only the newest INBOX_SYNC_DETAIL_LIMIT missing messages are detail-fetched
+    during a sync; older ones are returned header-only for lazy fetch on open."""
+    from app.workers.sync_worker import prepare_inbox_sync
+    from app.config import config
+
+    limit = config.INBOX_SYNC_DETAIL_LIMIT
+    total = limit + 5  # more missing messages than the cap
+
+    now = datetime.now(timezone.utc)
+    scraped = [
+        {
+            "portal_message_id": 1000 + i,
+            "token": f"tok_{i}",
+            "sender": f"Prof {i}",
+            "subject": f"Notice {i}",
+            "sent_on": now - timedelta(hours=i),  # i=0 is the newest
+        }
+        for i in range(total)
+    ]
+
+    def fake_parse_list(html):
+        return scraped
+
+    def fake_parse_detail(html):
+        return {"body": "body text", "attachment_url": None}
+
+    monkeypatch.setattr("app.nitris.parser.parse_messages_list_html", fake_parse_list)
+    monkeypatch.setattr("app.nitris.parser.parse_message_detail_html", fake_parse_detail)
+
+    fetched_tokens: list[str] = []
+    client = AsyncMock()
+    client.fetch_messages_list.return_value = "<html>list</html>"
+
+    async def mock_fetch_detail(token):
+        fetched_tokens.append(token)
+        return "<html>detail</html>"
+
+    client.fetch_message_detail.side_effect = mock_fetch_detail
+
+    with patch("app.workers.sync_worker.get_db_session") as mock_db_ctx:
+        session = AsyncMock()
+        mock_db_ctx.return_value.__aenter__.return_value = session
+        with patch(
+            "app.db.repositories.inbox_repository.InboxRepository.get_by_portal_message_ids",
+            return_value=[],
+        ):
+            scraped_out, details, existing = await prepare_inbox_sync(client, user_id=1)
+
+    # ALL scraped messages are returned so persist_inbox_sync can create a row
+    # for every one (header-only for the uncapped tail).
+    assert len(scraped_out) == total
+    # ONLY the newest N were detail-fetched.
+    assert len(details) == limit
+    assert len(fetched_tokens) == limit
+    assert set(fetched_tokens) == {f"tok_{i}" for i in range(limit)}

@@ -190,10 +190,21 @@ class NitrisJobQueue:
             actual_user_id = user_id
 
         async with self._lock:
-            # Check hard queue depth bound
-            if self.get_queue_depth() >= self.max_queue_depth:
+            # Hard queue depth bound. Background (MEDIUM/LOW) admission stops
+            # at the cap; interactive HIGH taps bypass it — up to an absolute
+            # safety valve at 2× cap — so a LOW/prewarm surge filling the
+            # shared budget can never reject a user-facing tap while dedicated
+            # interactive workers sit idle.
+            depth = self.get_queue_depth()
+            if priority == Priority.HIGH:
+                if depth >= self.max_queue_depth * 2:
+                    raise RuntimeError(
+                        f"NITRIS job queue saturated (depth={depth} >= "
+                        f"{self.max_queue_depth * 2}). NITRIS may be down."
+                    )
+            elif depth >= self.max_queue_depth:
                 raise RuntimeError(
-                    f"NITRIS job queue full (depth={self.get_queue_depth()} >= "
+                    f"NITRIS job queue full (depth={depth} >= "
                     f"{self.max_queue_depth}). NITRIS may be down."
                 )
 

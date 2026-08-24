@@ -9,7 +9,9 @@ from aiogram import Router, types, F
 from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramAPIError
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
@@ -375,9 +377,12 @@ async def process_password(message: types.Message, state: FSMContext):
             "✅ <b>Registration complete!</b>\n\n"
             "Initial attendance fetched successfully. Rendering your dashboard...",
             parse_mode=ParseMode.HTML,
-            # Attach/pin the floating 🏠 Start bar at the moment every new
-            # student finishes onboarding (chat-level, persists afterwards).
-            reply_markup=build_start_reply_keyboard(),
+            # NOTE: no reply_markup here. editMessageText only accepts
+            # InlineKeyboardMarkup — passing the ReplyKeyboardMarkup start bar
+            # raised a pydantic ValidationError that the generic except below
+            # mislabeled as a "database error" on EVERY registration
+            # (incident 2026-08-24). The 🏠 bar is already pinned chat-wide by
+            # the first /start welcome message, so nothing needs attaching.
         )
 
         async with get_db_session() as session:
@@ -398,6 +403,25 @@ async def process_password(message: types.Message, state: FSMContext):
         if user:
             await message.answer(text, reply_markup=get_dashboard_keyboard(unread_count), parse_mode=ParseMode.HTML)
 
+        await state.clear()
+
+    except (TelegramAPIError, ValidationError) as e:
+        # Telegram/render-layer failure — the registration itself COMMITTED
+        # above (user row + snapshot + sync state), so the student is fully
+        # registered and only the cosmetic render failed. Never label this
+        # a "database error" (that once masked an EditMessageText validation
+        # error as a DB outage and scared every new student).
+        logger.error(
+            "Registration committed but final render failed for telegram_id=%s: %r",
+            telegram_id, e,
+        )
+        try:
+            await status_msg.edit_text(
+                "✅ <b>You're registered!</b>\n\nTap 🏠 Start below to open your dashboard.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
         await state.clear()
 
     except Exception as e:

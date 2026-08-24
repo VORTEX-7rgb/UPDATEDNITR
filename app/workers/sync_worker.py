@@ -75,6 +75,9 @@ async def prepare_inbox_sync(client, user_id):
     Phase 4 perf redesign:
       - Detail fetches are now PARALLEL with bounded concurrency (default 5).
         15 messages × 4s sequential = 60s → 15/5 × 4s = 12s. ~5x speedup.
+      - Only the NEWEST INBOX_SYNC_DETAIL_LIMIT (default 15) missing messages
+        are detail-fetched per sync; older ones persist header-only and
+        lazy-fetch on first open (cache-first-forever contract).
       - SessionExpiredError PROPAGATES (caller must re-login, not swallow).
       - Other transient errors fall back to body=None but mark the row for
         re-fetch on next user open (handled in persist_inbox_sync).
@@ -109,13 +112,21 @@ async def prepare_inbox_sync(client, user_id):
     existing_by_id = {m.portal_message_id: m for m in existing}
 
     # 3. Pre-fetch detail pages for NEW non-historical messages IN PARALLEL.
-    #    Bounded by INBOX_DETAIL_FETCH_CONCURRENCY (default 5) to avoid tripping
-    #    the NITRIS circuit breaker with too many simultaneous requests.
-    new_messages_to_fetch = [
-        m for m in scraped_messages
-        if m["portal_message_id"] not in existing_by_id
-        and not m["token"].startswith("postback:")
-    ]
+    #    Only the NEWEST INBOX_SYNC_DETAIL_LIMIT missing messages are fetched
+    #    during the sync; older ones are persisted header-only by
+    #    persist_inbox_sync (body=None + stale body_fetched_at) and their
+    #    bodies are lazily fetched on first open via the cache-first inbox
+    #    path. Also bounded by INBOX_DETAIL_FETCH_CONCURRENCY (default 5) to
+    #    avoid tripping the NITRIS circuit breaker with too many requests.
+    new_messages_to_fetch = sorted(
+        (
+            m for m in scraped_messages
+            if m["portal_message_id"] not in existing_by_id
+            and not m["token"].startswith("postback:")
+        ),
+        key=lambda m: m["sent_on"],
+        reverse=True,
+    )[: config.INBOX_SYNC_DETAIL_LIMIT]
 
     if not new_messages_to_fetch:
         return scraped_messages, {}, existing_by_id
@@ -241,7 +252,8 @@ async def persist_inbox_sync(user_id, scraped_messages, detail_cache, existing_b
                             )
                             new_msg.body_fetched_at = stale_ts
                             logger.info(
-                                "Marked portal_id=%s for re-fetch on next open (detail fetch failed)",
+                                "Marked portal_id=%s for lazy body fetch on next open "
+                                "(no body fetched during sync — capped or fetch failed)",
                                 msg["portal_message_id"],
                             )
 
