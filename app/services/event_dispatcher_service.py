@@ -254,6 +254,58 @@ async def get_telegram_ids_for_users(
 
 # ── Main dispatcher ────────────────────────────────────────────────────────
 
+# Event types eligible for same-cycle per-user digesting. Attendance/absence
+# alerts are safety-critical one-offs — they always send individually.
+_MESSAGE_EVENT_TYPES = {
+    EventType.NEW_MESSAGE_RECEIVED.value,
+    EventType.MESSAGE_UPDATED.value,
+}
+
+
+def _etype(ev: dict) -> str:
+    """Normalized event_type string for a claimed-event dict."""
+    et = ev["event_type"]
+    return et.value if isinstance(et, EventType) else str(et)
+
+
+def _format_message_digest(events: list[dict]) -> tuple[str, Any]:
+    """Build ONE compact bubble covering several notice events for a user.
+
+    Incident 2026-08-25: a racing sync created ~10 NEW_MESSAGE_RECEIVED
+    events in one commit; the dispatcher fired them as 10 separate Telegram
+    messages ~400ms apart — perceived as spam. Same-cycle message events now
+    collapse into a single numbered digest with one Open-Inbox button.
+    Non-message types never reach this formatter.
+    """
+    new_n = sum(1 for ev in events if _etype(ev) == EventType.NEW_MESSAGE_RECEIVED.value)
+    upd_n = len(events) - new_n
+
+    parts: list[str] = []
+    if new_n:
+        parts.append(f"📩 <b>{new_n} new notice{'s' if new_n != 1 else ''}</b>")
+    if upd_n:
+        parts.append(f"🔄 <b>{upd_n} updated notice{'s' if upd_n != 1 else ''}</b>")
+    text = " / ".join(parts) + "\n\n"
+
+    MAX_LINES = 15
+    shown = events[:MAX_LINES]
+    for i, ev in enumerate(shown, start=1):
+        payload = ev.get("payload_json") or {}
+        sender = esc(payload.get("sender") or "NITRIS")
+        subject = esc(payload.get("subject") or "(no subject)")
+        attach = " 📎" if payload.get("has_attachment") else ""
+        marker = "🔄" if _etype(ev) == EventType.MESSAGE_UPDATED.value else "•"
+        text += f"{marker} {i}. {sender} — <b>{subject}</b>{attach}\n"
+    if len(events) > MAX_LINES:
+        text += f"<i>…and {len(events) - MAX_LINES} more</i>\n"
+
+    text += "\n<i>Open your Inbox to read them.</i>"
+
+    builder = InlineKeyboardBuilder()
+    builder.row(types.InlineKeyboardButton(text="📬 Open Inbox", callback_data="db_inbox"))
+    return text, builder.as_markup()
+
+
 class EventDispatcherService:
     """Singleton event dispatcher. Same architectural pattern as QPaperService:
     atomic DB-CAS claim + per-event state transition + stale-claim reaper.
@@ -328,7 +380,14 @@ class EventDispatcherService:
         await self.stop_reaper()
 
     async def _dispatch_once(self) -> int:
-        """Run one dispatch cycle. Returns number of events successfully sent."""
+        """Run one dispatch cycle. Returns number of events successfully sent.
+
+        Claims are grouped PER USER before sending: a burst of message-type
+        events for the same user (inbox backlog, racing syncs) goes out as
+        ONE digest bubble instead of N back-to-back notifications. All other
+        event types keep the exact per-event behavior (claim → send →
+        immediate mark), including failure/retry semantics.
+        """
         # Phase 1: atomic claim
         claimed = await claim_events(self.session_factory, self.worker_id)
         if not claimed:
@@ -341,94 +400,164 @@ class EventDispatcherService:
             self.session_factory, list({ev["user_id"] for ev in claimed})
         )
 
-        sent_count = 0
+        # SPAM FIX: per-user grouping, insertion-ordered (claims arrive id ASC,
+        # so each user's digest lists their notices oldest-first).
+        groups: dict[int, list[dict]] = {}
         for ev in claimed:
-            try:
-                telegram_id = telegram_ids.get(ev["user_id"])
-                if telegram_id is None:
-                    # User was deleted (orphaned event) — mark permanent
+            groups.setdefault(ev["user_id"], []).append(ev)
+
+        sent_count = 0
+        for user_id, group in groups.items():
+            telegram_id = telegram_ids.get(user_id)
+            if telegram_id is None:
+                # User was deleted (orphaned events) — mark permanent
+                for ev in group:
                     await mark_event_permanent_failure(
                         self.session_factory, ev["id"],
-                        error=f"orphaned event — user_id={ev['user_id']} not found",
+                        error=f"orphaned event — user_id={user_id} not found",
                     )
                     logger.warning(
                         "Event %d marked permanent_failure (orphaned user_id=%d)",
-                        ev["id"], ev["user_id"],
+                        ev["id"], user_id,
                     )
-                    continue
+                continue
 
-                # Format + send
-                msg_text, reply_markup = _format_notification(
-                    ev["event_type"], ev["payload_json"]
-                )
+            if len(group) > 1 and all(_etype(ev) in _MESSAGE_EVENT_TYPES for ev in group):
+                if await self._send_message_digest(group, telegram_id):
+                    sent_count += len(group)
+                continue
 
-                # Send to Telegram with FloodWait retry
-                success, error = await self._send_with_retry(
-                    telegram_id, msg_text, reply_markup
-                )
-
-                if success:
-                    # IMMEDIATELY mark this single event as sent (short transaction).
-                    # Crash window between send_message returning and this UPDATE
-                    # is ~10ms — orders of magnitude smaller than the old bulk
-                    # update's ~30s window.
-                    await mark_event_sent(self.session_factory, ev["id"])
+            for ev in group:
+                if await self._dispatch_single_event(ev, telegram_id):
                     sent_count += 1
-                    logger.info(
-                        "Dispatched event %d to telegram_id=%d (attempt %d)",
-                        ev["id"], telegram_id, ev["attempt_count"],
-                    )
-                    # Pacing to stay strictly under Telegram's global 30 msg/s broadcast ceiling
-                    await asyncio.sleep(INTER_MESSAGE_PACING_SECONDS)
-                elif error == "USER_BLOCKED":
-                    # User blocked the bot — terminal state, no retry
-                    await mark_event_permanent_failure(
-                        self.session_factory, ev["id"],
-                        error="user blocked the bot",
-                    )
-                    logger.warning(
-                        "Event %d marked permanent_failure (user %d blocked bot)",
-                        ev["id"], telegram_id,
-                    )
-                elif error == "USER_DEACTIVATED":
-                    await mark_event_permanent_failure(
-                        self.session_factory, ev["id"],
-                        error="user account deactivated",
-                    )
-                else:
-                    # Retryable failure (network, FloodWait exhausted, etc.)
-                    if ev["attempt_count"] >= MAX_DISPATCH_ATTEMPTS:
-                        await mark_event_permanent_failure(
-                            self.session_factory, ev["id"],
-                            error=f"exhausted {MAX_DISPATCH_ATTEMPTS} attempts: {error}",
-                        )
-                        logger.warning(
-                            "Event %d marked permanent_failure (exhausted retries)",
-                            ev["id"],
-                        )
-                    else:
-                        # Release claim — will be re-claimed next cycle
-                        await release_event_claim(
-                            self.session_factory, ev["id"],
-                            error=f"retryable: {error}",
-                        )
-                        logger.info(
-                            "Event %d released (attempt %d, error: %s)",
-                            ev["id"], ev["attempt_count"], error[:100] if error else "",
-                        )
-            except Exception as e:
-                logger.error(
-                    "Unexpected error dispatching event %d: %r", ev["id"], e
+
+        return sent_count
+
+    async def _dispatch_single_event(self, ev: dict, telegram_id: int) -> bool:
+        """Send one claimed event. Returns True when delivered."""
+        try:
+            # Format + send
+            msg_text, reply_markup = _format_notification(
+                ev["event_type"], ev["payload_json"]
+            )
+
+            # Send to Telegram with FloodWait retry
+            success, error = await self._send_with_retry(
+                telegram_id, msg_text, reply_markup
+            )
+
+            if success:
+                # IMMEDIATELY mark this single event as sent (short transaction).
+                # Crash window between send_message returning and this UPDATE
+                # is ~10ms — orders of magnitude smaller than the old bulk
+                # update's ~30s window.
+                await mark_event_sent(self.session_factory, ev["id"])
+                logger.info(
+                    "Dispatched event %d to telegram_id=%d (attempt %d)",
+                    ev["id"], telegram_id, ev["attempt_count"],
                 )
-                # Release the claim so it can be retried — don't leave it stuck
+                # Pacing to stay strictly under Telegram's global 30 msg/s broadcast ceiling
+                await asyncio.sleep(INTER_MESSAGE_PACING_SECONDS)
+                return True
+
+            return await self._handle_send_failure(ev, telegram_id, error)
+
+        except Exception as e:
+            logger.error(
+                "Unexpected error dispatching event %d: %r", ev["id"], e
+            )
+            # Release the claim so it can be retried — don't leave it stuck
+            try:
+                await release_event_claim(
+                    self.session_factory, ev["id"], error=str(e),
+                )
+            except Exception:
+                pass
+            return False
+
+    async def _send_message_digest(self, group: list[dict], telegram_id: int) -> bool:
+        """Send several same-user message events as ONE digest bubble.
+
+        Success marks EVERY grouped event sent (one send covers them all);
+        failures apply the exact same per-event transitions as singles.
+        """
+        try:
+            msg_text, reply_markup = _format_message_digest(group)
+            success, error = await self._send_with_retry(telegram_id, msg_text, reply_markup)
+
+            if success:
+                for ev in group:
+                    await mark_event_sent(self.session_factory, ev["id"])
+                logger.info(
+                    "Dispatched digest of %d notice event(s) to telegram_id=%d",
+                    len(group), telegram_id,
+                )
+                await asyncio.sleep(INTER_MESSAGE_PACING_SECONDS)
+                return True
+
+            any_delivered = False
+            for ev in group:
+                if await self._handle_send_failure(ev, telegram_id, error):
+                    any_delivered = True
+            return any_delivered
+
+        except Exception as e:
+            logger.error(
+                "Unexpected error dispatching digest for telegram_id=%d: %r",
+                telegram_id, e,
+            )
+            for ev in group:
                 try:
                     await release_event_claim(
                         self.session_factory, ev["id"], error=str(e),
                     )
                 except Exception:
                     pass
+            return False
 
-        return sent_count
+    async def _handle_send_failure(
+        self, ev: dict, telegram_id: int, error: Optional[str],
+    ) -> bool:
+        """Shared terminal/release transitions for failed sends. Always
+        returns False — blocked/deactivated/released events were never counted
+        as delivered by the dispatcher (parity with pre-digest behavior)."""
+        if error == "USER_BLOCKED":
+            # User blocked the bot — terminal state, no retry
+            await mark_event_permanent_failure(
+                self.session_factory, ev["id"],
+                error="user blocked the bot",
+            )
+            logger.warning(
+                "Event %d marked permanent_failure (user %d blocked bot)",
+                ev["id"], telegram_id,
+            )
+        elif error == "USER_DEACTIVATED":
+            await mark_event_permanent_failure(
+                self.session_factory, ev["id"],
+                error="user account deactivated",
+            )
+        else:
+            # Retryable failure (network, FloodWait exhausted, etc.)
+            if ev["attempt_count"] >= MAX_DISPATCH_ATTEMPTS:
+                await mark_event_permanent_failure(
+                    self.session_factory, ev["id"],
+                    error=f"exhausted {MAX_DISPATCH_ATTEMPTS} attempts: {error}",
+                )
+                logger.warning(
+                    "Event %d marked permanent_failure (exhausted retries)",
+                    ev["id"],
+                )
+            else:
+                # Release claim — will be re-claimed next cycle
+                await release_event_claim(
+                    self.session_factory, ev["id"],
+                    error=f"retryable: {error}",
+                )
+                logger.info(
+                    "Event %d released (attempt %d, error: %s)",
+                    ev["id"], ev["attempt_count"], error[:100] if error else "",
+                )
+        return False
 
     async def _send_with_retry(
         self, telegram_id: int, text: str, reply_markup=None,

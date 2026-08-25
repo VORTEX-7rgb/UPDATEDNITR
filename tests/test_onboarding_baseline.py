@@ -42,8 +42,13 @@ def _scraped_one():
     }]
 
 
-def _setup(monkeypatch):
-    """Wire the DB/session/repo fakes so persist_inbox_sync runs without a DB."""
+def _setup(monkeypatch, existing_rows=None, inbox_has_rows=False):
+    """Wire the DB/session/repo fakes so persist_inbox_sync runs without a DB.
+
+    existing_rows: what get_by_portal_message_ids reports as already-known.
+    inbox_has_rows: what the authoritative has_any_messages probe reports —
+    i.e. whether this user's inbox was EVER populated.
+    """
     monkeypatch.setattr(sw, "wait_for_db_recovery", _noop_recovery)
 
     fake_session = MagicMock()
@@ -61,7 +66,8 @@ def _setup(monkeypatch):
         id=1, portal_message_id="p1", sender="Dean Academic",
         subject="Exam Notice", body="hello", attachment_url=None,
     ))
-    fake_inbox_repo.get_by_portal_message_ids = AsyncMock(return_value=[])
+    fake_inbox_repo.get_by_portal_message_ids = AsyncMock(return_value=existing_rows or [])
+    fake_inbox_repo.has_any_messages = AsyncMock(return_value=inbox_has_rows)
     monkeypatch.setattr(
         "app.db.repositories.inbox_repository.InboxRepository",
         lambda session: fake_inbox_repo,
@@ -84,6 +90,19 @@ async def test_baseline_sync_is_silent(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_normal_sync_notifies(monkeypatch):
-    fake_event_repo = _setup(monkeypatch)
+    """Non-baseline sync over an ALREADY-POPULATED inbox keeps notifying."""
+    fake_event_repo = _setup(monkeypatch, inbox_has_rows=True)
     await sw.persist_inbox_sync(1, _scraped_one(), {"p1": {"body": "hello", "attachment_url": None}}, {}, baseline=False)
     fake_event_repo.create_event.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_first_population_via_nonbaseline_path_is_silent(monkeypatch):
+    """IMPLICIT BASELINE invariant (incident 2026-08-25): a racing sync that
+    populates a brand-new EMPTY inbox — scheduler tick firing seconds after
+    registration, onboarding retry, user-tapped refresh — must NEVER burst
+    NEW_MESSAGE_RECEIVED notifications for the historical backlog, even with
+    baseline=False."""
+    fake_event_repo = _setup(monkeypatch, inbox_has_rows=False)
+    await sw.persist_inbox_sync(1, _scraped_one(), {"p1": {"body": "hello", "attachment_url": None}}, {}, baseline=False)
+    fake_event_repo.create_event.assert_not_called()

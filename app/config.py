@@ -135,6 +135,16 @@ class Config:
     # cold-start / post-downtime thundering herd (all 5k users due at once).
     SCHEDULER_MAX_QUEUE_DEPTH = int(os.getenv("SCHEDULER_MAX_QUEUE_DEPTH", "50"))
 
+    # Incident 2026-08-25: new users' schedules were spread with
+    # uniform(0, TTL), so an inbox schedule could come due SECONDS after
+    # registration — the scheduler's non-baseline sync then raced the silent
+    # onboarding prefetch and burst "new message" notifications for the
+    # user's whole historical backlog. Brand-new schedules now start at least
+    # this far in the future, giving onboarding time to finish first.
+    SCHEDULER_INITIAL_SPREAD_FLOOR_SECONDS = int(
+        os.getenv("SCHEDULER_INITIAL_SPREAD_FLOOR_SECONDS", "300")
+    )  # 5min
+
     # ── Per-user operation cooldowns (rate_limiter) ─────────────────────────
     # Minimum seconds between repeated user-triggered operations. These are
     # UX/abuse guards, not portal protection — the gateway handles that.

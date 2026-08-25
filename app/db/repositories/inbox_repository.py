@@ -107,6 +107,20 @@ class InboxRepository:
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
 
+    async def has_any_messages(self, user_id: int) -> bool:
+        """True if the user has AT LEAST ONE inbox row (cheap LIMIT-1 probe).
+
+        This is the authoritative "has this inbox ever been populated" check —
+        NOT the same as "did any of the currently-scraped portal IDs match".
+        Used by persist_inbox_sync's implicit-baseline guard: whatever sync
+        path populates a brand-new inbox (onboarding retry, scheduler tick
+        that fired early, user-tapped refresh), the FIRST population is the
+        student's historical backlog and must never notify.
+        """
+        stmt = select(InboxMessage.id).where(InboxMessage.user_id == user_id).limit(1)
+        result = await self.session.execute(stmt)
+        return result.first() is not None
+
     async def update_message_body(
         self, message_id: int, body: str, attachment_url: Optional[str]
     ) -> None:

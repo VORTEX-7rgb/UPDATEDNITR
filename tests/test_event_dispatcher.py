@@ -433,3 +433,101 @@ async def test_m1_repeated_claims_never_burn_attempt_budget(test_setup):
     bot.fail_mode = "transient"
     await service._dispatch_once()
     assert all(event_store[eid]["attempt_count"] == 1 for eid in [1, 2, 3])
+
+
+# ── Per-user digest (spam fix, incident 2026-08-25) ───────────────────────
+
+def _msg_event(eid: int, user_id: int, sender: str, subject: str) -> dict:
+    return {
+        "id": eid, "user_id": user_id, "event_type": "new_message_received",
+        "payload_json": {"sender": sender, "subject": subject,
+                         "body_snippet": "…", "has_attachment": False, "message_id": eid},
+        "sent": False, "attempt_count": 0, "claimed_at": None, "permanent_failure": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_message_backlog_digested_into_one_bubble(test_setup):
+    """A burst of same-user message events (the racing-sync backlog scenario)
+    must arrive as ONE digest bubble — not N back-to-back notifications —
+    with every grouped event atomically marked sent after the single send."""
+    service, bot, event_store, user_store, session_factory = test_setup
+
+    event_store.clear()
+    for i in range(1, 5):
+        event_store[i] = _msg_event(i, user_id=3, sender=f"Prof {i}", subject=f"Notice {i}")
+
+    sent_count = await service._dispatch_once()
+
+    assert sent_count == 4
+    assert len(bot.sent_messages) == 1, "digest must collapse N events into ONE message"
+    text = bot.sent_messages[0]["text"]
+    assert "4 new notices" in text
+    for i in range(1, 5):
+        assert f"Notice {i}" in text
+    for eid in range(1, 5):
+        ev = event_store[eid]
+        assert ev["sent"] is True
+        assert ev["attempt_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_mixed_event_types_never_digested(test_setup):
+    """Attendance/absence alerts are safety-critical one-offs: a same-user mix
+    of message + attendance events sends individually (no lossy merging)."""
+    service, bot, event_store, user_store, session_factory = test_setup
+
+    event_store.clear()
+    event_store[1] = {
+        "id": 1, "user_id": 3, "event_type": "attendance_updated",
+        "payload_json": {"subject_name": "Maths", "subject_code": "MA1001",
+                          "changes": {"tc": {"old": "10", "new": "11"}}},
+        "sent": False, "attempt_count": 0, "claimed_at": None, "permanent_failure": False,
+    }
+    event_store[2] = _msg_event(2, user_id=3, sender="Dean", subject="Exam Schedule")
+
+    sent_count = await service._dispatch_once()
+
+    assert sent_count == 2
+    assert len(bot.sent_messages) == 2, "mixed types must NOT merge into a digest"
+    for eid in [1, 2]:
+        assert event_store[eid]["sent"] is True
+
+
+@pytest.mark.asyncio
+async def test_digest_failure_releases_every_group_claim(test_setup):
+    """If the digest send fails retryably, EVERY event in the group gets its
+    claim released and exactly one real attempt burned — identical semantics
+    to per-event dispatch."""
+    service, bot, event_store, user_store, session_factory = test_setup
+
+    event_store.clear()
+    for i in range(1, 4):
+        event_store[i] = _msg_event(i, user_id=3, sender=f"Prof {i}", subject=f"Notice {i}")
+
+    bot.fail_mode = "transient"
+    sent_count = await service._dispatch_once()
+
+    assert sent_count == 0
+    for eid in range(1, 4):
+        ev = event_store[eid]
+        assert ev["sent"] is False
+        assert ev["claimed_at"] is None
+        assert ev["attempt_count"] == 1
+        assert "retryable" in (ev["last_error"] or "")
+
+
+def test_digest_formatter_lists_senders_and_subjects():
+    from app.services.event_dispatcher_service import _format_message_digest
+    events = [
+        {"event_type": "new_message_received",
+         "payload_json": {"sender": "Dean", "subject": "Exams", "has_attachment": True}},
+        {"event_type": "message_updated",
+         "payload_json": {"sender": "Registrar", "subject": "Fees"}},
+    ]
+    text, markup = _format_message_digest(events)
+    assert "1 new notice" in text
+    assert "1 updated notice" in text
+    assert "Dean" in text and "<b>Exams</b>" in text and "📎" in text
+    assert "Registrar" in text and "<b>Fees</b>" in text
+    assert markup is not None

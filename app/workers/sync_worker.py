@@ -170,6 +170,12 @@ async def persist_inbox_sync(user_id, scraped_messages, detail_cache, existing_b
     When ``baseline=True`` (first sync right after registration), new messages
     are inserted SILENTLY — no NEW_MESSAGE_RECEIVED events — so a user's
     historical inbox backlog doesn't flood them with "new message" alerts.
+
+    IMPLICIT BASELINE: even with baseline=False, event creation is suppressed
+    whenever the user's inbox is still EMPTY (first-ever population). This
+    makes "the first population of an inbox never notifies" a structural
+    invariant instead of a caller convention — a racing scheduler tick or
+    refresh job can no longer burst the backlog while onboarding is in flight.
     """
     if not scraped_messages:
         return
@@ -201,6 +207,31 @@ async def persist_inbox_sync(user_id, scraped_messages, detail_cache, existing_b
             portal_ids = [m["portal_message_id"] for m in scraped_messages]
             current = await inbox_repo.get_by_portal_message_ids(user_id, portal_ids)
             existing_by_id = {m.portal_message_id: m for m in current}
+
+            # IMPLICIT BASELINE (spam-race fix, incident 2026-08-25 VM logs
+            # 16:51 UTC): the scheduler's next_sync_at spread is uniform over
+            # the whole TTL window, so a brand-new user's inbox schedule can
+            # come due SECONDS after registration — before the silent
+            # onboarding prefetch commits. That racing sync ran with
+            # baseline=False, populated the still-empty inbox, and burst a
+            # NEW_MESSAGE_RECEIVED notification per backlog message.
+            #
+            # Invariant: if this user has NO inbox rows yet, ANY sync that
+            # populates them now is delivering the student's historical
+            # backlog — regardless of which caller lost the race (scheduler,
+            # onboarding retry, user-tapped refresh). First population is
+            # therefore ALWAYS silent; only genuinely-new arrivals on top of
+            # an existing inbox may notify.
+            effective_baseline = baseline
+            if not effective_baseline:
+                effective_baseline = not await inbox_repo.has_any_messages(user_id)
+                if effective_baseline:
+                    logger.info(
+                        "Implicit baseline for user_id=%d — first-ever inbox "
+                        "population arrived via a non-baseline sync path; "
+                        "suppressing new-message events.",
+                        user_id,
+                    )
 
             for msg in scraped_messages:
                 normalized_scraped_sent_on = normalize_to_utc(msg["sent_on"])
@@ -257,7 +288,7 @@ async def persist_inbox_sync(user_id, scraped_messages, detail_cache, existing_b
                                 msg["portal_message_id"],
                             )
 
-                        if not baseline:
+                        if not effective_baseline:
                             if not await event_repo.has_message_event(
                                 user_id, EventType.NEW_MESSAGE_RECEIVED, new_msg.id
                             ):
@@ -274,7 +305,7 @@ async def persist_inbox_sync(user_id, scraped_messages, detail_cache, existing_b
                                 )
                         logger.info(
                             "Sync inserted message ID %s for user %s (baseline=%s)",
-                            new_msg.portal_message_id, user_id, baseline,
+                            new_msg.portal_message_id, user_id, effective_baseline,
                         )
                 else:
                     if existing.token != msg["token"]:

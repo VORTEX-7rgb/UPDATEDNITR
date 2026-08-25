@@ -229,9 +229,19 @@ async def ensure_schedule_exists(
     Called on registration. next_sync_at is spread pseudo-randomly across the
     module TTL window (instead of NOW()) so a bulk sign-up or cold start does
     not dump every user into the same scheduler cycle.
+
+    The spread starts at SCHEDULER_INITIAL_SPREAD_FLOOR_SECONDS (default 5
+    min), never at ~zero: a brand-new user's first scheduled sync must not
+    race the silent onboarding prefetch (incident 2026-08-25 — an early
+    scheduler tick ran a non-baseline inbox sync against the still-empty
+    inbox and burst backlog notifications). persist_inbox_sync's implicit-
+    baseline guard is the second layer of defense for this same race.
     """
     ttl_seconds = float(config.MODULE_TTL_SECONDS.get(module_name, 3600))
-    spread_seconds = random.uniform(0.0, ttl_seconds)
+    floor = float(config.SCHEDULER_INITIAL_SPREAD_FLOOR_SECONDS)
+    # Never let the floor eat more than half the TTL window (tiny TTLs stay sane).
+    floor = min(floor, ttl_seconds / 2.0)
+    spread_seconds = random.uniform(floor, max(ttl_seconds, floor + 1.0))
     async with session_factory() as session:
         async with session.begin():
             await session.execute(text("""
