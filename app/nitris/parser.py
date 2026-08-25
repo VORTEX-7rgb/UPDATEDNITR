@@ -549,6 +549,10 @@ def _parse_inbox_sent_on(date_str: str) -> datetime:
     resulting in duplicate message insertions and notification spam.
     """
     if not date_str or not date_str.strip():
+        logger.warning(
+            "_parse_inbox_sent_on: empty/blank date string — falling back to "
+            "sentinel 2000-01-01 (message will sort last in /inbox)."
+        )
         return datetime(2000, 1, 1, 0, 0, 0)
 
     clean_str = date_str.strip()
@@ -582,6 +586,12 @@ def _parse_inbox_sent_on(date_str: str) -> datetime:
         pass
 
     # Deterministic fallback: fixed epoch timestamp
+    logger.warning(
+        "_parse_inbox_sent_on: unrecognized date format %r — falling back to "
+        "sentinel 2000-01-01 (message will sort by sync recency in /inbox). "
+        "Add this format to the `formats` tuple above once confirmed.",
+        clean_str,
+    )
     return datetime(2000, 1, 1, 0, 0, 0)
 
 

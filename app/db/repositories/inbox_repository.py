@@ -2,13 +2,33 @@
 
 import logging
 from typing import Optional, Any
-from datetime import datetime
-from sqlalchemy import select, update, func, or_
+from datetime import datetime, timezone
+from sqlalchemy import select, update, func, or_, case
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import InboxMessage
 
 logger = logging.getLogger(__name__)
+
+# _parse_inbox_sent_on (app/nitris/parser.py) falls back to a fixed sentinel
+# (2000-01-01 UTC after normalize_to_utc) whenever NITRIS renders a date string
+# it doesn't recognize (e.g. a relative label like "Today" on the notification
+# dropdown). The fallback must stay deterministic (it feeds _content_portal_id
+# hashing), so recency ordering can NOT trust sent_on alone: a sentinel-dated
+# message would sort below every real message forever and vanish from /inbox
+# even though it was just synced and push-notified (incident 2026-08-25).
+# Instead we order by an effective-recency key: portal date for well-dated
+# rows, row creation time for sentinel-dated rows. created_at is assigned at
+# INSERT time and is immune to upstream date-parsing failures.
+_SENTINEL_CUTOFF = datetime(2001, 1, 1, tzinfo=timezone.utc)
+
+
+def _effective_recency():
+    """SQL expression: well-dated rows sort by portal date, sentinel-dated rows by insertion time."""
+    return case(
+        (InboxMessage.sent_on >= _SENTINEL_CUTOFF, InboxMessage.sent_on),
+        else_=InboxMessage.created_at,
+    )
 
 
 class InboxRepository:
@@ -164,11 +184,16 @@ class InboxRepository:
         return result.scalar() or 0
 
     async def get_latest_messages(self, user_id: int, offset: int = 0, limit: int = 5) -> list[InboxMessage]:
-        """Fetch a page of latest messages for the inbox list menu."""
+        """Fetch a page of latest messages for the inbox list menu.
+
+        Ordered by effective recency (portal sent_on when parseable, else
+        insertion time), NOT raw sent_on — a sentinel-dated message must
+        surface by sync recency instead of sinking past the last page.
+        """
         stmt = (
             select(InboxMessage)
             .where(InboxMessage.user_id == user_id)
-            .order_by(InboxMessage.sent_on.desc(), InboxMessage.id.desc())
+            .order_by(_effective_recency().desc(), InboxMessage.id.desc())
             .offset(offset)
             .limit(limit)
         )
@@ -189,7 +214,7 @@ class InboxRepository:
                     InboxMessage.body.ilike(q),
                 ),
             )
-            .order_by(InboxMessage.sent_on.desc())
+            .order_by(_effective_recency().desc(), InboxMessage.id.desc())
             .limit(limit)
         )
         result = await self.session.execute(stmt)
