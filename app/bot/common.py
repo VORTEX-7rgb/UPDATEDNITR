@@ -88,6 +88,15 @@ def format_dashboard_text(user, unread_count: int = 0) -> str:
 # ── Persistent floating Start button (chat-level reply keyboard) ────────────
 START_BUTTON_TEXT = "🏠 Start"
 
+# Shown whenever the bot retires the floating bar for a registered user —
+# right after registration completes, or on their first 🏠 tap as a registered
+# user. Doubles as the carrier text for ReplyKeyboardRemove.
+BAR_RETIRED_TEXT = (
+    "🧹 <b>Quick-action bar retired!</b> Your dashboard is right below.\n\n"
+    "ℹ️ Reach it anytime via the ☰ Menu or /start — without the pinned bar "
+    "your phone's back button works normally in this chat again."
+)
+
 
 def build_start_reply_keyboard() -> types.ReplyKeyboardMarkup:
     """Always-visible 🏠 Start bar pinned above the text input.
@@ -103,6 +112,16 @@ def build_start_reply_keyboard() -> types.ReplyKeyboardMarkup:
         is_persistent=True,
         input_field_placeholder="Tap 🏠 Start for your dashboard",
     )
+
+
+def build_bar_removal_markup() -> types.ReplyKeyboardRemove:
+    """Remove the chat-level 🏠 reply bar for this chat.
+
+    sendMessage-only: editMessageText rejects ReplyKeyboardRemove with the
+    same pydantic ValidationError that ReplyKeyboardMarkup triggered in
+    incident 2026-08-24. Only ever attach this to message.answer().
+    """
+    return types.ReplyKeyboardRemove()
 
 
 def get_dashboard_keyboard(unread_count: int = 0) -> types.InlineKeyboardMarkup:

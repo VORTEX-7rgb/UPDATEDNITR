@@ -24,7 +24,13 @@ from app.db.models import User, SyncState
 from app.config import IST
 
 from app.bot.fsm import Registration, Deregistration, InboxSearch
-from app.bot.common import get_dashboard_keyboard, build_start_reply_keyboard, START_BUTTON_TEXT
+from app.bot.common import (
+    get_dashboard_keyboard,
+    build_start_reply_keyboard,
+    build_bar_removal_markup,
+    START_BUTTON_TEXT,
+    BAR_RETIRED_TEXT,
+)
 from app.ui.alive import render_dashboard
 from app.ui.surface import show
 from app.bot.handlers.attendance import fetch_attendance_for_callback
@@ -65,7 +71,15 @@ async def cmd_forgot(message: types.Message, state: FSMContext):
 
 
 @router.message(CommandStart(), StateFilter("*"))
-async def cmd_start(message: types.Message, state: FSMContext):
+async def cmd_start(message: types.Message, state: FSMContext, via_start_bar: bool = False):
+    """Render the dashboard (registered) or the onboarding welcome (not yet).
+
+    via_start_bar: internal flag set ONLY by start_button_tap — aiogram's DI
+    ignores defaulted extras for /start invocations (same proven pattern as
+    cmd_papers' explicit_telegram_id). It marks "this request arrived by
+    tapping the pinned 🏠 bar", which proves that bar still exists on the
+    user's client and is therefore safe to retire for registered users.
+    """
     telegram_id = message.from_user.id
 
     # PERF F6: fire-and-forget "typing…" so the chat shows activity while the
@@ -108,6 +122,20 @@ async def cmd_start(message: types.Message, state: FSMContext):
             await state.set_state(Registration.waiting_for_roll)
 
     if user:
+        if via_start_bar:
+            # LEGACY CLEANUP (Plan B): a registered user tapping the 🏠 bar
+            # proves that bar is still pinned on their client — retire it
+            # now so no registered user keeps a chat-level keyboard (its
+            # auto-expansion swallows the first Android back-press on every
+            # chat open). Self-limiting: removing the keyboard destroys the
+            # button itself, so this fires at most once per user. Sent
+            # before the dashboard so it doubles as instant tap feedback
+            # while the dashboard renders below.
+            await message.answer(
+                BAR_RETIRED_TEXT,
+                reply_markup=build_bar_removal_markup(),
+                parse_mode=ParseMode.HTML,
+            )
         await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
     else:
         # Persistent floating 🏠 Start bar is attached here — chat-level, so
@@ -124,9 +152,11 @@ async def start_button_tap(message: types.Message, state: FSMContext):
 
     Registered BEFORE every FSM text-catcher so the bar always wins — even
     mid-registration / while typing a password. Clears any active flow first.
+    via_start_bar=True lets cmd_start retire the pinned bar for registered
+    users (Plan B legacy cleanup); unregistered users are untouched.
     """
     await state.clear()
-    await cmd_start(message, state)
+    await cmd_start(message, state, via_start_bar=True)
 
 
 # --- FSM Command Shielding ---
@@ -403,6 +433,26 @@ async def process_password(message: types.Message, state: FSMContext):
         if user:
             await message.answer(text, reply_markup=get_dashboard_keyboard(unread_count), parse_mode=ParseMode.HTML)
 
+            # PLAN B: registration committed → retire the onboarding 🏠 bar.
+            # A bubble can carry inline buttons OR a keyboard removal, never
+            # both — hence this separate send AFTER the dashboard. New
+            # signups only: credential updaters already run bar-less (or shed
+            # it on their next 🏠 tap), and repeating the notice on every
+            # /forgot would be pure noise. If THIS send fails, the bar simply
+            # survives until the next 🏠 tap cleans it up — never fatal.
+            if is_new_user:
+                try:
+                    await message.answer(
+                        BAR_RETIRED_TEXT,
+                        reply_markup=build_bar_removal_markup(),
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception as remove_err:
+                    logger.warning(
+                        "Failed to retire 🏠 start bar post-registration for telegram_id=%s: %r",
+                        telegram_id, remove_err,
+                    )
+
         await state.clear()
 
     except (TelegramAPIError, ValidationError) as e:
@@ -417,7 +467,7 @@ async def process_password(message: types.Message, state: FSMContext):
         )
         try:
             await status_msg.edit_text(
-                "✅ <b>You're registered!</b>\n\nTap 🏠 Start below to open your dashboard.",
+                "✅ <b>You're registered!</b>\n\nOpen your dashboard anytime via the ☰ Menu or /start.",
                 parse_mode=ParseMode.HTML,
             )
         except Exception:

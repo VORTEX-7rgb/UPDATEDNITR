@@ -42,12 +42,17 @@ def _except_handler_types(tree: ast.AST) -> list[str]:
 def test_no_edit_text_call_carries_the_reply_start_keyboard():
     """Every status_msg.edit_text(...) in registration.py must avoid passing
     build_start_reply_keyboard() as reply_markup. (message.answer MAY use it —
-    new messages accept ReplyKeyboardMarkup; edits do not.)"""
+    new messages accept ReplyKeyboardMarkup; edits do not.) The same
+    editMessageText constraint applies to keyboard REMOVAL payloads, so
+    build_bar_removal_markup()/ReplyKeyboardRemove are guarded identically."""
     tree = _registration_tree()
     source = REGISTRATION_PATH.read_text(encoding="utf-8")
 
-    # The helper must still exist and be used for the /start welcome message.
+    # The helpers must still exist and be reachable.
     assert "build_start_reply_keyboard" in source
+    assert "build_bar_removal_markup" in source
+
+    forbidden = ("build_start_reply_keyboard", "build_bar_removal_markup", "ReplyKeyboardRemove")
 
     offenders: list[str] = []
     for node in ast.walk(tree):
@@ -59,12 +64,12 @@ def test_no_edit_text_call_carries_the_reply_start_keyboard():
         for kw in node.keywords:
             if kw.arg == "reply_markup":
                 rendered = ast.unparse(kw.value)
-                if "build_start_reply_keyboard" in rendered:
+                if any(name in rendered for name in forbidden):
                     offenders.append(rendered)
 
     assert not offenders, (
-        "editMessageText only accepts InlineKeyboardMarkup — attaching the "
-        f"reply-keyboard Start bar to an edit breaks every registration: {offenders}"
+        "editMessageText only accepts InlineKeyboardMarkup — attaching a "
+        f"reply-keyboard payload or its removal to an edit breaks flows: {offenders}"
     )
 
 
