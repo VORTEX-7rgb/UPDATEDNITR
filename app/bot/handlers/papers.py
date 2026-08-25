@@ -30,7 +30,6 @@ router = Router(name="papers_router")
 YEAR_MAP = {
     "2627A": "2026-27/Autumn",
     "2526A": "2025-26/Autumn",
-    "2526S": "2025-26/Autumn",
     "2425A": "2024-25/Autumn",
     "2324A": "2023-24/Autumn",
     "2223A": "2022-23/Autumn"
