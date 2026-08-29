@@ -32,6 +32,17 @@ router = Router(name="timetable_router")
 COOLDOWN_TIMETABLE_SYNC = config.COOLDOWN_TIMETABLE_SYNC  # seconds (env-tunable)
 
 
+def _fmt_wait(seconds: int) -> str:
+    """Humanize a cooldown remainder — '45s', '12m', '3h 05m'."""
+    if seconds < 90:
+        return f"{seconds}s"
+    minutes, sec = divmod(int(seconds), 60)
+    if minutes < 60:
+        return f"{minutes}m"
+    hours, mins = divmod(minutes, 60)
+    return f"{hours}h {mins:02d}m"
+
+
 # ── Keyboards ────────────────────────────────────────────────────────────────
 
 def get_now_next_keyboard() -> types.InlineKeyboardMarkup:
@@ -178,7 +189,7 @@ async def _enqueue_sync(
         user_id, "timetable_sync", cooldown_seconds=COOLDOWN_TIMETABLE_SYNC
     )
     if not allowed:
-        return False, f"⏳ Please wait <b>{wait}s</b> before syncing timetable again."
+        return False, f"⏳ Please wait <b>{_fmt_wait(wait)}</b> before syncing timetable again."
 
     # ...but RELEASE it if the enqueue fails — a rejected job must never
     # leave the user locked out with nothing scheduled.

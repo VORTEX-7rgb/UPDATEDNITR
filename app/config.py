@@ -224,7 +224,10 @@ class Config:
     BROADCAST_PACING_SECONDS = float(os.getenv("BROADCAST_PACING_SECONDS", "0.05"))
     BROADCAST_PROGRESS_EVERY = int(os.getenv("BROADCAST_PROGRESS_EVERY", "250"))
     ATTENDANCE_SLOW_AFTER_SECONDS = float(os.getenv("ATTENDANCE_SLOW_AFTER_SECONDS", "3.5"))
-    COOLDOWN_TIMETABLE_SYNC = int(os.getenv("COOLDOWN_TIMETABLE_SYNC", "60"))
+    # Manual "⚡ Sync from NITRIS" timetable cooldown. Timetables change ~never
+    # mid-semester (scheduler TTL is 7d), so 4h keeps the portal load sane
+    # without blocking genuine semester-boundary refreshes for long.
+    COOLDOWN_TIMETABLE_SYNC = int(os.getenv("COOLDOWN_TIMETABLE_SYNC", str(4 * 3600)))
 
     # ── DB engine housekeeping ───────────────────────────────────────────────
     DB_POOL_DISPOSE_DEBOUNCE_SECONDS = float(os.getenv("DB_POOL_DISPOSE_DEBOUNCE_SECONDS", "60"))
