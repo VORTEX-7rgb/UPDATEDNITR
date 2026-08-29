@@ -25,6 +25,7 @@ Get real-time attendance alerts, upcoming class countdowns, campus notices with 
 ## 📌 Table of Contents
 
 - [Why NITRClaw?](#-why-nitrclaw)
+- [Screenshots & Live UI](#-screenshots--live-ui)
 - [Key Features](#-key-features)
 - [Privacy & Security Guarantee](#-privacy--security-guarantee)
 - [System Architecture](#-system-architecture)
@@ -52,6 +53,19 @@ The official NITRIS web portal is built on legacy ASP.NET webforms:
 - ✅ **Sub-second responses**: Cached-first UI backed by asynchronous background sync workers.
 - ✅ **Zero portal overload**: Intelligent rate-limiting, token-bucket login pacing, and circuit breakers protect the NITRIS server from getting overwhelmed or banning IPs.
 - ✅ **Direct document delivery**: Question papers and notice attachments are delivered as native Telegram documents without broken or expiring links.
+
+---
+
+## 📸 Screenshots & Live UI
+
+<div align="center">
+
+| Student Dashboard | System Telemetry (`/status`) | Admin Registration Alert |
+| :---: | :---: | :---: |
+| <img src="assets/dashboard.jpg" width="250" alt="Student Dashboard" /> | <img src="assets/status.jpg" width="250" alt="System Status" /> | <img src="assets/registration_alert.jpg" width="250" alt="Registration Alert" /> |
+| *Real-time attendance & timetable* | *Live gateway & worker health* | *Privacy-safe admin notifications* |
+
+</div>
 
 ---
 
