@@ -25,7 +25,7 @@ Get real-time attendance alerts, upcoming class countdowns, campus notices with 
 ## 📌 Table of Contents
 
 - [Why NITRClaw?](#-why-nitrclaw)
-- [Screenshots & Live UI](#-screenshots--live-ui)
+- [Live Interface Preview](#-live-bot-interface-preview)
 - [Key Features](#-key-features)
 - [Privacy & Security Guarantee](#-privacy--security-guarantee)
 - [System Architecture](#-system-architecture)
@@ -56,16 +56,61 @@ The official NITRIS web portal is built on legacy ASP.NET webforms:
 
 ---
 
-## 📸 Screenshots & Live UI
+## 📱 Live Bot Interface Preview
 
 <div align="center">
 
-| Student Dashboard | System Telemetry (`/status`) | Admin Registration Alert |
-| :---: | :---: | :---: |
-| <img src="assets/dashboard.jpg" width="250" alt="Student Dashboard" /> | <img src="assets/status.jpg" width="250" alt="System Status" /> | <img src="assets/registration_alert.jpg" width="250" alt="Registration Alert" /> |
-| *Real-time attendance & timetable* | *Live gateway & worker health* | *Privacy-safe admin notifications* |
+```text
+┌─────────────────────────────────────────────────────────────┐
+│ 🦀 NITRCLAW (Beta)                                          │
+├─────────────────────────────────────────────────────────────┤
+│ 📅 Next: ER2251 · 08:00 · in 32h 40m                        │
+│ 🟢 Attendance: SAFE                                         │
+│ 📬 139 unread notices                                       │
+│ ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬ 92% overall                         │
+│                                                             │
+│ 👤 725MN1011 · 🟢 Synced 29 Aug 20:17 IST                   │
+└─────────────────────────────────────────────────────────────┘
+  [ 📊 Get Latest Attendance ]
+  [ 📅 Timetable ]          [ ⏰ Now & Next ]
+  [ 📥 Inbox (139) ]        [ 📚 Previous Papers ]
+  [ 🔄 Update Credentials ] [ ❌ Deregister ]
+```
 
 </div>
+
+<details>
+<summary><b>🔍 Click to view Real-time System Telemetry & Admin Alerts</b></summary>
+
+<br/>
+
+```text
+📊 NITRClaw System Status
+───────────────────────────────────────────────────────────────
+🔧 NITRIS Gateway
+   Circuit:        🟢 closed
+   Concurrency:    10/10 active
+   Login Pacing:   1.0s interval
+   Latency:        avg 3916ms | p95 9434ms
+   Total Requests: 816 (logins: 663)
+
+📋 Asynchronous Job Queue
+   Pending:        0 (Interactive: 0, Background: 0)
+   Workers:        8 interactive lane, 8 background lane
+   Active Handlers: attendance_refresh, inbox_refresh,
+                    qp_metadata_fetch, timetable_sync,
+                    attachment_download, qp_search
+
+📚 Question Paper Cache
+   Available:      1,914 cached papers
+   Stuck / Failed: 0
+───────────────────────────────────────────────────────────────
+🔔 Transparent Admin Event:
+   👤 Name: Student Name | 🎓 Roll: 123XX0000
+   (Zero passwords, zero tokens, zero personal Telegram IDs logged)
+```
+
+</details>
 
 ---
 
