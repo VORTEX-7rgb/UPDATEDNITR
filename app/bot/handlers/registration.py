@@ -33,6 +33,7 @@ from app.bot.common import (
 )
 from app.ui.alive import render_dashboard
 from app.ui.surface import show
+from app.ui.copy import POSTGRAD_UNSUPPORTED_NOTICE
 from app.bot.handlers.attendance import fetch_attendance_for_callback
 from app.bot.handlers.papers import cmd_papers
 
@@ -44,6 +45,19 @@ router = Router(name="registration_router")
 # roll-number prompt (register / start / forgot / credential-update / deregister).
 SIGNATURE_ROLLS_PLAIN = "👑 725MN1011, 125MM0058, 125EC0063"
 SIGNATURE_ROLLS_HTML = "👑 <b>725MN1011</b>, <b>125MM0058</b>, <b>125EC0063</b>"
+
+# ── Programme support gate ──────────────────────────────────────────────────
+# NITR roll number layout (regex-validated above): BBB LL D NNN (9 chars).
+# D = roll[5] is the programme indicator. Currently-supported programmes
+# (verified end-to-end against NITRIS attendance):
+#   '0','1','2','3','4' → BTech / Dual Degree / Integrated MSc (undergrad)
+# Not yet supported — NITRIS serves these with a different page layout that
+# 503s on the semester postback (see app/nitris/aspnet.py:199-202):
+#   '5','6'             → MSc 2-year (postgraduate)
+#   '7','8','9'         → MTech / PhD
+# To widen support later: confirm the programme works end-to-end, then add
+# its digit to this frozenset. NO DB migration needed — pure-Python check.
+SUPPORTED_PROGRAMME_DIGITS: frozenset[str] = frozenset("01234")
 
 
 # --- Global Command Overrides ---
@@ -195,6 +209,23 @@ async def process_roll(message: types.Message, state: FSMContext):
             f"The expected format is strictly 9 characters (e.g. {SIGNATURE_ROLLS_HTML}).\n\n"
             "Please try entering your roll number again, or send /cancel to abort:",
             parse_mode=ParseMode.HTML
+        )
+        return
+
+    # ── Programme support gate ──────────────────────────────────────────
+    # Soft-block postgraduate programmes (MTech / MSc 2-year / PhD) until we
+    # teach the bot their NITRIS page layout. Stays in waiting_for_roll so
+    # the user can retype or /cancel. CRITICAL: this runs BEFORE any NITRIS
+    # HTTP traffic (which only starts in process_password at line ~272) and
+    # before state.update_data — so no portal hit, no FSM pollution.
+    if roll[5] not in SUPPORTED_PROGRAMME_DIGITS:
+        logger.info(
+            "Registration soft-blocked — unsupported programme digit %r for roll %s",
+            roll[5], roll,
+        )
+        await message.answer(
+            POSTGRAD_UNSUPPORTED_NOTICE.format(roll=html.escape(roll)),
+            parse_mode=ParseMode.HTML,
         )
         return
 

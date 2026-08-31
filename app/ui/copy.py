@@ -29,6 +29,24 @@ QUEUE_BUSY = (
     "<i>Give it a few seconds and tap again.</i>"
 )
 
+# ── Programme support gate ──────────────────────────────────────────────────
+# Fires at registration time when the roll number's programme digit (roll[5])
+# isn't in the supported BTech / undergraduate set. Friendly, honest, with a
+# clear next step. Voice per file rules: utility first, one emoji for the
+# concept, no false promises. {roll} is filled in by the caller (HTML-escaped).
+POSTGRAD_UNSUPPORTED_NOTICE = (
+    "🎓 <b>Hey! We're not ready for your programme just yet.</b>\n\n"
+    "NitrClaw currently supports <b>BTech, Dual Degree, and Integrated MSc</b> "
+    "(all undergraduate programmes) on the NITRIS portal.\n\n"
+    "Your roll number (<code>{roll}</code>) belongs to a <b>Master's / postgraduate</b> "
+    "programme (MTech / MSc 2-year / PhD), and NITRIS serves those with a slightly "
+    "different page layout that we're still teaching the bot to handle.\n\n"
+    "🛠️ <b>We're working day and night to bring you in.</b> Hang tight — "
+    "Master's and PhD support is <b>coming soon</b>.\n\n"
+    "<i>If you believe this is a mistake, double-check your roll number and try again, "
+    "or send /cancel to abort.</i>"
+)
+
 # ── Attendance glossary (plain-English translations of NITRIS jargon) ──────
 GLOSSARY_TITLE = "📖 What NITRIS actually means"
 GLOSSARY_BODY = (
