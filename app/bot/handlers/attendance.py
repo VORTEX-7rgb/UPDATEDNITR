@@ -37,6 +37,22 @@ router = Router(name="attendance_router")
 SLOW_AFTER_SECONDS = config.ATTENDANCE_SLOW_AFTER_SECONDS
 ATTLIST_CB = "ui|attlist"
 ATTSUB_PREFIX = "ui|attsub|"
+ATTDET_PREFIX = "ui|attdet|"
+ATTDET_REFRESH_PREFIX = "ui|attdetrf|"
+DETAILS_MODULE_PREFIX = "att_details:"
+
+_DETAILS_STATUS_EMOJI = {
+    "present": "🟢",
+    "absent": "🔴",
+    "leave": "🔵",
+    "present_late": "🟠",
+    "absent_late": "💗",
+    "unknown": "⚪",
+}
+
+_DETAILS_LEGEND = (
+    "🟢 Present · 🔴 Absent · 🔵 Leave · 🟠/💗 Late-reg"
+)
 
 _OVERALL_LABEL = {
     "safe": "SAFE",
@@ -181,6 +197,135 @@ def _detail_text(s: SubjectHealth) -> str:
     return f"{title}\n{meta}\n{body}\n\n{verdict}"
 
 
+def _day_token(d: dict) -> str:
+    status = d.get("status") or "unknown"
+    day = d.get("day") or 0
+    emoji = _DETAILS_STATUS_EMOJI.get(status, "⚪")
+    if status in ("absent", "absent_late"):
+        return f"{emoji}<b>{day}</b>"
+    return f"{emoji}{day}"
+
+
+def _verdict_line(s: SubjectHealth | None) -> str:
+    """Format one-line debar verdict banner for the top of the date-wise screen."""
+    if s is None:
+        return ""
+    if s.level == "no_classes":
+        return "⚪ <i>Classes haven't started yet.</i>"
+    if s.level == "debarred":
+        return "💀 <b>DEBARRED ZONE — talk to your professor NOW</b>"
+    if s.level == "danger":
+        return f"🔴 <b>LAST SKIPS.</b> Only {max(s.ua_left or 0, 0)} more before debar line."
+    if s.level == "risk":
+        return f"🟠 <b>Grade-penalty territory.</b> ({s.ua_left} skip(s) left)"
+    if s.level == "warn":
+        return f"🟡 <b>Half budget gone.</b> {s.ua_left} skip(s) left."
+    if s.level == "unknown":
+        return "❔ <i>Raw attendance (pattern not published yet).</i>"
+    return f"🟢 Safe. <b>{s.ua_left} skip(s)</b> before debar line."
+
+
+def _details_text(
+    data: dict | None,
+    code: str,
+    status_line: str | None = None,
+    subject: SubjectHealth | None = None,
+) -> str:
+    safe_code = esc(code)
+    subject_label = esc(
+        (data.get("subject_label") if data else None)
+        or (subject.name if subject else "")
+        or code
+    )
+    session_label = esc((data.get("session_label") if data else None) or "")
+    totals = (data.get("totals") if data else None) or {}
+
+    header_parts = [f"{theme.ICON_ATT} <b>{safe_code}</b> · {subject_label}"]
+    if session_label:
+        header_parts.append(f"<i>{session_label}</i>")
+
+    v_line = _verdict_line(subject)
+    if v_line:
+        header_parts.append(v_line)
+
+    # If no month matrix yet (first-time loading preview)
+    if not data or not data.get("months"):
+        if subject is not None and subject.tc > 0:
+            tc = subject.tc
+            ua = subject.ua
+            le = subject.le
+            oa = subject.oa
+            pres = tc - oa
+            pct = round((pres / tc * 100), 1) if tc else 0.0
+            body_lines = [
+                f"Classes: <b>{tc}</b> · Present: <b>{pres}</b> · Absent: <b>{ua}</b>"
+                + (f" · Leave: <b>{le}</b>" if le else ""),
+                f"Attendance: <b>{pct}%</b>",
+                "",
+                "⏳ <i>Loading date-by-date calendar from NITRIS…</i>",
+                "",
+                f"<i>{_DETAILS_LEGEND}</i>",
+            ]
+            text = "\n".join(header_parts) + "\n" + theme.quote("\n".join(body_lines))
+            return f"{text}\n\n{status_line}" if status_line else text
+
+        body = theme.quote(
+            f"No date-wise records on file for <b>{safe_code}</b> yet.\n"
+            "⏳ <i>Fetching from NITRIS…</i>"
+        )
+        text = "\n".join(header_parts) + "\n" + body
+        return f"{text}\n\n{status_line}" if status_line else text
+
+    # Full month matrix available
+    total_classes = totals.get("total", subject.tc if subject else 0)
+    present = totals.get("present", (subject.tc - subject.oa) if subject else 0)
+    absent = totals.get("absent", subject.ua if subject else 0)
+    leave = totals.get("leave", subject.le if subject else 0)
+    pct = round((present / total_classes * 100), 1) if total_classes else 0.0
+
+    month_blocks: list[str] = []
+    for m in data.get("months") or []:
+        m_name = esc(m.get("name") or "")
+        m_count = m.get("count", 0)
+        m_sub = (m.get("submission") or "").strip()
+        badge = " · <i>Pending</i>" if m_sub.lower() == "pending" else ""
+
+        days = m.get("days") or []
+        if not days:
+            month_blocks.append(f"<b>{m_name}</b> ({m_count}){badge}\n  <i>No classes recorded</i>")
+            continue
+
+        lines: list[str] = []
+        row: list[str] = []
+        for d in days:
+            row.append(_day_token(d))
+            if len(row) == 8:
+                lines.append(" ".join(row))
+                row = []
+        if row:
+            lines.append(" ".join(row))
+
+        month_blocks.append(
+            f"<b>{m_name}</b> ({m_count}){badge}\n  " + "\n  ".join(lines)
+        )
+
+    body_lines = [
+        "\n\n".join(month_blocks),
+        "",
+        f"Classes: <b>{total_classes}</b> · Present: <b>{present}</b> · "
+        f"Absent: <b>{absent}</b>" + (f" · Leave: <b>{leave}</b>" if leave else ""),
+        f"Attendance: <b>{pct}%</b>",
+        "",
+        f"<i>{_DETAILS_LEGEND}</i>",
+    ]
+
+    text = (
+        "\n".join(header_parts) + "\n" +
+        theme.quote("\n".join(body_lines))
+    )
+    return f"{text}\n\n{status_line}" if status_line else text
+
+
 # ── Keyboards ───────────────────────────────────────────────────────────────
 
 def _kb_viewing(summary: AttendanceSummary | None = None):
@@ -210,8 +355,13 @@ def _kb_busy():
     return b.as_markup()
 
 
-def _kb_detail():
+def _kb_detail(code: str = ""):
+    return _kb_dates(code)
+
+
+def _kb_dates(code: str):
     b = InlineKeyboardBuilder()
+    b.row(theme.btn("🔄 Refresh", f"{ATTDET_REFRESH_PREFIX}{code}"))
     b.row(theme.btn("← All Subjects", ATTLIST_CB))
     b.row(theme.btn("📖 What do these mean?", GLOSSARY_CB))
     b.row(theme.home_button())
@@ -354,28 +504,174 @@ async def cb_attendance_list(callback: types.CallbackQuery):
 
 @router.callback_query(F.data.startswith(ATTSUB_PREFIX))
 async def cb_attendance_subject(callback: types.CallbackQuery):
+    """Subject tapped from list -> go DIRECTLY to date-wise calendar."""
     try:
         await callback.answer()
     except Exception:
         pass
 
-    code = callback.data[len(ATTSUB_PREFIX):]
+    # Support both ATTSUB_PREFIX (ui|attsub|) and ATTDET_PREFIX (ui|attdet|)
+    raw = callback.data or ""
+    if raw.startswith(ATTSUB_PREFIX):
+        code = raw[len(ATTSUB_PREFIX):].strip().upper()
+    elif raw.startswith(ATTDET_PREFIX):
+        code = raw[len(ATTDET_PREFIX):].strip().upper()
+    else:
+        code = raw.strip().upper()
 
-    # PERF: one round trip (was user lookup + snapshot load).
     user_id, summary = await _load_user_and_summary(callback.from_user.id)
     if user_id is None:
         await show(callback.message, "⚠️ Not registered. Send /start.")
         return
 
     target = next(
-        (s for s in (summary.subjects if summary else []) if s.code.upper() == code.upper()),
+        (s for s in (summary.subjects if summary else []) if s.code.upper() == code),
         None,
     )
     if target is None:
         await show(callback.message, _list_text(summary), _kb_viewing(summary))
         return
 
-    await show(callback.message, _detail_text(target), _kb_detail())
+    cached_details = await _load_details(user_id, code)
+    if cached_details and cached_details.get("months"):
+        # INSTANT (< 20ms from DB) — ZERO PORTAL LATENCY!
+        await show(
+            callback.message,
+            _details_text(cached_details, code, subject=target),
+            _kb_dates(code),
+        )
+        return
+
+    # First time ever: auto-trigger fetch in background, show instant preview!
+    surf = Surface(callback.message)
+    await _run_details_flow(
+        surf, user_id, code, cached_details,
+        chat_id=callback.message.chat.id,
+        message_id=callback.message.message_id,
+        subject=target,
+    )
+
+
+# ── Date-wise matrix navigation (cached-first + live refresh) ───────────────
+
+def _details_module(code: str) -> str:
+    return f"{DETAILS_MODULE_PREFIX}{code.upper()}"
+
+
+async def _load_details(user_id: int, code: str) -> dict | None:
+    from app.db.repositories.snapshot_repository import SnapshotRepository
+    async with get_db_session() as session:
+        repo = SnapshotRepository(session)
+        snap = await repo.get_latest_snapshot(user_id, _details_module(code))
+    if not snap or not getattr(snap, "snapshot_json", None):
+        return None
+    return snap.snapshot_json
+
+
+async def _run_details_flow(
+    surf: Surface,
+    user_id: int,
+    code: str,
+    cached: dict | None,
+    chat_id: int | None = None,
+    message_id: int | None = None,
+    subject: SubjectHealth | None = None,
+) -> None:
+    """LAYER 2 (timetable pattern): enqueue details fetch and return immediately."""
+    has_cache = bool(cached and cached.get("months"))
+    await surf.edit(
+        _details_text(
+            cached, code,
+            copy.UPDATING if has_cache else "⏳ <i>Fetching date-wise matrix from NITRIS…</i>",
+            subject=subject,
+        ),
+        _kb_dates(code),
+    )
+
+    from app.nitris.job_queue import nitris_job_queue, Priority
+    from app.nitris.gateway import NitrisCircuitOpenError
+
+    try:
+        await nitris_job_queue.enqueue(
+            job_type="attendance_details_fetch",
+            user_id=user_id,
+            priority=Priority.HIGH,
+            dedup_key=f"attendance_details:user:{user_id}:{code.upper()}",
+            payload={
+                "subject_code": code,
+                "callback_chat_id": chat_id,
+                "callback_message_id": message_id,
+                "interaction_token": getattr(surf, "owner_token", None),
+            },
+        )
+    except NitrisCircuitOpenError:
+        from app.nitris.rate_limiter import operation_cooldown
+        await operation_cooldown.clear(user_id, f"att_details_refresh:{code.upper()}")
+        await surf.final(
+            _details_text(cached, code, copy.CIRCUIT_DOWN, subject=subject),
+            _kb_dates(code),
+        )
+    except RuntimeError as e:
+        from app.nitris.rate_limiter import operation_cooldown
+        await operation_cooldown.clear(user_id, f"att_details_refresh:{code.upper()}")
+        logger.warning("Attendance details enqueue rejected: %r", e)
+        await surf.final(
+            _details_text(cached, code, copy.QUEUE_BUSY, subject=subject),
+            _kb_dates(code),
+        )
+
+
+@router.callback_query(F.data.startswith(ATTDET_PREFIX))
+async def cb_attendance_dates(callback: types.CallbackQuery):
+    """Alias to cb_attendance_subject for backward compatibility."""
+    return await cb_attendance_subject(callback)
+
+
+@router.callback_query(F.data.startswith(ATTDET_REFRESH_PREFIX))
+async def cb_attendance_dates_refresh(callback: types.CallbackQuery):
+    """Force fresh scrape of date-wise attendance matrix from NITRIS."""
+    try:
+        await callback.answer()
+    except Exception:
+        pass
+
+    code = callback.data[len(ATTDET_REFRESH_PREFIX):].strip().upper()
+    user_id, summary = await _load_user_and_summary(callback.from_user.id)
+    if user_id is None:
+        await show(callback.message, "⚠️ Not registered. Send /start.")
+        return
+
+    target = next(
+        (s for s in (summary.subjects if summary else []) if s.code.upper() == code),
+        None,
+    )
+    if target is None:
+        await show(callback.message, _list_text(summary), _kb_viewing(summary))
+        return
+
+    from app.nitris.rate_limiter import operation_cooldown, COOLDOWN_ATTENDANCE_REFRESH
+
+    action_key = f"att_details_refresh:{code}"
+    allowed, wait = await operation_cooldown.check(
+        user_id, action_key, cooldown_seconds=COOLDOWN_ATTENDANCE_REFRESH
+    )
+    cached_details = await _load_details(user_id, code)
+    surf = Surface(callback.message)
+
+    if not allowed:
+        cooldown_note = f"⏳ Synced just now. Next live refresh in {wait}s."
+        await surf.edit(
+            _details_text(cached_details, code, cooldown_note, subject=target),
+            _kb_dates(code),
+        )
+        return
+
+    await _run_details_flow(
+        surf, user_id, code, cached_details,
+        chat_id=callback.message.chat.id,
+        message_id=callback.message.message_id,
+        subject=target,
+    )
 
 
 # ── Glossary ────────────────────────────────────────────────────────────────
