@@ -165,13 +165,13 @@ async def with_pooled_session(
     async with entry.lock:                       # serialize same-account jobs
         async with _gateway_acquire():           # single slot: [login?] + work
             password = decrypt_password(encrypted_password)   # JIT inside slot
-            if entry.needs_login:
-                from app.nitris.gateway import nitris_gateway
-                await nitris_gateway.login_through_gateway(
-                    entry.client, roll_number, password, user_id=user_id,
-                )
-                entry.needs_login = False
             try:
+                if entry.needs_login:
+                    from app.nitris.gateway import nitris_gateway
+                    await nitris_gateway.login_through_gateway(
+                        entry.client, roll_number, password, user_id=user_id,
+                    )
+                    entry.needs_login = False
                 result = await work(entry.client, password)
             except (LoginError, SessionExpiredError, CredentialsQuarantinedError):
                 logger.info(

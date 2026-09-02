@@ -248,6 +248,7 @@ async def _run_flow(
             payload={
                 "callback_chat_id": chat_id,
                 "callback_message_id": message_id,
+                "interaction_token": getattr(surf, "owner_token", None),
             },
         )
     except NitrisCircuitOpenError:

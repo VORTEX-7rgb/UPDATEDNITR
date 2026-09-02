@@ -57,6 +57,13 @@ def is_bubble_owner(message: types.Message, token: int) -> bool:
     return _bubble_owners.get(key, token) == token
 
 
+def check_bubble_owner(chat_id: int | None, message_id: int | None, token: int | None) -> bool:
+    """Return True if the interaction token still owns the bubble, or if token is None."""
+    if chat_id is None or message_id is None or token is None:
+        return True
+    return _bubble_owners.get((chat_id, message_id), token) == token
+
+
 async def show(
     message: types.Message,
     text: str,
@@ -126,6 +133,11 @@ class Surface:
         self._gen = 0
         self._owner_token = claim_bubble(message)
         self._pokes: set[asyncio.Task] = set()
+
+    @property
+    def owner_token(self) -> int:
+        """The active interaction sequence token for this surface."""
+        return self._owner_token
 
     async def edit(self, text: str, reply_markup=None) -> types.Message | None:
         if not is_bubble_owner(self.message, self._owner_token):

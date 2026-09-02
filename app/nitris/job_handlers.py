@@ -93,9 +93,21 @@ async def handle_attendance_refresh(job: NitrisJob) -> dict:
     user_id = job.user_id
     callback_chat_id = job.payload.get("callback_chat_id")
     callback_message_id = job.payload.get("callback_message_id")
+    interaction_token = job.payload.get("interaction_token")
 
     # PERF instrumentation: one line showing where the time went.
     _t0 = time.monotonic()
+
+    async def _safe_edit(chat_id, message_id, text, reply_markup=None):
+        if interaction_token is not None:
+            try:
+                await _edit_callback_message(
+                    chat_id, message_id, text, reply_markup=reply_markup, token=interaction_token
+                )
+                return
+            except TypeError:
+                pass
+        await _edit_callback_message(chat_id, message_id, text, reply_markup=reply_markup)
 
     # ── Step 1: DB lookup (encrypted credential) — OUTSIDE gateway ────
     async with async_session_factory() as session:
@@ -134,7 +146,7 @@ async def handle_attendance_refresh(job: NitrisJob) -> dict:
         )
 
     except NitrisCircuitOpenError as e:
-        await _edit_callback_message(
+        await _safe_edit(
             callback_chat_id, callback_message_id,
             "⚠️ <b>NITRIS is temporarily unavailable.</b>\n\n"
             "The system is protecting the portal from overload. "
@@ -146,7 +158,7 @@ async def handle_attendance_refresh(job: NitrisJob) -> dict:
         # Portal down/misbehaving — NOT a credential problem (H1 fix).
         # Never quarantine on this; surface the same "try later" UX.
         logger.warning("attendance_refresh: NITRIS unavailable for user_id=%s: %r", user_id, e)
-        await _edit_callback_message(
+        await _safe_edit(
             callback_chat_id, callback_message_id,
             "⚠️ <b>NITRIS is temporarily unavailable.</b>\n\n"
             "Could not reach the portal right now. "
@@ -157,7 +169,7 @@ async def handle_attendance_refresh(job: NitrisJob) -> dict:
     except (LoginError, CredentialsQuarantinedError) as e:
         # Mark credentials as invalid
         await on_login_failure(user_id, str(e))
-        await _edit_callback_message(
+        await _safe_edit(
             callback_chat_id, callback_message_id,
             f"❌ <b>Login failed.</b>\n\n"
             f"Your NITRIS credentials may have changed. "
@@ -168,7 +180,7 @@ async def handle_attendance_refresh(job: NitrisJob) -> dict:
 
     except (AttendanceWorkflowError, AttendanceParseError) as e:
         await _update_sync_state(user_id, success=False, error_msg=str(e))
-        await _edit_callback_message(
+        await _safe_edit(
             callback_chat_id, callback_message_id,
             f"❌ <b>Could not fetch attendance.</b>\n\n"
             f"The NITRIS portal may be experiencing issues. Please try again later.\n\n"
@@ -191,7 +203,7 @@ async def handle_attendance_refresh(job: NitrisJob) -> dict:
             )
             records = (data.to_dict() or {}).get("records") or []
             fresh_summary = _att_summarize(records)
-            await _edit_callback_message(
+            await _safe_edit(
                 callback_chat_id, callback_message_id,
                 _att_list_text(fresh_summary, "🟢 Updated just now."),
                 reply_markup=_att_kb_viewing(fresh_summary),
@@ -852,10 +864,24 @@ async def _edit_callback_message(
     message_id: Optional[int],
     text: str,
     reply_markup=None,
+    token: Optional[int] = None,
 ) -> None:
-    """Edit a Telegram message if chat_id and message_id are provided."""
+    """Edit a Telegram message if chat_id and message_id are provided.
+
+    Stale-write protection: if an interaction token is provided and the user
+    navigated away (claimed a newer screen on the same bubble), the edit is
+    silently dropped to prevent overwriting the newer screen.
+    """
     if not _bot or not chat_id or not message_id:
         return
+    if token is not None:
+        from app.ui.surface import check_bubble_owner
+        if not check_bubble_owner(chat_id, message_id, token):
+            logger.info(
+                "Skipping stale background edit for bubble (%s, %s) — user navigated away.",
+                chat_id, message_id,
+            )
+            return
     try:
         await _bot.edit_message_text(
             chat_id=chat_id,

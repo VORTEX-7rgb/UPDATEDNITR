@@ -7,9 +7,10 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional, Any
 
 def normalize_to_utc(dt: datetime) -> datetime:
-    """Normalize any datetime (aware or naive) to UTC timezone-aware datetime."""
+    """Normalize any datetime (aware or naive IST) to UTC timezone-aware datetime."""
     if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
+        from app.config import config
+        dt = dt.replace(tzinfo=config.IST)
     return dt.astimezone(timezone.utc)
 
 from app.utils import esc, safe_truncate
@@ -316,7 +317,7 @@ async def persist_inbox_sync(user_id, scraped_messages, detail_cache, existing_b
                         existing.token = msg["token"]
 
                     existing_sent_on_utc = normalize_to_utc(existing.sent_on)
-                    if existing.subject != msg["subject"] or existing_sent_on_utc != normalized_scraped_sent_on:
+                    if existing.subject != msg["subject"]:
                         logger.info(
                             "Sync detected edited notice. Invalidating cache for token: %s",
                             msg["token"],
@@ -330,7 +331,7 @@ async def persist_inbox_sync(user_id, scraped_messages, detail_cache, existing_b
                         existing.is_read = False
                         if not await event_repo.has_message_event(
                             user_id, EventType.MESSAGE_UPDATED, existing.id
-                        ):
+                         ):
                             await event_repo.create_event(
                                 user_id=user_id,
                                 event_type=EventType.MESSAGE_UPDATED,
@@ -340,6 +341,10 @@ async def persist_inbox_sync(user_id, scraped_messages, detail_cache, existing_b
                                     "subject": existing.subject,
                                 },
                             )
+                    elif existing_sent_on_utc != normalized_scraped_sent_on:
+                        # Silent timestamp migration: update existing.sent_on to corrected UTC
+                        # without wiping body cache, resetting read status, or spamming events.
+                        existing.sent_on = normalized_scraped_sent_on
 
 
 _event_dispatcher = None

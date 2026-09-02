@@ -79,14 +79,17 @@ async def _shielded_finish(coro) -> None:
     guarantees the connection returns to the pool before we propagate.
     """
     import asyncio as _aio
+    task = _aio.create_task(coro)
     try:
-        await _aio.shield(coro)
+        await _aio.shield(task)
     except _aio.CancelledError:
-        # Outer cancellation arrived mid-cleanup — finish the job anyway.
+        # Outer cancellation arrived mid-cleanup — finish the job anyway,
+        # then re-raise CancelledError so cancellation propagates.
         try:
-            await coro
+            await task
         except Exception:
             pass
+        raise
     except Exception:
         pass
 

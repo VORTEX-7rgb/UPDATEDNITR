@@ -145,6 +145,7 @@ class NitrisClient:
         # as a legacy explicit override. Snapshots contain student PII — keep off
         # in production.
         self._debug = config.DEBUG or os.getenv("DEBUG_ATTENDANCE", "").lower() in ("1", "true")
+        self.closed = False
         limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
         self.client = httpx.AsyncClient(
             base_url=self.base_url,
@@ -1435,5 +1436,12 @@ class NitrisClient:
         return html
 
     async def close(self) -> None:
-        await self.client.aclose()
+        """Close client instance by clearing session state.
+
+        Note: We intentionally do NOT call self.client.aclose() because that
+        would close the process-wide _shared_transport pooled sockets.
+        _shared_transport is closed cleanly on app shutdown via close_shared_transport().
+        """
+        self.closed = True
+        self.client.cookies.clear()
 
