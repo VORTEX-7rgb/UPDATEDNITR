@@ -237,7 +237,7 @@ You can easily run your own instance of NITRClaw on a VPS, local machine, or hom
 4. **Fill in your credentials in `.env`:**
    ```ini
    BOT_TOKEN=your_telegram_bot_token
-   ADMIN_TELEGRAM_IDS=your_telegram_user_id
+   ADMIN_TELEGRAM_IDS=your_telegram_id
    ENCRYPTION_KEY=your_generated_fernet_key
    ```
 
