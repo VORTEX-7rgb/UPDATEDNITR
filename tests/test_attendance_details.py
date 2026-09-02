@@ -533,3 +533,50 @@ async def test_handle_attendance_details_fetch_errors():
         assert res["success"] is False
         assert mock_edit.call_count == 1
         assert "Could not fetch date-wise attendance" in mock_edit.call_args[0][2]
+
+
+@pytest.mark.asyncio
+async def test_client_fetch_attendance_details_postback_flow():
+    from app.nitris.client import NitrisClient
+    import httpx
+
+    client = NitrisClient()
+    postback_grid = """
+    <form action="ClassAttendance.aspx?AppId=123" method="POST">
+      <input type="hidden" name="__VIEWSTATE" value="vs_data" />
+      <table id="ContentPlaceHolder2_ContentPlaceHolder1_mainContent_gvSubjects">
+        <tr><th>#</th><th>Code</th><th>Name</th><th>Action</th></tr>
+        <tr>
+          <td>1</td><td>ER2251</td><td>Mining Geology</td>
+          <td><a href="javascript:__doPostBack('ctl00$btnDetails','')">Details</a></td>
+        </tr>
+      </table>
+    </form>
+    """
+
+    client.fetch_attendance = AsyncMock(return_value=postback_grid)
+    client._peek_cached_subpage_url = MagicMock(return_value=None)
+
+    # Mock POST returning 302 with Location
+    post_resp = MagicMock()
+    post_resp.status_code = 302
+    post_resp.headers = {"Location": "/nitris/Student/Attendance/ClassAttendanceDetails.aspx?AppId=123&token=abc"}
+
+    # Mock GET returning 200 with details page
+    get_resp = MagicMock()
+    get_resp.status_code = 200
+    get_resp.text = SAMPLE_DETAILS_HTML
+
+    client.client = MagicMock()
+    client.client.post = AsyncMock(return_value=post_resp)
+    client.client.get = AsyncMock(return_value=get_resp)
+
+    html, url = await client.fetch_attendance_details("ER2251")
+    assert html == SAMPLE_DETAILS_HTML
+    assert "ClassAttendanceDetails.aspx" in url
+    assert client.client.post.call_count == 1
+    assert client.client.get.call_count == 1
+    # Verify post payload
+    payload = client.client.post.call_args.kwargs["data"]
+    assert payload["__EVENTTARGET"] == "ctl00$btnDetails"
+    assert payload["__VIEWSTATE"] == "vs_data"
