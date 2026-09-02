@@ -370,13 +370,17 @@ async def handle_attendance_details_fetch(job: NitrisJob) -> dict:
         )
         return {"success": False, "error": str(e), "data": None}
 
-    # ── Step 3 (LAYER 2): render the fresh matrix FIRST ─────────────────
     if callback_chat_id and callback_message_id:
         try:
-            from app.bot.handlers.attendance import _details_text, _kb_dates
+            from app.bot.handlers.attendance import _details_text, _kb_dates, _load_summary
+            summary = await _load_summary(user_id)
+            target = next(
+                (s for s in (summary.subjects if summary else []) if s.code.upper() == code),
+                None,
+            )
             await _safe_edit(
                 callback_chat_id, callback_message_id,
-                _details_text(data.to_dict(), code, "🟢 Updated just now."),
+                _details_text(data.to_dict(), code, "🟢 Updated just now.", subject=target),
                 reply_markup=_kb_dates(code),
             )
         except Exception as e:

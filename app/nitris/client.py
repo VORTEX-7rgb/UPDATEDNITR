@@ -973,7 +973,9 @@ class NitrisClient:
 
         kind, val = target
         if kind == "postback":
-            from app.nitris.aspnet import extract_form_fields
+            from bs4 import BeautifulSoup
+            from app.nitris.aspnet import extract_form_fields, HTML_PARSER
+
             form_state = await asyncio.to_thread(extract_form_fields, attendance_html)
             soup = BeautifulSoup(attendance_html, HTML_PARSER)
             form = soup.find("form")
