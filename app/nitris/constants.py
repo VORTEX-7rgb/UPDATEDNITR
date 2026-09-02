@@ -67,6 +67,28 @@ CTL_QP_SEARCH_BTN = "ctl00$ctl00$ctl00$ContentPlaceHolder2$ContentPlaceHolder1$m
 # Grid ID
 QUESTION_TABLE_ID = "ContentPlaceHolder2_ContentPlaceHolder1_mainContent_gvSubjects"
 
+# ── Attendance DETAILS page (Subject/Date-wise attendance) ──────────────────
+# Per-subject "ClassAttendanceDetails.aspx" matrix page. Links to it live on
+# the ClassAttendance.aspx grid (one per subject row) and carry rotated
+# base64 tokens (ApId=-<token>&AppName=...&SubModId=...). Exactly like the
+# module URLs above, they are NEVER hardcoded — they are harvested from the
+# live attendance page HTML at runtime (see attendance_details_parser).
+ATTENDANCE_DETAILS_LINK_KEYWORD = "classattendancedetails.aspx"
+
+# Outcome palette of the details matrix. NITRIS paints every class-date cell
+# with an Office-style background color encoding the attendance outcome:
+#   green  = Present                  red    = Absent (default before submit)
+#   blue   = Leave Sanctioned         orange = Present (Late Registration)
+#   pink   = Absent (Late Registration)
+# Colors are classified by HUE BUCKET (not exact hex) so small palette drift
+# on the portal never breaks parsing.
+DETAILS_STATUS_PRESENT = "present"
+DETAILS_STATUS_ABSENT = "absent"
+DETAILS_STATUS_LEAVE = "leave"
+DETAILS_STATUS_PRESENT_LATE = "present_late"   # Present (Late Registration/Admission)
+DETAILS_STATUS_ABSENT_LATE = "absent_late"     # Absent (Late Registration)
+DETAILS_STATUS_UNKNOWN = "unknown"
+
 # NOTE: ATTENDANCE_RAW_QUERY and the hardcoded QP fallback query have been REMOVED.
 # Both were using stale navigation tokens that NITRIS rotates periodically, which
 # caused 503 errors and random failures. URLs are now resolved dynamically from

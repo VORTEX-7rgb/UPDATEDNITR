@@ -896,6 +896,153 @@ class NitrisClient:
 
         return final_html
 
+    # ── Attendance Details Workflow (Subject/Date-wise matrix) ──
+
+    async def fetch_attendance_details(self, subject_code: str) -> tuple[str, str]:
+        """Fetch ONE subject's "Subject/Date wise Attendance Details" HTML.
+
+        The details links live on the ClassAttendance.aspx grid and carry
+        ROTATED base64 tokens (ApId=-<token>&AppName=…&SubModId=…) — they are
+        harvested from the live attendance page at runtime (never hardcoded),
+        matching the self-healing philosophy of the module-URL resolver.
+
+        Escalation ladder (cheapest path wins, portal pressure minimized):
+          1. WARM  — cached attendance sub-page URL → direct GET → harvest the
+                     subject's details href (2 GETs, the common case).
+          2. HEAL  — module context lost (503) or link absent → full
+                     self-healing module resolve → GET → harvest (+1 GET).
+          3. FORCE — link still absent (server-side year/session drifted) →
+                     run the proven full postback workflow so the CURRENT
+                     semester grid renders, then harvest from its final HTML.
+
+        Returns:
+            (details_html, details_url) — details_url keeps the raw query
+            string byte-for-byte (base64 '=' padding and '-' separators are
+            significant; httpx raw_path prevents any re-encoding).
+
+        Raises:
+            SessionExpiredError: auth dropped (propagates — service re-logins).
+            InvalidContextError: every escalation level lost module context.
+            AttendanceWorkflowError: subject has no details link anywhere.
+        """
+        code = (subject_code or "").strip()
+        if not code:
+            raise AttendanceWorkflowError("fetch_attendance_details: empty subject_code.")
+
+        from app.nitris.attendance_details_parser import (
+            extract_details_target,
+            normalize_details_href,
+        )
+
+        target: Optional[tuple[str, str]] = None
+        attendance_html: str = ""
+        source_url: str = ""
+
+        # ── 1) WARM: cached attendance URL → direct GET → check target ──
+        page_url = self._peek_cached_subpage_url(
+            ATTENDANCE_MODULE_NAME, ATTENDANCE_SIDEBAR_LINK_KEYWORD,
+        )
+        if page_url is not None:
+            try:
+                page_html, page_url_str = await self._fetch_attendance_page(page_url)
+                self._touch_resolved_url(
+                    ATTENDANCE_MODULE_NAME, ATTENDANCE_SIDEBAR_LINK_KEYWORD,
+                )
+                t = await asyncio.to_thread(extract_details_target, page_html, code)
+                if t:
+                    logger.info("[attdetails] %s target found (%s, warm path)", code, t[0])
+                    target = t
+                    attendance_html = page_html
+                    source_url = page_url_str
+            except InvalidContextError:
+                logger.info("[attdetails] module context lost on warm path — escalating")
+
+        # ── 2) FORCE: full attendance workflow (ensures current session + rows) ──
+        if target is None:
+            logger.info("[attdetails] %s target absent on default grid — forcing full workflow", code)
+            final_html = await self.fetch_attendance(prefer_key=code)
+            t = await asyncio.to_thread(extract_details_target, final_html, code)
+            if t is None:
+                raise AttendanceWorkflowError(
+                    f"No date-wise attendance link found for subject '{code}'. "
+                    f"The subject may have no recorded classes this session."
+                )
+            target = t
+            attendance_html = final_html
+            source_url = f"{self.base_url}{ATTENDANCE_PAGE_PATH}"
+
+        kind, val = target
+        if kind == "postback":
+            from app.nitris.aspnet import extract_form_fields
+            form_state = await asyncio.to_thread(extract_form_fields, attendance_html)
+            soup = BeautifulSoup(attendance_html, HTML_PARSER)
+            form = soup.find("form")
+            action = form.get("action") if form else ""
+            post_url = urllib.parse.urljoin(source_url, action)
+
+            payload = {
+                **form_state,
+                "__EVENTTARGET": val,
+                "__EVENTARGUMENT": "",
+            }
+            logger.info("[attdetails] POST %s for target %s", str(post_url)[:110], val.split("$")[-1])
+            resp = await self.client.post(
+                post_url, data=payload, headers={"Referer": source_url}, follow_redirects=False
+            )
+            if resp.status_code in (301, 302, 303, 307, 308):
+                loc = resp.headers.get("Location", "")
+                if "Login.aspx" in loc:
+                    raise SessionExpiredError("Session expired — redirected to login.")
+                if "503.aspx" in loc:
+                    raise InvalidContextError("Attendance details page redirected to 503 — module context lost.")
+
+                details_url_str = urllib.parse.urljoin(self.base_url, loc)
+                parsed = urllib.parse.urlparse(details_url_str)
+                raw_path = f"{parsed.path}?{parsed.query}".encode("ascii")
+                details_url = httpx.URL(self.base_url).copy_with(raw_path=raw_path)
+
+                logger.info("[attdetails] GET redirect %s", str(details_url)[:110])
+                resp2 = await self.client.get(
+                    details_url, headers={"Referer": post_url}, follow_redirects=False
+                )
+                if resp2.status_code != 200:
+                    raise AttendanceWorkflowError(f"Attendance details GET returned {resp2.status_code}")
+                details_html = resp2.text
+                final_url = str(details_url)
+            elif resp.status_code == 200:
+                details_html = resp.text
+                final_url = post_url
+            else:
+                raise AttendanceWorkflowError(f"Details postback returned {resp.status_code}")
+        else:
+            # kind == "link"
+            absolute = normalize_details_href(val)
+            parsed = urllib.parse.urlparse(absolute)
+            raw_path = f"{parsed.path}?{parsed.query}".encode("ascii")
+            details_url = httpx.URL(self.base_url).copy_with(raw_path=raw_path)
+
+            logger.info("[attdetails] GET direct link %s", str(details_url)[:110])
+            headers = {"Referer": f"{self.base_url}{ATTENDANCE_PAGE_PATH}"}
+            resp = await self.client.get(details_url, headers=headers, follow_redirects=False)
+            if resp.status_code in (301, 302, 303, 307, 308):
+                loc = resp.headers.get("Location", "")
+                if "Login.aspx" in loc:
+                    raise SessionExpiredError("Session expired — redirected to login.")
+                if "503.aspx" in loc:
+                    raise InvalidContextError("Attendance details page redirected to 503 — module context lost.")
+                raise AttendanceWorkflowError(f"Details GET redirected to {loc}")
+            if resp.status_code != 200:
+                raise AttendanceWorkflowError(f"Attendance details GET returned {resp.status_code}")
+            details_html = resp.text
+            final_url = str(details_url)
+
+        if is_login_page(details_html):
+            raise SessionExpiredError("Session expired — login form detected.")
+        if is_error_page(details_html, None):
+            raise InvalidContextError("Attendance details page returned a 503 error page.")
+
+        return details_html, final_url
+
     # ── Helpers ─────────────────────────────────────────────────
 
     @staticmethod

@@ -17,8 +17,10 @@ Each handler:
 from __future__ import annotations
 
 import asyncio
-import logging
+import hashlib
 import html
+import json
+import logging
 import time
 from datetime import datetime, timezone
 from typing import Optional, Any
@@ -61,6 +63,7 @@ def init_job_handlers(bot) -> None:
     _bot = bot
 
     nitris_job_queue.register_handler("attendance_refresh", handle_attendance_refresh)
+    nitris_job_queue.register_handler("attendance_details_fetch", handle_attendance_details_fetch)
     nitris_job_queue.register_handler("inbox_refresh", handle_inbox_refresh)
     nitris_job_queue.register_handler("sync_onboarding", handle_sync_onboarding)
     nitris_job_queue.register_handler("qp_metadata_fetch", handle_qp_metadata_fetch)
@@ -235,6 +238,187 @@ async def handle_attendance_refresh(job: NitrisJob) -> dict:
         "success": True,
         "data": data,
         "error": None,
+        "callback_chat_id": callback_chat_id,
+        "callback_message_id": callback_message_id,
+    }
+
+
+# ── Handler: attendance_details_fetch ───────────────────────────────
+
+async def handle_attendance_details_fetch(job: NitrisJob) -> dict:
+    """Fetch ONE subject's date-wise attendance matrix, snapshot it, render.
+
+    Payload:
+        - subject_code: str (attendance subject code, e.g. "ER2251")
+        - callback_chat_id / callback_message_id: int (bubble to edit)
+        - interaction_token: int | None (bubble ownership token)
+
+    Mirrors handle_attendance_refresh end-to-end: DB lookup OUTSIDE the
+    gateway → pooled authenticated session INSIDE one gateway slot →
+    render-first edit → background snapshot persist.
+
+    Deliberately DIFFERENT from attendance_refresh in two ways:
+      * Snapshots go through SnapshotRepository directly (module_name
+        "att_details:<CODE>") — NEVER through SnapshotService, because
+        EventService change-detection would fire user notifications for a
+        derived view. Details snapshots are silent by design.
+      * SyncState is NOT touched — date-wise is a view over attendance,
+        not a module sync; polluting failure metrics would mislead admins.
+    """
+    user_id = job.user_id
+    code = str(job.payload.get("subject_code") or "").strip().upper()
+    callback_chat_id = job.payload.get("callback_chat_id")
+    callback_message_id = job.payload.get("callback_message_id")
+    interaction_token = job.payload.get("interaction_token")
+
+    if not code:
+        return {"success": False, "error": "Missing subject_code", "data": None}
+
+    _t0 = time.monotonic()
+
+    async def _safe_edit(chat_id, message_id, text, reply_markup=None):
+        if interaction_token is not None:
+            try:
+                await _edit_callback_message(
+                    chat_id, message_id, text, reply_markup=reply_markup, token=interaction_token
+                )
+                return
+            except TypeError:
+                pass
+        await _edit_callback_message(chat_id, message_id, text, reply_markup=reply_markup)
+
+    # ── Step 1: DB lookup (encrypted credential) — OUTSIDE gateway ────
+    async with async_session_factory() as session:
+        user = await session.get(User, user_id)
+        if not user:
+            return {"success": False, "error": "User not found", "data": None}
+        if not user.credentials_valid:
+            return {
+                "success": False,
+                "error": "Credentials marked invalid. Please /forgot to update.",
+                "data": None,
+            }
+        roll_number = user.roll_number
+        encrypted_password = user.encrypted_password
+    _t_db = time.monotonic()
+
+    # ── Step 2: NITRIS work — pooled authenticated session (PERF P1) ────
+    try:
+        from app.nitris.session_pool import with_pooled_session
+        from app.services.attendance_details_service import get_attendance_details_data
+
+        async def _work(client, password):
+            return await get_attendance_details_data(
+                roll_number, password, client=client,
+                subject_code=code, user_id=user_id,
+            )
+
+        data = await with_pooled_session(
+            user_id=user_id,
+            roll_number=roll_number,
+            encrypted_password=encrypted_password,
+            work=_work,
+        )
+        _t_nitris = time.monotonic()
+        logger.info(
+            "⏱ attendance_details_fetch user=%s subject=%s db=%dms nitris=%dms",
+            roll_number, code,
+            int((_t_db - _t0) * 1000),
+            int((_t_nitris - _t_db) * 1000),
+        )
+
+    except NitrisCircuitOpenError as e:
+        await _safe_edit(
+            callback_chat_id, callback_message_id,
+            "⚠️ <b>NITRIS is temporarily unavailable.</b>\n\n"
+            "The system is protecting the portal from overload. "
+            "Please try again in ~60 seconds.",
+        )
+        return {"success": False, "error": str(e), "data": None}
+
+    except LoginUnavailableError as e:
+        logger.warning(
+            "attendance_details_fetch: NITRIS unavailable for user_id=%s: %r",
+            user_id, e,
+        )
+        await _safe_edit(
+            callback_chat_id, callback_message_id,
+            "⚠️ <b>NITRIS is temporarily unavailable.</b>\n\n"
+            "Could not reach the portal right now. "
+            "Please try again in a few minutes.",
+        )
+        return {"success": False, "error": f"NITRIS temporarily unavailable: {e}", "data": None}
+
+    except (LoginError, CredentialsQuarantinedError) as e:
+        await on_login_failure(user_id, str(e))
+        await _safe_edit(
+            callback_chat_id, callback_message_id,
+            f"❌ <b>Login failed.</b>\n\n"
+            f"Your NITRIS credentials may have changed. "
+            f"Please use /forgot to update them.\n\n"
+            f"<i>Error: {html.escape(str(e))}</i>",
+        )
+        return {"success": False, "error": f"Login failed: {e}", "data": None}
+
+    except (AttendanceWorkflowError, AttendanceParseError) as e:
+        await _safe_edit(
+            callback_chat_id, callback_message_id,
+            f"❌ <b>Could not fetch date-wise attendance for {html.escape(code)}.</b>\n\n"
+            f"The NITRIS portal may be experiencing issues, or this subject has "
+            f"no recorded classes yet. Please try again later.\n\n"
+            f"<i>Error: {html.escape(str(e)[:200])}</i>",
+        )
+        return {"success": False, "error": str(e), "data": None}
+
+    # ── Step 3 (LAYER 2): render the fresh matrix FIRST ─────────────────
+    if callback_chat_id and callback_message_id:
+        try:
+            from app.bot.handlers.attendance import _details_text, _kb_dates
+            await _safe_edit(
+                callback_chat_id, callback_message_id,
+                _details_text(data.to_dict(), code, "🟢 Updated just now."),
+                reply_markup=_kb_dates(code),
+            )
+        except Exception as e:
+            logger.warning("attendance_details_fetch: success self-render failed: %r", e)
+
+    # ── Step 4: persist snapshot — OFF the perceived path ───────────────
+    data_dict = data.to_dict()
+    module_name = f"att_details:{code}"
+    snapshot_hash = hashlib.sha256(
+        json.dumps(data_dict, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+    def _spawn_persist() -> None:
+        async def _persist() -> None:
+            try:
+                async with get_db_session() as session:
+                    async with session.begin():
+                        repo = SnapshotRepository(session)
+                        latest = await repo.get_latest_snapshot(user_id, module_name)
+                        if latest is not None and latest.snapshot_hash == snapshot_hash:
+                            logger.debug(
+                                "attendance_details_fetch: %s unchanged for user_id=%s — skipping",
+                                module_name, user_id,
+                            )
+                            return
+                        await repo.create_snapshot(
+                            user_id=user_id,
+                            module_name=module_name,
+                            snapshot_json=data_dict,
+                            snapshot_hash=snapshot_hash,
+                        )
+            except Exception as e:
+                logger.error("Failed to save attendance-details snapshot: %r", e)
+        spawn_tracked(_persist(), name=f"attdet-persist-{user_id}-{code}")
+
+    _spawn_persist()
+
+    return {
+        "success": True,
+        "data": data_dict,
+        "error": None,
+        "subject_code": code,
         "callback_chat_id": callback_chat_id,
         "callback_message_id": callback_message_id,
     }
