@@ -373,7 +373,15 @@ async def handle_attendance_details_fetch(job: NitrisJob) -> dict:
     if callback_chat_id and callback_message_id:
         try:
             from app.bot.handlers.attendance import _details_text, _kb_dates, _load_summary
-            summary = await _load_summary(user_id)
+            try:
+                summary = await _load_summary(user_id)
+            except Exception as summary_err:
+                logger.debug(
+                    "attendance_details_fetch: could not load summary for verdict banner: %r",
+                    summary_err,
+                )
+                summary = None
+
             target = next(
                 (s for s in (summary.subjects if summary else []) if s.code.upper() == code),
                 None,
