@@ -223,9 +223,32 @@ class NitrisClient:
                 except Exception as e:
                     raise LoginUnavailableError("Login request failed.") from e
 
-                if not result or "SUCCESS" not in result:
-                    # The ONLY hard-auth signal: portal explicitly rejected.
-                    raise LoginError(f"Invalid credentials. Server: {result}")
+                if not result:
+                    raise LoginUnavailableError("Server returned empty login response.")
+
+                if "SUCCESS" not in result:
+                    res_clean = result.strip()
+                    res_lower = res_clean.lower()
+
+                    # NITRIS portal unhandled exception / SQL timeout fallback:
+                    # "Invalid Username/Password!!" (note '!!' and absence of attempt counter).
+                    # This happens when the DB lookup times out or fails internally.
+                    # It is a portal fault and must NEVER quarantine the user.
+                    if "!!" in res_clean or "invalid username/password" in res_lower:
+                        raise LoginUnavailableError(f"NITRIS portal error: {result}")
+
+                    is_explicit_rejection = (
+                        "attempt" in res_lower
+                        or "locked" in res_lower
+                        or "invalid credentials" in res_lower
+                        or "invalid password" in res_lower
+                    )
+                    if is_explicit_rejection:
+                        raise LoginError(f"Invalid credentials. Server: {result}")
+
+                    raise LoginUnavailableError(
+                        f"Portal returned unexpected login response: {result}"
+                    )
 
                 # Step 3: Visit home page to finalize session
                 parts = result.split(":", 1)
@@ -263,6 +286,11 @@ class NitrisClient:
                     raise LoginUnavailableError(
                         f"NITRIS login unavailable after {max_attempts} attempts."
                     ) from e
+                # Clear session cookies so the next attempt starts with a fresh ASP.NET session
+                try:
+                    self.client.cookies.clear()
+                except Exception:
+                    pass
                 await asyncio.sleep(backoff)
                 backoff *= 2.0  # 1s, 2s, 4s backoff
 

@@ -133,6 +133,34 @@ async def test_h1_empty_transform_is_portal_fault_not_bad_credentials(monkeypatc
         await c.login("125AI0001", "pw")
 
 
+@pytest.mark.asyncio
+async def test_h1_invalid_username_password_exclamation_is_portal_fault_not_login_error(monkeypatch):
+    """NITRIS portal's generic unhandled exception / SQL timeout string
+    'Invalid Username/Password!!' (with '!!' and no attempt counter) must be
+    treated as a portal fault (LoginUnavailableError), not confirmed bad credentials."""
+    c = _make_client_with_mocks(monkeypatch)
+
+    async def _nosleep(_):
+        pass
+
+    monkeypatch.setattr("asyncio.sleep", _nosleep)
+
+    c.client.get.return_value = _resp({})
+    # Step 1: transform OK, Step 2: returns IIS/ASP.NET generic fallback error
+    c.client.post.side_effect = [
+        _resp({"d": "transformed"}),
+        _resp({"d": "Invalid Username/Password!!"}),
+        _resp({"d": "transformed"}),
+        _resp({"d": "Invalid Username/Password!!"}),
+        _resp({"d": "transformed"}),
+        _resp({"d": "Invalid Username/Password!!"}),
+    ]
+
+    with pytest.raises(LoginUnavailableError):
+        await c.login("125AI0001", "pw")
+
+
+
 # ── H1: gateway routing ──────────────────────────────────────────────────────
 
 

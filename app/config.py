@@ -59,7 +59,7 @@ class Config:
     # 1/NITRIS_GATEWAY_MIN_LOGIN_INTERVAL per second (same average-rate
     # portal protection). Raise interval/burst ONLY after measuring the
     # portal's real tolerance; the circuit breaker backstops overshoots.
-    NITRIS_LOGIN_BURST = int(os.getenv("NITRIS_LOGIN_BURST", "3"))
+    NITRIS_LOGIN_BURST = int(os.getenv("NITRIS_LOGIN_BURST", "1"))
     NITRIS_GATEWAY_CIRCUIT_ERROR_THRESHOLD = int(os.getenv("NITRIS_GATEWAY_CIRCUIT_ERROR_THRESHOLD", "10"))
     NITRIS_GATEWAY_CIRCUIT_RECOVERY_SECONDS = float(os.getenv("NITRIS_GATEWAY_CIRCUIT_RECOVERY_SECONDS", "60"))
 
