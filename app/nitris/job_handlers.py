@@ -74,6 +74,7 @@ def init_job_handlers(bot) -> None:
     nitris_job_queue.register_handler("timetable_sync", handle_timetable_sync)
     nitris_job_queue.register_handler("qp_prewarm_subject", handle_qp_prewarm_subject)
     nitris_job_queue.register_handler("session_warm", handle_session_warm)
+    nitris_job_queue.register_handler("holidays_fetch", handle_holidays_fetch)
 
     logger.info(
         "Registered NITRIS job handlers: %s",
@@ -1172,6 +1173,94 @@ async def handle_timetable_sync(job: NitrisJob) -> dict:
                 )
         except Exception as e:
             logger.warning("timetable_sync: could not edit callback message: %r", e)
+
+    return result
+
+
+# ── Handler: holidays_fetch ─────────────────────────────────────────────
+
+async def handle_holidays_fetch(job: NitrisJob) -> dict:
+    """Fetch the holiday calendar (current month or prev/next navigation).
+
+    Payload:
+        - callback_chat_id: int (Telegram chat ID to edit)
+        - callback_message_id: int (Telegram message ID to edit)
+        - interaction_token: int | None (Surface ownership token)
+        - direction: None | "prev" | "next"  (None = current month)
+        - current_page: dict | None  (serialized HolidaysPage for navigation)
+
+    Returns:
+        dict with success, error, kind, month, year, month_label, holidays,
+        prev_available, next_available, page (serialized for follow-up nav).
+
+    The job handler renders the result into the user's Telegram bubble via
+    app.bot.handlers.holidays.render_holidays_message().
+    """
+    from app.services.holidays_service import (
+        fetch_user_holidays,
+        deserialize_holidays_page,
+    )
+    from app.bot.handlers.holidays import (
+        render_holidays_message,
+        get_holidays_keyboard,
+    )
+
+    user_id = job.user_id
+    callback_chat_id = job.payload.get("callback_chat_id")
+    callback_message_id = job.payload.get("callback_message_id")
+    interaction_token = job.payload.get("interaction_token")
+    direction = job.payload.get("direction")  # None | "prev" | "next"
+    current_page_dict = job.payload.get("current_page")
+
+    # Reconstruct the HolidaysPage if navigation was requested.
+    current_page = None
+    if current_page_dict is not None:
+        try:
+            current_page = deserialize_holidays_page(current_page_dict)
+        except Exception as e:
+            logger.warning(
+                "holidays_fetch: could not deserialize current_page: %r", e,
+            )
+            current_page = None
+
+    force_refresh = job.payload.get("force_refresh", False)
+
+    result = await fetch_user_holidays(
+        user_id=user_id,
+        direction=direction,
+        current_page=current_page,
+        force_refresh=force_refresh,
+    )
+
+    # Edit the user's bubble with the rendered result.
+    if _bot and callback_chat_id and callback_message_id:
+        try:
+            if result.get("success"):
+                text, kb = render_holidays_message(result)
+                await _edit_callback_message(
+                    callback_chat_id,
+                    callback_message_id,
+                    text,
+                    reply_markup=kb,
+                    token=interaction_token,
+                )
+            else:
+                err = result.get("error", "Unknown error")
+                # Show the error inline; keep a Home button so the user can escape.
+                from aiogram.utils.keyboard import InlineKeyboardBuilder
+                from aiogram import types
+                kb = InlineKeyboardBuilder()
+                kb.row(types.InlineKeyboardButton(text="🏠 Home", callback_data="inbox_back_dashboard"))
+                kb.row(types.InlineKeyboardButton(text="🔄 Retry", callback_data="db_holidays"))
+                await _edit_callback_message(
+                    callback_chat_id,
+                    callback_message_id,
+                    f"❌ <b>Couldn't load holidays.</b>\n\n{esc(str(err))}",
+                    reply_markup=kb.as_markup(),
+                    token=interaction_token,
+                )
+        except Exception as e:
+            logger.warning("holidays_fetch: could not edit callback message: %r", e)
 
     return result
 

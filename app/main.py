@@ -68,6 +68,7 @@ async def main():
             BotCommand(command="now", description="⏰ Current class"),
             BotCommand(command="next", description="⏭ Next class"),
             BotCommand(command="papers", description="📝 Question papers"),
+            BotCommand(command="holidays", description="🎉 Holiday calendar"),
             BotCommand(command="forgot", description="🔑 Update NITRIS password"),
         ])
     except Exception as e:

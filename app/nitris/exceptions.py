@@ -76,3 +76,7 @@ class PaperNotAvailableError(NitrisError):
     """The requested question paper exists in the catalog but has not been uploaded to the portal yet."""
 
 
+class HolidaysParseError(NitrisError):
+    """Could not parse the Home.aspx holiday calendar HTML or markup changed."""
+
+

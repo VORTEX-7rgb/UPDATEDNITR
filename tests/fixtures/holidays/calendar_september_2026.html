@@ -1,0 +1,117 @@
+<!--
+  Redacted NITRIS Home.aspx calendar widget fixture.
+
+  Captured 2026-09-05 from a live authenticated session. Only the
+  ContentPlaceHolder3_cal1 calendar table is retained — the rest of
+  Home.aspx (student PII, timetable, registered courses) is stripped.
+
+  This fixture is used by tests/test_holidays_parser.py to verify:
+    1. parse_holidays_html() correctly identifies holiday cells by their
+       `title` attribute (NOT by background color — weekend cells use red
+       TEXT but no title, so they must be excluded).
+    2. The month header ("September 2026") is parsed correctly.
+    3. The prev/next postback arguments ("V9709" / "V9770") are harvested
+       from the rendered <a href="javascript:__doPostBack(...)"> anchors.
+    4. Trailing-day holidays (e.g. Oct 2 "Mahatma Gandhis Birthday" on the
+       September grid) are flagged with is_trailing=True.
+-->
+<html>
+<head><title>NITRIS - Student Home</title></head>
+<body>
+<form name="form1" method="post" action="Home.aspx" id="form1">
+<input type="hidden" name="__VIEWSTATE" id="__VIEWSTATE" value="/wEPDwUKLTE2MjY5OTY=" />
+<input type="hidden" name="__EVENTVALIDATION" id="__EVENTVALIDATION" value="/wEWAwK40vL9AwK56Z6TDQLP5uHZC" />
+<input type="hidden" name="__VIEWSTATEGENERATOR" id="__VIEWSTATEGENERATOR" value="A1B2C3D4" />
+<input type="hidden" name="__EVENTTARGET" id="__EVENTTARGET" value="" />
+<input type="hidden" name="__EVENTARGUMENT" id="__EVENTARGUMENT" value="" />
+
+<div class="row">
+  <div class="col-md-12">
+    <table id="ContentPlaceHolder3_cal1" cellspacing="0" cellpadding="2" title="Calendar" style="background-color:White;border-color:#CCCCCC;border-width:1px;border-style:solid;width:100%;border-collapse:collapse;">
+      <tbody>
+        <tr>
+          <td colspan="7" style="background-color:#2D2B2B;height:36px;">
+            <table cellspacing="0" style="color:White;font-size:18px;width:100%;border-collapse:collapse;">
+              <tbody>
+                <tr>
+                  <td style="color:White;font-size:18px;font-style:italic;width:15%;">
+                    <a href="javascript:__doPostBack('ctl00$ContentPlaceHolder3$cal1','V9709')" style="color:White" title="Go to the previous month">&lt;</a>
+                  </td>
+                  <td align="center" style="width:70%;">September 2026</td>
+                  <td align="right" style="color:White;font-size:18px;font-style:italic;width:15%;">
+                    <a href="javascript:__doPostBack('ctl00$ContentPlaceHolder3$cal1','V9770')" style="color:White" title="Go to the next month">&gt;</a>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </td>
+        </tr>
+        <tr>
+          <th align="center" abbr="Monday" scope="col" style="color:#DDDDDD;background-color:#425FE1;">Mon</th>
+          <th align="center" abbr="Tuesday" scope="col" style="color:#DDDDDD;background-color:#425FE1;">Tue</th>
+          <th align="center" abbr="Wednesday" scope="col" style="color:#DDDDDD;background-color:#425FE1;">Wed</th>
+          <th align="center" abbr="Thursday" scope="col" style="color:#DDDDDD;background-color:#425FE1;">Thu</th>
+          <th align="center" abbr="Friday" scope="col" style="color:#DDDDDD;background-color:#425FE1;">Fri</th>
+          <th align="center" abbr="Saturday" scope="col" style="color:#DDDDDD;background-color:#425FE1;">Sat</th>
+          <th align="center" abbr="Sunday" scope="col" style="color:#DDDDDD;background-color:#425FE1;">Sun</th>
+        </tr>
+        <tr>
+          <!-- Aug 31 — trailing day from previous month, YellowGreen text -->
+          <td align="center" style="color:YellowGreen;border-color:#CCCCCC;border-width:1px;border-style:solid;font-style:italic;width:14%;">31</td>
+          <td align="center" style="border-color:#CCCCCC;border-width:1px;border-style:solid;width:14%;">1</td>
+          <td align="center" style="border-color:#CCCCCC;border-width:1px;border-style:solid;width:14%;">2</td>
+          <td align="center" style="border-color:#CCCCCC;border-width:1px;border-style:solid;width:14%;">3</td>
+          <!-- HOLIDAY: Janmashtami -->
+          <td title="Janmashtami" align="center" style="color:#FFFFFF;background-color:#D9534F;border-color:#D43F3A;border-width:1px;border-style:solid;width:14%;">4</td>
+          <!-- Weekend (red text, no title) — must NOT be flagged as holiday -->
+          <td align="center" style="color:#FF0000;background-color:#2B2B2B;border-color:#CCCCCC;border-width:1px;border-style:solid;font-weight:bold;width:14%;">5</td>
+          <td align="center" style="color:#FF0000;border-color:#CCCCCC;border-width:1px;border-style:solid;font-weight:bold;width:14%;">6</td>
+        </tr>
+        <tr>
+          <td align="center" style="border-color:#CCCCCC;border-width:1px;border-style:solid;width:14%;">7</td>
+          <td align="center" style="border-color:#CCCCCC;border-width:1px;border-style:solid;width:14%;">8</td>
+          <td align="center" style="border-color:#CCCCCC;border-width:1px;border-style:solid;width:14%;">9</td>
+          <td align="center" style="border-color:#CCCCCC;border-width:1px;border-style:solid;width:14%;">10</td>
+          <td align="center" style="border-color:#CCCCCC;border-width:1px;border-style:solid;width:14%;">11</td>
+          <td align="center" style="color:#FF0000;border-color:#CCCCCC;border-width:1px;border-style:solid;font-weight:bold;width:14%;">12</td>
+          <td align="center" style="color:#FF0000;border-color:#CCCCCC;border-width:1px;border-style:solid;font-weight:bold;width:14%;">13</td>
+        </tr>
+        <tr>
+          <!-- HOLIDAY: Ganesh Chaturthi -->
+          <td title="Ganesh Chaturthi" align="center" style="color:#FFFFFF;background-color:#D9534F;border-color:#D43F3A;border-width:1px;border-style:solid;width:14%;">14</td>
+          <!-- HOLIDAY: Nuakhai -->
+          <td title="Nuakhai" align="center" style="color:#FFFFFF;background-color:#D9534F;border-color:#D43F3A;border-width:1px;border-style:solid;width:14%;">15</td>
+          <td align="center" style="border-color:#CCCCCC;border-width:1px;border-style:solid;width:14%;">16</td>
+          <!-- HOLIDAY: Vishwakarma Puja -->
+          <td title="Vishwakarma Puja" align="center" style="color:#FFFFFF;background-color:#D9534F;border-color:#D43F3A;border-width:1px;border-style:solid;width:14%;">17</td>
+          <td align="center" style="border-color:#CCCCCC;border-width:1px;border-style:solid;width:14%;">18</td>
+          <td align="center" style="color:#FF0000;border-color:#CCCCCC;border-width:1px;border-style:solid;font-weight:bold;width:14%;">19</td>
+          <td align="center" style="color:#FF0000;border-color:#CCCCCC;border-width:1px;border-style:solid;font-weight:bold;width:14%;">20</td>
+        </tr>
+        <tr>
+          <td align="center" style="border-color:#CCCCCC;border-width:1px;border-style:solid;width:14%;">21</td>
+          <td align="center" style="border-color:#CCCCCC;border-width:1px;border-style:solid;width:14%;">22</td>
+          <td align="center" style="border-color:#CCCCCC;border-width:1px;border-style:solid;width:14%;">23</td>
+          <td align="center" style="border-color:#CCCCCC;border-width:1px;border-style:solid;width:14%;">24</td>
+          <td align="center" style="border-color:#CCCCCC;border-width:1px;border-style:solid;width:14%;">25</td>
+          <td align="center" style="color:#FF0000;border-color:#CCCCCC;border-width:1px;border-style:solid;font-weight:bold;width:14%;">26</td>
+          <td align="center" style="color:#FF0000;border-color:#CCCCCC;border-width:1px;border-style:solid;font-weight:bold;width:14%;">27</td>
+        </tr>
+        <tr>
+          <td align="center" style="border-color:#CCCCCC;border-width:1px;border-style:solid;width:14%;">28</td>
+          <td align="center" style="border-color:#CCCCCC;border-width:1px;border-style:solid;width:14%;">29</td>
+          <td align="center" style="border-color:#CCCCCC;border-width:1px;border-style:solid;width:14%;">30</td>
+          <!-- TRAILING HOLIDAY: Oct 2 — Gandhi Jayanti, on the September grid -->
+          <td title="Mahatma Gandhis Birthday" align="center" style="color:#FFFFFF;background-color:#D9534F;border-color:#D43F3A;border-width:1px;border-style:solid;width:14%;">2</td>
+          <td align="center" style="color:YellowGreen;border-color:#CCCCCC;border-width:1px;border-style:solid;font-style:italic;width:14%;">3</td>
+          <td align="center" style="color:YellowGreen;border-color:#CCCCCC;border-width:1px;border-style:solid;font-style:italic;width:14%;">4</td>
+          <td align="center" style="color:YellowGreen;border-color:#CCCCCC;border-width:1px;border-style:solid;font-style:italic;width:14%;">5</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+</form>
+</body>
+</html>

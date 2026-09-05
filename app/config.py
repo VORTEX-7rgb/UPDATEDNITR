@@ -229,6 +229,11 @@ class Config:
     # without blocking genuine semester-boundary refreshes for long.
     COOLDOWN_TIMETABLE_SYNC = int(os.getenv("COOLDOWN_TIMETABLE_SYNC", str(4 * 3600)))
 
+    # Holiday calendar fetch cooldown. The calendar is real-time per-tap (no
+    # DB cache) and institute holidays change ~never mid-semester, so 30s is
+    # plenty for < > navigation without burdening the portal.
+    COOLDOWN_HOLIDAYS = int(os.getenv("COOLDOWN_HOLIDAYS", "30"))
+
     # ── DB engine housekeeping ───────────────────────────────────────────────
     DB_POOL_DISPOSE_DEBOUNCE_SECONDS = float(os.getenv("DB_POOL_DISPOSE_DEBOUNCE_SECONDS", "60"))
 

@@ -38,6 +38,8 @@ from app.nitris.constants import (
     MESSAGES_PAGE_PATH,
     MESSAGE_DETAIL_PATH,
     HTML_PARSER,
+    HOLIDAYS_CALENDAR_EVENT_TARGET,
+    HOLIDAYS_PAGE_PATH,
 )
 from app.nitris.exceptions import (
     LoginError,
@@ -59,6 +61,7 @@ from app.nitris.aspnet import (
     has_attendance_table,
     _save_debug_snapshot,
 )
+from app.nitris.holidays_parser import HolidaysPage, parse_holidays_html
 
 logger = logging.getLogger(__name__)
 
@@ -1611,6 +1614,145 @@ class NitrisClient:
             )
         logger.info("Fetched Home.aspx (%d bytes)", len(html))
         return html
+
+    # ── Holiday Calendar (Home.aspx widget) ──────────────────────────────────
+    #
+    # The ASP.NET Calendar control `ctl00$ContentPlaceHolder3$cal1` lives on
+    # Home.aspx. The current month is rendered on the initial GET; prev/next
+    # month navigation is a standard ASP.NET postback with
+    #   __EVENTTARGET  = ctl00$ContentPlaceHolder3$cal1
+    #   __EVENTARGUMENT = Vxxxx   (harvested from the rendered <a> href —
+    #                              ASP.NET's internal date-offset code; we
+    #                              NEVER compute it ourselves).
+    #
+    # Workflow:
+    #   1. fetch_holidays()           -> GET Home.aspx, parse current month
+    #   2. navigate_holidays_month()  -> POST Home.aspx with prev/next arg,
+    #                                     parse the new month
+    #
+    # Both methods return a HolidaysPage carrying the parsed month, holidays,
+    # and the next prev/next arguments — so the caller can chain navigation
+    # without re-fetching.
+
+    async def fetch_holidays(self) -> HolidaysPage:
+        """GET Home.aspx and parse the current month's holiday calendar.
+
+        Raises SessionExpiredError if NITRIS bounces us back to Login.aspx.
+        Raises HolidaysParseError if the calendar markup changed.
+        """
+        html = await self.fetch_home_html()
+        return parse_holidays_html(html)
+
+    async def navigate_holidays_month(
+        self,
+        current_page: HolidaysPage,
+        direction: str,
+    ) -> HolidaysPage:
+        """Postback to navigate the calendar to the previous or next month.
+
+        Args:
+            current_page: The HolidaysPage returned by a prior fetch_holidays()
+                or navigate_holidays_month() call. Its `raw_html` is used to
+                harvest the full ASP.NET form state (VIEWSTATE etc.) and its
+                `prev_event_argument` / `next_event_argument` supply the
+                postback's __EVENTARGUMENT.
+            direction: "prev" or "next" (case-insensitive).
+
+        Returns:
+            A fresh HolidaysPage parsed from the postback response.
+
+        Raises:
+            ValueError: If direction is invalid or the requested navigation
+                argument is unavailable (e.g. calendar hit its min/max month).
+            SessionExpiredError: If NITRIS bounces us to Login.aspx.
+            HolidaysParseError: If the new month's markup is unparseable.
+        """
+        direction_lower = direction.strip().lower()
+        if direction_lower == "prev":
+            event_arg = current_page.prev_event_argument
+            step_label = "previous"
+        elif direction_lower == "next":
+            event_arg = current_page.next_event_argument
+            step_label = "next"
+        else:
+            raise ValueError(
+                f"Invalid holiday navigation direction: {direction!r} "
+                f"(expected 'prev' or 'next')"
+            )
+
+        if not event_arg:
+            # NITRIS omits the prev/next anchor when the calendar hits its
+            # bounds (typically the academic-year boundary). Soft error so the
+            # bot can tell the student "no further months available".
+            raise ValueError(
+                f"Cannot navigate to {step_label} month — NITRIS calendar "
+                f"offers no {step_label} link on {current_page.month_label}."
+            )
+
+        # Build the postback payload manually. We CANNOT use the shared
+        # submit_postback() helper because it hard-codes __EVENTARGUMENT=""
+        # — but the ASP.NET Calendar requires __EVENTARGUMENT="Vxxxx" (the
+        # harvested date-offset code) to know which month to switch to.
+        #
+        # PERF: extract_form_fields() parses the full Home.aspx HTML (700KB+)
+        # synchronously — offload to a worker thread so we don't block the
+        # event loop inside the gateway slot (matches the pattern enforced
+        # by test_no_sync_bs4_calls_remain_in_async_hot_paths).
+        import asyncio
+        form_state = await asyncio.to_thread(extract_form_fields, current_page.raw_html)
+        payload = {
+            **form_state,
+            "__EVENTTARGET": HOLIDAYS_CALENDAR_EVENT_TARGET,
+            "__EVENTARGUMENT": event_arg,
+        }
+
+        url = f"{self.base_url}{HOLIDAYS_PAGE_PATH}"
+        logger.info(
+            "[holidays_%s] POST %s (target: cal1, arg: %s, payload keys: %d)",
+            direction_lower,
+            url,
+            event_arg,
+            len(payload),
+        )
+
+        resp = await self.client.post(
+            url,
+            data=payload,
+            headers={"Referer": url},
+            follow_redirects=False,
+        )
+        logger.info(
+            "[holidays_%s] Response: status %d, %d bytes",
+            direction_lower,
+            resp.status_code,
+            len(resp.content),
+        )
+
+        if resp.status_code in (301, 302, 303, 307, 308):
+            location = resp.headers.get("Location", "")
+            if "Login.aspx" in location:
+                raise SessionExpiredError(
+                    "Session expired — redirected to login during holiday nav."
+                )
+            raise AttendanceWorkflowError(
+                f"[holidays_{direction_lower}] Unexpected redirect to {location}"
+            )
+        if resp.status_code != 200:
+            raise AttendanceWorkflowError(
+                f"[holidays_{direction_lower}] POST returned {resp.status_code}"
+            )
+
+        new_html = resp.text
+        if is_login_page(new_html):
+            raise SessionExpiredError(
+                "Session expired — login form detected in holiday nav response."
+            )
+        if is_error_page(new_html, resp):
+            raise AttendanceWorkflowError(
+                f"[holidays_{direction_lower}] NITRIS returned 503 error page"
+            )
+
+        return parse_holidays_html(new_html)
 
     async def close(self) -> None:
         """Close client instance by clearing session state.

@@ -111,3 +111,10 @@ TIMETABLE_ROOM_RE = r"#\s*([^}]*?)\s*\}"
 # Header column time format: "08:00 hr 08:55 hr" (start + " hr " + end + " hr").
 TIMETABLE_TIME_RE = re.compile(r"(\d{1,2}:\d{2})")
 
+# ── Holiday Calendar (Home.aspx widget) ──────────────────────────────────
+HOLIDAYS_CALENDAR_ID = "ContentPlaceHolder3_cal1"
+HOLIDAYS_CALENDAR_EVENT_TARGET = "ctl00$ContentPlaceHolder3$cal1"
+HOLIDAYS_PREV_LINK_TITLE = "Go to the previous month"
+HOLIDAYS_NEXT_LINK_TITLE = "Go to the next month"
+HOLIDAYS_PAGE_PATH = "/nitris/Student/Home/Home.aspx"
+

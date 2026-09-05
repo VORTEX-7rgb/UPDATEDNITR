@@ -134,7 +134,10 @@ def get_dashboard_keyboard(unread_count: int = 0) -> types.InlineKeyboardMarkup:
     inbox_text = f"📩 Inbox ({unread_count})" if unread_count > 0 else "📩 Inbox"
     builder.row(
         types.InlineKeyboardButton(text=inbox_text, callback_data="db_inbox"),
-        types.InlineKeyboardButton(text="📚 Previous Papers", callback_data="db_papers")
+        types.InlineKeyboardButton(text="📚 Previous Papers", callback_data="db_papers"),
+    )
+    builder.row(
+        types.InlineKeyboardButton(text="🎉 Holidays", callback_data="db_holidays"),
     )
     builder.row(
         types.InlineKeyboardButton(text="🔄 Update Credentials", callback_data="db_update"),

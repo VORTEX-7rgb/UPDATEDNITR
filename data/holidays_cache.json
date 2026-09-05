@@ -1,0 +1,89 @@
+{
+  "2026-9": {
+    "month": 9,
+    "year": 2026,
+    "month_label": "September 2026",
+    "holidays": [
+      {
+        "day": 4,
+        "name": "Janmashtami",
+        "month": 9,
+        "year": 2026,
+        "is_trailing": false
+      },
+      {
+        "day": 14,
+        "name": "Ganesh Chaturthi",
+        "month": 9,
+        "year": 2026,
+        "is_trailing": false
+      },
+      {
+        "day": 15,
+        "name": "Nuakhai",
+        "month": 9,
+        "year": 2026,
+        "is_trailing": false
+      },
+      {
+        "day": 17,
+        "name": "Vishwakarma Puja",
+        "month": 9,
+        "year": 2026,
+        "is_trailing": false
+      },
+      {
+        "day": 2,
+        "name": "Mahatma Gandhis Birthday",
+        "month": 9,
+        "year": 2026,
+        "is_trailing": true
+      }
+    ],
+    "prev_available": true,
+    "next_available": true,
+    "prev_event_argument": "V9709",
+    "next_event_argument": "V9770",
+    "raw_html": "<!--\n  Redacted NITRIS Home.aspx calendar widget fixture.\n\n  Captured 2026-09-05 from a live authenticated session. Only the\n  ContentPlaceHolder3_cal1 calendar table is retained \u2014 the rest of\n  Home.aspx (student PII, timetable, registered courses) is stripped.\n\n  This fixture is used by tests/test_holidays_parser.py to verify:\n    1. parse_holidays_html() correctly identifies holiday cells by their\n       `title` attribute (NOT by background color \u2014 weekend cells use red\n       TEXT but no title, so they must be excluded).\n    2. The month header (\"September 2026\") is parsed correctly.\n    3. The prev/next postback arguments (\"V9709\" / \"V9770\") are harvested\n       from the rendered <a href=\"javascript:__doPostBack(...)\"> anchors.\n    4. Trailing-day holidays (e.g. Oct 2 \"Mahatma Gandhis Birthday\" on the\n       September grid) are flagged with is_trailing=True.\n-->\n<html>\n<head><title>NITRIS - Student Home</title></head>\n<body>\n<form name=\"form1\" method=\"post\" action=\"Home.aspx\" id=\"form1\">\n<input type=\"hidden\" name=\"__VIEWSTATE\" id=\"__VIEWSTATE\" value=\"/wEPDwUKLTE2MjY5OTY=\" />\n<input type=\"hidden\" name=\"__EVENTVALIDATION\" id=\"__EVENTVALIDATION\" value=\"/wEWAwK40vL9AwK56Z6TDQLP5uHZC\" />\n<input type=\"hidden\" name=\"__VIEWSTATEGENERATOR\" id=\"__VIEWSTATEGENERATOR\" value=\"A1B2C3D4\" />\n<input type=\"hidden\" name=\"__EVENTTARGET\" id=\"__EVENTTARGET\" value=\"\" />\n<input type=\"hidden\" name=\"__EVENTARGUMENT\" id=\"__EVENTARGUMENT\" value=\"\" />\n\n<div class=\"row\">\n  <div class=\"col-md-12\">\n    <table id=\"ContentPlaceHolder3_cal1\" cellspacing=\"0\" cellpadding=\"2\" title=\"Calendar\" style=\"background-color:White;border-color:#CCCCCC;border-width:1px;border-style:solid;width:100%;border-collapse:collapse;\">\n      <tbody>\n        <tr>\n          <td colspan=\"7\" style=\"background-color:#2D2B2B;height:36px;\">\n            <table cellspacing=\"0\" style=\"color:White;font-size:18px;width:100%;border-collapse:collapse;\">\n              <tbody>\n                <tr>\n                  <td style=\"color:White;font-size:18px;font-style:italic;width:15%;\">\n                    <a href=\"javascript:__doPostBack('ctl00$ContentPlaceHolder3$cal1','V9709')\" style=\"color:White\" title=\"Go to the previous month\">&lt;</a>\n                  </td>\n                  <td align=\"center\" style=\"width:70%;\">September 2026</td>\n                  <td align=\"right\" style=\"color:White;font-size:18px;font-style:italic;width:15%;\">\n                    <a href=\"javascript:__doPostBack('ctl00$ContentPlaceHolder3$cal1','V9770')\" style=\"color:White\" title=\"Go to the next month\">&gt;</a>\n                  </td>\n                </tr>\n              </tbody>\n            </table>\n          </td>\n        </tr>\n        <tr>\n          <th align=\"center\" abbr=\"Monday\" scope=\"col\" style=\"color:#DDDDDD;background-color:#425FE1;\">Mon</th>\n          <th align=\"center\" abbr=\"Tuesday\" scope=\"col\" style=\"color:#DDDDDD;background-color:#425FE1;\">Tue</th>\n          <th align=\"center\" abbr=\"Wednesday\" scope=\"col\" style=\"color:#DDDDDD;background-color:#425FE1;\">Wed</th>\n          <th align=\"center\" abbr=\"Thursday\" scope=\"col\" style=\"color:#DDDDDD;background-color:#425FE1;\">Thu</th>\n          <th align=\"center\" abbr=\"Friday\" scope=\"col\" style=\"color:#DDDDDD;background-color:#425FE1;\">Fri</th>\n          <th align=\"center\" abbr=\"Saturday\" scope=\"col\" style=\"color:#DDDDDD;background-color:#425FE1;\">Sat</th>\n          <th align=\"center\" abbr=\"Sunday\" scope=\"col\" style=\"color:#DDDDDD;background-color:#425FE1;\">Sun</th>\n        </tr>\n        <tr>\n          <!-- Aug 31 \u2014 trailing day from previous month, YellowGreen text -->\n          <td align=\"center\" style=\"color:YellowGreen;border-color:#CCCCCC;border-width:1px;border-style:solid;font-style:italic;width:14%;\">31</td>\n          <td align=\"center\" style=\"border-color:#CCCCCC;border-width:1px;border-style:solid;width:14%;\">1</td>\n          <td align=\"center\" style=\"border-color:#CCCCCC;border-width:1px;border-style:solid;width:14%;\">2</td>\n          <td align=\"center\" style=\"border-color:#CCCCCC;border-width:1px;border-style:solid;width:14%;\">3</td>\n          <!-- HOLIDAY: Janmashtami -->\n          <td title=\"Janmashtami\" align=\"center\" style=\"color:#FFFFFF;background-color:#D9534F;border-color:#D43F3A;border-width:1px;border-style:solid;width:14%;\">4</td>\n          <!-- Weekend (red text, no title) \u2014 must NOT be flagged as holiday -->\n          <td align=\"center\" style=\"color:#FF0000;background-color:#2B2B2B;border-color:#CCCCCC;border-width:1px;border-style:solid;font-weight:bold;width:14%;\">5</td>\n          <td align=\"center\" style=\"color:#FF0000;border-color:#CCCCCC;border-width:1px;border-style:solid;font-weight:bold;width:14%;\">6</td>\n        </tr>\n        <tr>\n          <td align=\"center\" style=\"border-color:#CCCCCC;border-width:1px;border-style:solid;width:14%;\">7</td>\n          <td align=\"center\" style=\"border-color:#CCCCCC;border-width:1px;border-style:solid;width:14%;\">8</td>\n          <td align=\"center\" style=\"border-color:#CCCCCC;border-width:1px;border-style:solid;width:14%;\">9</td>\n          <td align=\"center\" style=\"border-color:#CCCCCC;border-width:1px;border-style:solid;width:14%;\">10</td>\n          <td align=\"center\" style=\"border-color:#CCCCCC;border-width:1px;border-style:solid;width:14%;\">11</td>\n          <td align=\"center\" style=\"color:#FF0000;border-color:#CCCCCC;border-width:1px;border-style:solid;font-weight:bold;width:14%;\">12</td>\n          <td align=\"center\" style=\"color:#FF0000;border-color:#CCCCCC;border-width:1px;border-style:solid;font-weight:bold;width:14%;\">13</td>\n        </tr>\n        <tr>\n          <!-- HOLIDAY: Ganesh Chaturthi -->\n          <td title=\"Ganesh Chaturthi\" align=\"center\" style=\"color:#FFFFFF;background-color:#D9534F;border-color:#D43F3A;border-width:1px;border-style:solid;width:14%;\">14</td>\n          <!-- HOLIDAY: Nuakhai -->\n          <td title=\"Nuakhai\" align=\"center\" style=\"color:#FFFFFF;background-color:#D9534F;border-color:#D43F3A;border-width:1px;border-style:solid;width:14%;\">15</td>\n          <td align=\"center\" style=\"border-color:#CCCCCC;border-width:1px;border-style:solid;width:14%;\">16</td>\n          <!-- HOLIDAY: Vishwakarma Puja -->\n          <td title=\"Vishwakarma Puja\" align=\"center\" style=\"color:#FFFFFF;background-color:#D9534F;border-color:#D43F3A;border-width:1px;border-style:solid;width:14%;\">17</td>\n          <td align=\"center\" style=\"border-color:#CCCCCC;border-width:1px;border-style:solid;width:14%;\">18</td>\n          <td align=\"center\" style=\"color:#FF0000;border-color:#CCCCCC;border-width:1px;border-style:solid;font-weight:bold;width:14%;\">19</td>\n          <td align=\"center\" style=\"color:#FF0000;border-color:#CCCCCC;border-width:1px;border-style:solid;font-weight:bold;width:14%;\">20</td>\n        </tr>\n        <tr>\n          <td align=\"center\" style=\"border-color:#CCCCCC;border-width:1px;border-style:solid;width:14%;\">21</td>\n          <td align=\"center\" style=\"border-color:#CCCCCC;border-width:1px;border-style:solid;width:14%;\">22</td>\n          <td align=\"center\" style=\"border-color:#CCCCCC;border-width:1px;border-style:solid;width:14%;\">23</td>\n          <td align=\"center\" style=\"border-color:#CCCCCC;border-width:1px;border-style:solid;width:14%;\">24</td>\n          <td align=\"center\" style=\"border-color:#CCCCCC;border-width:1px;border-style:solid;width:14%;\">25</td>\n          <td align=\"center\" style=\"color:#FF0000;border-color:#CCCCCC;border-width:1px;border-style:solid;font-weight:bold;width:14%;\">26</td>\n          <td align=\"center\" style=\"color:#FF0000;border-color:#CCCCCC;border-width:1px;border-style:solid;font-weight:bold;width:14%;\">27</td>\n        </tr>\n        <tr>\n          <td align=\"center\" style=\"border-color:#CCCCCC;border-width:1px;border-style:solid;width:14%;\">28</td>\n          <td align=\"center\" style=\"border-color:#CCCCCC;border-width:1px;border-style:solid;width:14%;\">29</td>\n          <td align=\"center\" style=\"border-color:#CCCCCC;border-width:1px;border-style:solid;width:14%;\">30</td>\n          <!-- TRAILING HOLIDAY: Oct 2 \u2014 Gandhi Jayanti, on the September grid -->\n          <td title=\"Mahatma Gandhis Birthday\" align=\"center\" style=\"color:#FFFFFF;background-color:#D9534F;border-color:#D43F3A;border-width:1px;border-style:solid;width:14%;\">2</td>\n          <td align=\"center\" style=\"color:YellowGreen;border-color:#CCCCCC;border-width:1px;border-style:solid;font-style:italic;width:14%;\">3</td>\n          <td align=\"center\" style=\"color:YellowGreen;border-color:#CCCCCC;border-width:1px;border-style:solid;font-style:italic;width:14%;\">4</td>\n          <td align=\"center\" style=\"color:YellowGreen;border-color:#CCCCCC;border-width:1px;border-style:solid;font-style:italic;width:14%;\">5</td>\n        </tr>\n      </tbody>\n    </table>\n  </div>\n</div>\n\n</form>\n</body>\n</html>\n"
+  },
+  "2026-8": {
+    "month": 8,
+    "year": 2026,
+    "month_label": "August 2026",
+    "holidays": [
+      {
+        "day": 8,
+        "name": "Working day in view NBA Visit.",
+        "month": 8,
+        "year": 2026,
+        "is_trailing": false
+      },
+      {
+        "day": 15,
+        "name": "Independence Day",
+        "month": 8,
+        "year": 2026,
+        "is_trailing": false
+      },
+      {
+        "day": 26,
+        "name": "Prophet Mohammads Birthday (Id-E-Millad)",
+        "month": 8,
+        "year": 2026,
+        "is_trailing": false
+      },
+      {
+        "day": 4,
+        "name": "Janmashtami",
+        "month": 8,
+        "year": 2026,
+        "is_trailing": true
+      }
+    ],
+    "prev_available": true,
+    "next_available": true,
+    "prev_event_argument": "V9678",
+    "next_event_argument": "V9740",
+    "raw_html": ""
+  }
+}

@@ -57,15 +57,28 @@ class WarmSessionMiddleware(BaseMiddleware):
         data: dict[str, Any],
     ) -> Any:
         try:
-            tg_user = data.get("event_from_user")
-            user_id = _known_registered.get(getattr(tg_user, "id", None))
-            if user_id is not None:
-                from app.services.session_warmer import request_session_warm
-                from app.utils import spawn_tracked
-                spawn_tracked(
-                    request_session_warm(user_id),
-                    name=f"sw-mw-{user_id}",
-                )
+            # Skip session warming for purely static/cached features like holiday calendar
+            cb = getattr(event, "callback_query", None) or (event if getattr(event, "data", None) else None)
+            cb_data = getattr(cb, "data", "") or ""
+            msg = getattr(event, "message", None) or (event if getattr(event, "text", None) else None)
+            msg_text = getattr(msg, "text", "") or ""
+
+            is_holiday_interaction = (
+                cb_data in ("db_holidays", "holidays_refresh")
+                or cb_data.startswith("holidays_")
+                or msg_text.strip().lower().startswith("/holidays")
+            )
+
+            if not is_holiday_interaction:
+                tg_user = data.get("event_from_user")
+                user_id = _known_registered.get(getattr(tg_user, "id", None))
+                if user_id is not None:
+                    from app.services.session_warmer import request_session_warm
+                    from app.utils import spawn_tracked
+                    spawn_tracked(
+                        request_session_warm(user_id),
+                        name=f"sw-mw-{user_id}",
+                    )
         except Exception as e:  # NEVER let warming disturb the update flow
             logger.debug("warm middleware skipped: %r", e)
 
