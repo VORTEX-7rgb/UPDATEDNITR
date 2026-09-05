@@ -32,7 +32,11 @@ from app.nitris.exceptions import (
     AttendanceWorkflowError,
 )
 from app.nitris.gateway import NitrisCircuitOpenError
-from app.nitris.holidays_parser import HolidayEntry, HolidaysPage
+from app.nitris.holidays_parser import (
+    HolidayEntry,
+    HolidaysPage,
+    parse_holidays_html,
+)
 from app.nitris.session_pool import with_pooled_session
 from app.nitris.auth_gate import on_login_failure
 
@@ -47,8 +51,29 @@ _CACHE_FILE = Path(__file__).resolve().parent.parent.parent / "data" / "holidays
 
 # ── 2. Per-User Postback Continuity Cache ────────────────────────────────────
 # user_id -> (HolidaysPage, expires_at_monotonic)
+# NOTE: HolidaysPage carries raw_html. To strictly bound memory, we cap this
+# dict at _USER_PAGES_MAX_ENTRIES and prune expired entries on every store.
 _user_calendar_pages: dict[int, tuple[HolidaysPage, float]] = {}
 _PAGE_CACHE_TTL = 900.0  # 15 minutes
+_USER_PAGES_MAX_ENTRIES = 256  # Hard capacity cap
+
+
+def _prune_user_pages() -> None:
+    """Evict expired entries from _user_calendar_pages and enforce hard cap."""
+    now = time.monotonic()
+    expired = [uid for uid, (_, exp) in _user_calendar_pages.items() if exp <= now]
+    for uid in expired:
+        _user_calendar_pages.pop(uid, None)
+    if len(_user_calendar_pages) > _USER_PAGES_MAX_ENTRIES:
+        sorted_by_exp = sorted(_user_calendar_pages.items(), key=lambda kv: kv[1][1])
+        for uid, _ in sorted_by_exp[: len(_user_calendar_pages) - _USER_PAGES_MAX_ENTRIES]:
+            _user_calendar_pages.pop(uid, None)
+
+
+def _store_user_page(user_id: int, page: HolidaysPage) -> None:
+    """Safely store user page and immediately prune to prevent memory leaks."""
+    _user_calendar_pages[user_id] = (page, time.monotonic() + _PAGE_CACHE_TTL)
+    _prune_user_pages()
 
 
 def serialize_holidays_page(page: HolidaysPage) -> dict:
@@ -182,13 +207,28 @@ def get_cached_holidays(year: Optional[int] = None, month: Optional[int] = None)
 
 
 def store_cached_holidays(page: HolidaysPage, res_dict: dict) -> None:
-    """Store parsed HolidaysPage and render dict in the institute-wide cache and persist."""
+    """Store parsed HolidaysPage and render dict in the institute-wide cache and persist.
+
+    The in-memory dict update is sync and atomic. The disk write is offloaded
+    to a background thread via spawn_tracked so write_text never stalls the event loop.
+    """
     _global_month_cache[(page.year, page.month)] = (
         res_dict,
         page,
         time.monotonic() + GLOBAL_HOLIDAYS_CACHE_TTL,
     )
-    _save_disk_cache()
+    # Fire-and-forget the disk write on a background thread if event loop is running.
+    try:
+        import asyncio
+        from app.utils import spawn_tracked
+        loop = asyncio.get_running_loop()
+        if loop.is_running():
+            spawn_tracked(asyncio.to_thread(_save_disk_cache), name="holidays-disk-write")
+        else:
+            _save_disk_cache()
+    except RuntimeError:
+        # No running event loop (e.g. during import-time seed or unit tests) — write sync.
+        _save_disk_cache()
 
 
 def get_cached_user_page(user_id: int) -> Optional[HolidaysPage]:
@@ -245,7 +285,7 @@ async def fetch_user_holidays(
             # Maintain user's navigation page state
             entry = _global_month_cache.get((cached["year"], cached["month"]))
             if entry:
-                _user_calendar_pages[user_id] = (entry[1], time.monotonic() + _PAGE_CACHE_TTL)
+                _store_user_page(user_id, entry[1])
             return cached
 
     # If navigation was requested without an explicit current_page, check user's cache
@@ -266,13 +306,38 @@ async def fetch_user_holidays(
             logger.info("Serving navigated %s/%s holidays from global cache (0ms)", t_year, t_month)
             entry = _global_month_cache.get((t_year, t_month))
             if entry:
-                _user_calendar_pages[user_id] = (entry[1], time.monotonic() + _PAGE_CACHE_TTL)
+                _store_user_page(user_id, entry[1])
             return cached_target
 
     try:
         async def _work(client: NitrisClient, password: str) -> HolidaysPage:
             if direction and current_page:
-                return await client.navigate_holidays_month(current_page, direction)
+                # CRITICAL: Re-GET Home.aspx on THIS pooled client to obtain a
+                # session-matched __VIEWSTATE / __EVENTVALIDATION before posting
+                # the calendar navigation postback. The pooled client may have a
+                # DIFFERENT ASP.NET_SessionId than the session that originally
+                # rendered current_page.raw_html — ASP.NET rejects postbacks
+                # whose __EVENTVALIDATION doesn't match the active session.
+                # We then walk to the target month from the fresh page.
+                import asyncio as _asyncio
+                fresh_html = await client.fetch_home_html()
+                fresh_page = await _asyncio.to_thread(parse_holidays_html, fresh_html)
+                target_label = _target_month_label(current_page, direction)
+                if fresh_page.month_label.lower() == target_label.lower():
+                    return fresh_page
+
+                walker = fresh_page
+                for _ in range(24):
+                    step = _step_direction(walker, target_label)
+                    if step is None:
+                        return walker
+                    try:
+                        walker = await client.navigate_holidays_month(walker, step)
+                        _cache_intermediate_page(walker)
+                    except ValueError:
+                        # Calendar boundary hit — return what we reached
+                        return walker
+                return walker
             return await client.fetch_holidays()
 
         page: HolidaysPage = await with_pooled_session(
@@ -282,8 +347,8 @@ async def fetch_user_holidays(
             work=_work,
         )
 
-        # Cache per-user navigation continuity
-        _user_calendar_pages[user_id] = (page, time.monotonic() + _PAGE_CACHE_TTL)
+        # Cache per-user navigation continuity (bounded + pruned)
+        _store_user_page(user_id, page)
 
         res = {
             "success": True,
@@ -334,3 +399,72 @@ async def fetch_user_holidays(
     except Exception as e:
         logger.error("fetch_user_holidays unexpected error for user_id=%s: %r", user_id, e)
         return {"success": False, "error": f"Failed to load holidays: {e}"}
+
+
+# ── Navigation & Walking Helpers ─────────────────────────────────────────────
+
+def _cache_intermediate_page(page: HolidaysPage) -> None:
+    """Store intermediate step in global cache so future queries hit 0ms."""
+    res = {
+        "success": True,
+        "error": None,
+        "kind": "holidays",
+        "month": page.month,
+        "year": page.year,
+        "month_label": page.month_label,
+        "holidays": [
+            {
+                "day": h.day,
+                "name": h.name,
+                "month": h.month,
+                "year": h.year,
+                "is_trailing": h.is_trailing,
+            }
+            for h in page.holidays
+        ],
+        "prev_available": bool(page.prev_event_argument),
+        "next_available": bool(page.next_event_argument),
+        "page": serialize_holidays_page(page),
+    }
+    store_cached_holidays(page, res)
+
+
+def _target_month_label(current_page: HolidaysPage, direction: str) -> str:
+    """Compute the target month label after a prev/next step from current_page."""
+    import calendar as _cal
+    m, y = current_page.month, current_page.year
+    if direction.strip().lower() == "prev":
+        m -= 1
+        if m < 1:
+            m = 12
+            y -= 1
+    else:
+        m += 1
+        if m > 12:
+            m = 1
+            y += 1
+    return f"{_cal.month_name[m]} {y}"
+
+
+def _step_direction(walker: HolidaysPage, target_label: str) -> Optional[str]:
+    """Return 'prev'/'next' to step from walker toward target_label, or None
+    if walker IS the target."""
+    if walker.month_label.lower() == target_label.lower():
+        return None
+    if (walker.year, walker.month) < _label_to_ym(target_label):
+        return "next"
+    return "prev"
+
+
+def _label_to_ym(label: str) -> tuple[int, int]:
+    """Parse 'September 2026' -> (2026, 9). Returns (0, 0) on failure."""
+    import re
+    import calendar as _cal
+    m = re.match(r"^\s*([A-Za-z]+)\s+(\d{4})\s*$", label)
+    if not m:
+        return (0, 0)
+    month_name, year_str = m.group(1), m.group(2)
+    for i in range(1, 13):
+        if _cal.month_name[i].lower() == month_name.lower():
+            return (int(year_str), i)
+    return (0, 0)
