@@ -63,13 +63,14 @@ class WarmSessionMiddleware(BaseMiddleware):
             msg = getattr(event, "message", None) or (event if getattr(event, "text", None) else None)
             msg_text = getattr(msg, "text", "") or ""
 
-            is_holiday_interaction = (
-                cb_data in ("db_holidays", "holidays_refresh")
+            is_static_interaction = (
+                cb_data in ("db_holidays", "holidays_refresh", "db_exams")
                 or cb_data.startswith("holidays_")
-                or msg_text.strip().lower().startswith("/holidays")
+                or cb_data.startswith("exams_")
+                or msg_text.strip().lower().startswith(("/holidays", "/exams", "/seating"))
             )
 
-            if not is_holiday_interaction:
+            if not is_static_interaction:
                 tg_user = data.get("event_from_user")
                 user_id = _known_registered.get(getattr(tg_user, "id", None))
                 if user_id is not None:
