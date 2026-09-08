@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 class Priority(IntEnum):
     HIGH = 1     # Direct interactive user button taps (e.g. /attendance, /inbox)
+    INTERACTIVE = 1  # Alias for HIGH
     MEDIUM = 2   # Secondary operations (e.g. metadata pre-fetch, search)
     NORMAL = 2   # Alias for MEDIUM
     LOW = 3      # Periodic background crawl cycles

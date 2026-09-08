@@ -234,6 +234,9 @@ class Config:
     # plenty for < > navigation without burdening the portal.
     COOLDOWN_HOLIDAYS = int(os.getenv("COOLDOWN_HOLIDAYS", "30"))
 
+    # Exam seating schedule/details fetch cooldown (seconds).
+    COOLDOWN_EXAM_SEATING = int(os.getenv("COOLDOWN_EXAM_SEATING", "30"))
+
     # ── DB engine housekeeping ───────────────────────────────────────────────
     DB_POOL_DISPOSE_DEBOUNCE_SECONDS = float(os.getenv("DB_POOL_DISPOSE_DEBOUNCE_SECONDS", "60"))
 

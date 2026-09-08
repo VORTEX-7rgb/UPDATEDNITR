@@ -40,6 +40,11 @@ from app.nitris.constants import (
     HTML_PARSER,
     HOLIDAYS_CALENDAR_EVENT_TARGET,
     HOLIDAYS_PAGE_PATH,
+    EXAM_SEATING_MODULE_NAME,
+    EXAM_SEATING_MID_SEM_KEYWORD,
+    EXAM_SEATING_END_SEM_KEYWORD,
+    EXAM_SEATING_CTL_EXAM_TYPE,
+    EXAM_SEATING_DEFAULT_OPTION,
 )
 from app.nitris.exceptions import (
     LoginError,
@@ -50,6 +55,7 @@ from app.nitris.exceptions import (
     HiddenFieldExtractionError,
     InvalidContextError,
     PaperNotAvailableError,
+    ExamSeatingParseError,
 )
 from app.nitris.aspnet import (
     extract_form_fields,
@@ -62,6 +68,12 @@ from app.nitris.aspnet import (
     _save_debug_snapshot,
 )
 from app.nitris.holidays_parser import HolidaysPage, parse_holidays_html
+from app.nitris.exam_seating_parser import (
+    ExamScheduleItem,
+    RoomLayoutResult,
+    parse_exam_schedule_html,
+    parse_room_sitting_details_html,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1753,6 +1765,121 @@ class NitrisClient:
             )
 
         return parse_holidays_html(new_html)
+
+    # ── Examination Seating Chart Flow ─────────────────────────
+
+    async def fetch_exam_seating_schedule(
+        self, exam_type: str = "mid_sem"
+    ) -> tuple[list[ExamScheduleItem], str, str]:
+        """Fetch and parse the student's exam schedule for mid_sem or end_sem.
+
+        Args:
+            exam_type: Either 'mid_sem' (default) or 'end_sem'.
+
+        Returns:
+            Tuple of:
+              - list[ExamScheduleItem] (empty if off-season / schedule not published)
+              - raw_html (the postback response containing View buttons)
+              - subpage_url (the resolved SubMod URL with tokens)
+
+        Raises:
+            AttendanceWorkflowError: If portal navigation fails.
+            SessionExpiredError: If redirected to login.
+            ExamSeatingParseError: If the markup is corrupt.
+        """
+        keyword = (
+            EXAM_SEATING_MID_SEM_KEYWORD
+            if exam_type == "mid_sem"
+            else EXAM_SEATING_END_SEM_KEYWORD
+        )
+
+        subpage_url = str(
+            await self._resolve_module_subpage_url(
+                EXAM_SEATING_MODULE_NAME, keyword
+            )
+        )
+
+        resp = await self.client.get(
+            subpage_url,
+            headers={"Referer": f"{self.base_url}{HOME_PAGE_URL}"},
+            follow_redirects=True,
+        )
+        if resp.status_code != 200:
+            raise AttendanceWorkflowError(
+                f"Exam seating subpage returned status {resp.status_code}"
+            )
+        initial_html = resp.text
+        if is_login_page(initial_html):
+            raise SessionExpiredError("Session expired while loading exam seating page.")
+        if is_error_page(initial_html, resp):
+            raise AttendanceWorkflowError("NITRIS returned 503 while loading exam seating page.")
+
+        # Postback ddlSemesterType dropdown with "Autumn/Spring"
+        form_state = await asyncio.to_thread(extract_form_fields, initial_html)
+        postback_html = await submit_postback(
+            self.client,
+            subpage_url,
+            form_state,
+            event_target=EXAM_SEATING_CTL_EXAM_TYPE,
+            form_updates={EXAM_SEATING_CTL_EXAM_TYPE: EXAM_SEATING_DEFAULT_OPTION},
+            step_name="exam_seating_select_type",
+            debug=self._debug,
+        )
+
+        items = await asyncio.to_thread(parse_exam_schedule_html, postback_html)
+        return items, postback_html, subpage_url
+
+    async def fetch_room_sitting_details(
+        self,
+        subpage_url: str,
+        schedule_html: str,
+        postback_target: str,
+        target_roll: Optional[str] = None,
+    ) -> RoomLayoutResult:
+        """Postback the btnDetails LinkButton to fetch and parse View_Sitting_Details.aspx.
+
+        Args:
+            subpage_url: The URL of Mid_Semester.aspx or End_Semester.aspx with query tokens.
+            schedule_html: HTML of the schedule page containing the gvExamSchedule grid.
+            postback_target: The __EVENTTARGET (e.g. gvExamSchedule$ctl02$btnDetails).
+            target_roll: Student roll number to locate within the room grid.
+
+        Returns:
+            RoomLayoutResult containing seat coordinates, neighbours, and metadata.
+
+        Raises:
+            SessionExpiredError: If redirected to login.
+            AttendanceWorkflowError: If the server returns an error.
+            ExamSeatingParseError: If the details markup is unparseable.
+        """
+        form_state = await asyncio.to_thread(extract_form_fields, schedule_html)
+        payload = {
+            **form_state,
+            "__EVENTTARGET": postback_target,
+            "__EVENTARGUMENT": "",
+        }
+
+        # btnDetails returns a 302 redirect to View_Sitting_Details.aspx?{signed_tokens}
+        subpage_url_str = str(subpage_url)
+        resp = await self.client.post(
+            subpage_url_str,
+            data=payload,
+            headers={"Referer": subpage_url_str},
+            follow_redirects=True,
+        )
+        if resp.status_code != 200:
+            raise AttendanceWorkflowError(
+                f"Room sitting details request returned status {resp.status_code}"
+            )
+        details_html = resp.text
+        if is_login_page(details_html):
+            raise SessionExpiredError("Session expired while loading room sitting details.")
+        if is_error_page(details_html, resp):
+            raise AttendanceWorkflowError("NITRIS returned 503 on room sitting details.")
+
+        return await asyncio.to_thread(
+            parse_room_sitting_details_html, details_html, target_roll
+        )
 
     async def close(self) -> None:
         """Close client instance by clearing session state.

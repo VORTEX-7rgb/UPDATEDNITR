@@ -80,3 +80,7 @@ class HolidaysParseError(NitrisError):
     """Could not parse the Home.aspx holiday calendar HTML or markup changed."""
 
 
+class ExamSeatingParseError(NitrisError):
+    """Could not parse the exam seating schedule or room sitting details HTML."""
+
+

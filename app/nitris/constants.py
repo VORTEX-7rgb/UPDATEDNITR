@@ -118,3 +118,16 @@ HOLIDAYS_PREV_LINK_TITLE = "Go to the previous month"
 HOLIDAYS_NEXT_LINK_TITLE = "Go to the next month"
 HOLIDAYS_PAGE_PATH = "/nitris/Student/Home/Home.aspx"
 
+# ── Examination Seating Chart (SittingChart module) ──────────────────────
+EXAM_SEATING_MODULE_NAME = "Examination"
+EXAM_SEATING_MID_SEM_KEYWORD = "Mid_Semester.aspx"
+EXAM_SEATING_END_SEM_KEYWORD = "End_Semester.aspx"
+EXAM_SEATING_MID_SEM_PATH = "/nitris/Student/Examination/SittingChart/Mid_Semester.aspx"
+EXAM_SEATING_END_SEM_PATH = "/nitris/Student/Examination/SittingChart/End_Semester.aspx"
+EXAM_SEATING_VIEW_DETAILS_PATH = "/nitris/Student/Examination/SittingChart/View_Sitting_Details.aspx"
+
+EXAM_SEATING_CTL_EXAM_TYPE = "ctl00$ctl00$ctl00$ContentPlaceHolder2$ContentPlaceHolder1$mainContent$ddlSemesterType"
+EXAM_SEATING_GRID_ID = "ContentPlaceHolder2_ContentPlaceHolder1_mainContent_gvExamSchedule"
+EXAM_SEATING_SCHEDULE_BTN_PREFIX = "ctl00$ctl00$ctl00$ContentPlaceHolder2$ContentPlaceHolder1$mainContent$gvExamSchedule$ctl"
+EXAM_SEATING_DEFAULT_OPTION = "Autumn/Spring"
+

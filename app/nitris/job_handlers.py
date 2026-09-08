@@ -75,6 +75,8 @@ def init_job_handlers(bot) -> None:
     nitris_job_queue.register_handler("qp_prewarm_subject", handle_qp_prewarm_subject)
     nitris_job_queue.register_handler("session_warm", handle_session_warm)
     nitris_job_queue.register_handler("holidays_fetch", handle_holidays_fetch)
+    nitris_job_queue.register_handler("exam_seating_schedule_fetch", handle_exam_seating_schedule_fetch)
+    nitris_job_queue.register_handler("exam_room_layout_fetch", handle_exam_room_layout_fetch)
 
     logger.info(
         "Registered NITRIS job handlers: %s",
@@ -1365,5 +1367,127 @@ async def handle_session_warm(payload: dict, bot) -> dict:
     from app.services.session_warmer import warm_now
     ok = await warm_now(int(user_id))
     return {"success": bool(ok)}
+
+
+async def handle_exam_seating_schedule_fetch(job: NitrisJob) -> dict:
+    """Fetch student's exam schedule, format message, and edit Telegram bubble.
+
+    Payload:
+        - callback_chat_id: int
+        - callback_message_id: int
+        - interaction_token: str
+        - exam_type: str ("mid_sem" | "end_sem")
+        - force_refresh: bool
+    """
+    user_id = job.user_id
+    callback_chat_id = job.payload.get("callback_chat_id")
+    callback_message_id = job.payload.get("callback_message_id")
+    interaction_token = job.payload.get("interaction_token")
+    exam_type = job.payload.get("exam_type", "mid_sem")
+    force_refresh = job.payload.get("force_refresh", False)
+
+    from app.services.exam_seating_service import (
+        fetch_user_exam_schedule,
+        render_exam_schedule_message,
+    )
+
+    result = await fetch_user_exam_schedule(
+        user_id=user_id,
+        exam_type=exam_type,
+        force_refresh=force_refresh,
+    )
+
+    if _bot and callback_chat_id and callback_message_id:
+        try:
+            if result.get("success"):
+                text, kb = render_exam_schedule_message(result)
+                await _edit_callback_message(
+                    callback_chat_id,
+                    callback_message_id,
+                    text,
+                    reply_markup=kb,
+                    token=interaction_token,
+                )
+            else:
+                err = result.get("error", "Unknown error")
+                from aiogram.utils.keyboard import InlineKeyboardBuilder
+                from aiogram import types
+                kb = InlineKeyboardBuilder()
+                kb.row(types.InlineKeyboardButton(text="🏠 Home", callback_data="inbox_back_dashboard"))
+                kb.row(types.InlineKeyboardButton(text="🔄 Retry", callback_data=f"exams_type:{exam_type}"))
+                await _edit_callback_message(
+                    callback_chat_id,
+                    callback_message_id,
+                    f"❌ <b>Couldn't load exam schedule.</b>\n\n{esc(str(err))}",
+                    reply_markup=kb.as_markup(),
+                    token=interaction_token,
+                )
+        except Exception as e:
+            logger.warning("exam_seating_schedule_fetch: could not edit callback message: %r", e)
+
+    return result
+
+
+async def handle_exam_room_layout_fetch(job: NitrisJob) -> dict:
+    """Fetch room layout details for an exam, format message, and edit Telegram bubble.
+
+    Payload:
+        - callback_chat_id: int
+        - callback_message_id: int
+        - interaction_token: str
+        - exam_type: str ("mid_sem" | "end_sem")
+        - item_num: int
+        - force_refresh: bool
+    """
+    user_id = job.user_id
+    callback_chat_id = job.payload.get("callback_chat_id")
+    callback_message_id = job.payload.get("callback_message_id")
+    interaction_token = job.payload.get("interaction_token")
+    exam_type = job.payload.get("exam_type", "mid_sem")
+    item_num = job.payload.get("item_num", 1)
+    force_refresh = job.payload.get("force_refresh", False)
+
+    from app.services.exam_seating_service import (
+        fetch_user_room_layout,
+        render_room_seating_message,
+    )
+
+    result = await fetch_user_room_layout(
+        user_id=user_id,
+        exam_type=exam_type,
+        item_num=item_num,
+        force_refresh=force_refresh,
+    )
+
+    if _bot and callback_chat_id and callback_message_id:
+        try:
+            if result.get("success"):
+                text, kb = render_room_seating_message(result)
+                await _edit_callback_message(
+                    callback_chat_id,
+                    callback_message_id,
+                    text,
+                    reply_markup=kb,
+                    token=interaction_token,
+                )
+            else:
+                err = result.get("error", "Unknown error")
+                from aiogram.utils.keyboard import InlineKeyboardBuilder
+                from aiogram import types
+                kb = InlineKeyboardBuilder()
+                kb.row(types.InlineKeyboardButton(text="🔙 Back", callback_data=f"exams_type:{exam_type}"))
+                kb.row(types.InlineKeyboardButton(text="🔄 Retry", callback_data=f"exams_seat:{item_num}:{exam_type}"))
+                await _edit_callback_message(
+                    callback_chat_id,
+                    callback_message_id,
+                    f"❌ <b>Couldn't load seating chart.</b>\n\n{esc(str(err))}",
+                    reply_markup=kb.as_markup(),
+                    token=interaction_token,
+                )
+        except Exception as e:
+            logger.warning("exam_room_layout_fetch: could not edit callback message: %r", e)
+
+    return result
+
 
 

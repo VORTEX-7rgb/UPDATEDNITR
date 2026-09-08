@@ -139,6 +139,11 @@ class Surface:
         """The active interaction sequence token for this surface."""
         return self._owner_token
 
+    @property
+    def interaction_token(self) -> int:
+        """Alias for owner_token for job handler interaction tracking."""
+        return self._owner_token
+
     async def edit(self, text: str, reply_markup=None) -> types.Message | None:
         if not is_bubble_owner(self.message, self._owner_token):
             logger.debug("Surface edit dropped: user navigated to newer interaction")

@@ -31,6 +31,9 @@ debug_html/
 *.tmp
 *.bak
 memory/
-NITRIS_PORTAL_RECON.json
 *RECON*.json
 *recon*.json
+scratch_*.py
+
+# ── Local Persistent Caches ─────────────────────────────────────────
+data/*.json

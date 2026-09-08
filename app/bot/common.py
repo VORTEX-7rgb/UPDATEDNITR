@@ -137,6 +137,7 @@ def get_dashboard_keyboard(unread_count: int = 0) -> types.InlineKeyboardMarkup:
         types.InlineKeyboardButton(text="📚 Previous Papers", callback_data="db_papers"),
     )
     builder.row(
+        types.InlineKeyboardButton(text="💺 Exam Seating", callback_data="db_exams"),
         types.InlineKeyboardButton(text="🎉 Holidays", callback_data="db_holidays"),
     )
     builder.row(

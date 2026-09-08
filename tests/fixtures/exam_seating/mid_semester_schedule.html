@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>NITRIS - Examination Seating Chart</title></head>
+<body>
+<form method="post" action="Mid_Semester.aspx?AppId=test&AppName=test" id="form1">
+<div class="aspNetHidden">
+<input type="hidden" name="__EVENTTARGET" id="__EVENTTARGET" value="" />
+<input type="hidden" name="__EVENTARGUMENT" id="__EVENTARGUMENT" value="" />
+<input type="hidden" name="__VIEWSTATE" id="__VIEWSTATE" value="sample_viewstate_data_schedule" />
+<input type="hidden" name="__VIEWSTATEGENERATOR" id="__VIEWSTATEGENERATOR" value="A1B2C3D4" />
+<input type="hidden" name="__EVENTVALIDATION" id="__EVENTVALIDATION" value="sample_eventvalidation_data" />
+</div>
+
+<div class="container">
+    <h3>Examination Seating Chart (Mid Semester)</h3>
+    <table class="table" id="student_info">
+        <tr><td>Roll No:</td><td>725MN1011</td><td>Name:</td><td>JOHN DOE</td></tr>
+        <tr><td>Exam Type:</td><td>Autumn/Spring</td><td>Academic Year/Session:</td><td>2026-27</td></tr>
+        <tr><td>Examination:</td><td>Mid Semester</td><td></td><td></td></tr>
+    </table>
+
+    <select name="ctl00$ctl00$ctl00$ContentPlaceHolder2$ContentPlaceHolder1$mainContent$ddlSemesterType" id="ContentPlaceHolder2_ContentPlaceHolder1_mainContent_ddlSemesterType">
+        <option value="">--Select--</option>
+        <option selected="selected" value="Autumn/Spring">Autumn/Spring</option>
+        <option value="Summer/Guided/Supplementary">Summer/Guided/Supplementary</option>
+    </select>
+
+    <div>
+        <table class="table table-bordered table-hover table-striped" cellspacing="0" rules="all" border="1" id="ContentPlaceHolder2_ContentPlaceHolder1_mainContent_gvExamSchedule" style="border-collapse:collapse;">
+            <tr>
+                <th scope="col">#</th>
+                <th scope="col">Day</th>
+                <th scope="col">Date</th>
+                <th scope="col">Time</th>
+                <th scope="col">Seating</th>
+                <th scope="col">Subject</th>
+                <th scope="col">Room No</th>
+                <th scope="col">Details</th>
+            </tr>
+            <tr>
+                <td>1</td>
+                <td>Day 1</td>
+                <td>21 Sep 2026</td>
+                <td>08.00 am to 10.00 am</td>
+                <td>1st Seating</td>
+                <td>ER2251 : Mining Geology</td>
+                <td>LA2-222</td>
+                <td>
+                    <a id="ContentPlaceHolder2_ContentPlaceHolder1_mainContent_gvExamSchedule_ctl02_btnDetails" href="javascript:__doPostBack('ctl00$ctl00$ctl00$ContentPlaceHolder2$ContentPlaceHolder1$mainContent$gvExamSchedule$ctl02$btnDetails','')">View</a>
+                </td>
+            </tr>
+            <tr>
+                <td>2</td>
+                <td>Day 2</td>
+                <td>22 Sep 2026</td>
+                <td>08.00 am to 10.00 am</td>
+                <td>1st Seating</td>
+                <td>MN2101 : Surface Mining Technology</td>
+                <td>LA2-122</td>
+                <td>
+                    <a id="ContentPlaceHolder2_ContentPlaceHolder1_mainContent_gvExamSchedule_ctl03_btnDetails" href="javascript:__doPostBack('ctl00$ctl00$ctl00$ContentPlaceHolder2$ContentPlaceHolder1$mainContent$gvExamSchedule$ctl03$btnDetails','')">View</a>
+                </td>
+            </tr>
+            <tr>
+                <td>3</td>
+                <td>Day 3</td>
+                <td>23 Sep 2026</td>
+                <td>08.00 am to 10.00 am</td>
+                <td>1st Seating</td>
+                <td>MN2105 : Underground Coal Mining</td>
+                <td>LA2-012</td>
+                <td>
+                    <a id="ContentPlaceHolder2_ContentPlaceHolder1_mainContent_gvExamSchedule_ctl04_btnDetails" href="javascript:__doPostBack('ctl00$ctl00$ctl00$ContentPlaceHolder2$ContentPlaceHolder1$mainContent$gvExamSchedule$ctl04$btnDetails','')">View</a>
+                </td>
+            </tr>
+            <tr>
+                <td>4</td>
+                <td>Day 4</td>
+                <td>24 Sep 2026</td>
+                <td>08.00 am to 10.00 am</td>
+                <td>1st Seating</td>
+                <td>CS2011 : Introduction to AI and ML</td>
+                <td>LA-214</td>
+                <td>
+                    <a id="ContentPlaceHolder2_ContentPlaceHolder1_mainContent_gvExamSchedule_ctl05_btnDetails" href="javascript:__doPostBack('ctl00$ctl00$ctl00$ContentPlaceHolder2$ContentPlaceHolder1$mainContent$gvExamSchedule$ctl05$btnDetails','')">View</a>
+                </td>
+            </tr>
+            <tr>
+                <td>5</td>
+                <td>Day 5</td>
+                <td>25 Sep 2026</td>
+                <td>11.00 am to 01.00 pm</td>
+                <td>2nd Seating</td>
+                <td>HS2331 : Introduction to Society and Culture</td>
+                <td>LA-009</td>
+                <td>
+                    <a id="ContentPlaceHolder2_ContentPlaceHolder1_mainContent_gvExamSchedule_ctl06_btnDetails" href="javascript:__doPostBack('ctl00$ctl00$ctl00$ContentPlaceHolder2$ContentPlaceHolder1$mainContent$gvExamSchedule$ctl06$btnDetails','')">View</a>
+                </td>
+            </tr>
+        </table>
+    </div>
+</div>
+</form>
+</body>
+</html>

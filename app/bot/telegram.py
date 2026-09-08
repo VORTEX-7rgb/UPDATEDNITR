@@ -25,6 +25,7 @@ from app.bot.handlers.attendance import router as attendance_router
 from app.bot.handlers.inbox import router as inbox_router
 from app.bot.handlers.papers import router as papers_router
 from app.bot.handlers.holidays import router as holidays_router
+from app.bot.handlers.exam_seating import router as exam_seating_router
 from app.bot.handlers.admin import router as admin_router
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,7 @@ dp.include_router(attendance_router)
 dp.include_router(inbox_router)
 dp.include_router(papers_router)
 dp.include_router(holidays_router)
+dp.include_router(exam_seating_router)
 dp.include_router(admin_router)
 
 
