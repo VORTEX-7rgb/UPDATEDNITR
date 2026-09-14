@@ -3,6 +3,7 @@
 import logging
 import asyncio
 import html
+from typing import Optional, Any
 
 from aiogram import Router, types, F
 from aiogram.filters import Command, StateFilter
@@ -22,10 +23,19 @@ from app.bot import qpaper_registry
 from app.ui.surface import show, Surface
 from app.ui import copy as ui_copy
 from app.ui import theme as ui_theme
+from app.nitris.rate_limiter import (
+    operation_cooldown,
+    COOLDOWN_PAPER_DOWNLOAD,
+    COOLDOWN_PAPER_BATCH_DOWNLOAD,
+)
 
 logger = logging.getLogger(__name__)
 
 router = Router(name="papers_router")
+
+# Concurrency & dedup safety: in-flight tracking to prevent simultaneous duplicate downloads
+_inflight_downloads: set[tuple[int, int]] = set()      # (telegram_id, cache_id)
+_inflight_batch_downloads: set[int] = set()            # telegram_id
 
 YEAR_MAP = {
     "2627A": "2026-27/Autumn",
@@ -321,15 +331,16 @@ async def handle_paper_download(callback: types.CallbackQuery, state: FSMContext
             pass
         return
 
-    # PERF F3 — ACK FIRST: the spinner dies immediately, BEFORE any DB work.
-    # Neutral text since cached-vs-cold isn't known yet; the later specific
-    # answers were second answers on the same query (Telegram ignores those).
-    try:
-        await callback.answer("⚡ Opening paper…")
-    except Exception:
-        pass
+    # 1. In-flight check: drop immediate concurrent duplicate taps for the same paper
+    inflight_key = (telegram_id, cache_id)
+    if inflight_key in _inflight_downloads:
+        try:
+            await callback.answer("⚡ Already fetching this paper...", show_alert=False)
+        except Exception:
+            pass
+        return
 
-    # Resolve the requesting student so cold acquisitions run under THEIR OWN
+    # 2. Resolve the requesting student so cold acquisitions run under THEIR OWN
     # NITRIS account (own-creds-first policy; pool is fallback only).
     requester_user_id = None
     async with get_db_session() as session:
@@ -338,39 +349,65 @@ async def handle_paper_download(callback: types.CallbackQuery, state: FSMContext
         if user:
             requester_user_id = user.id
 
-    # Check if paper is already available in cache for instant delivery
-    snap = await qpaper_registry.qpaper_service._read_cache(cache_id)
-    is_cached = snap and snap[0] == "paper_available" and snap[1]
+    if not user:
+        try:
+            await callback.answer("⚠️ You are not registered. Use /start first.", show_alert=True)
+        except Exception:
+            pass
+        return
 
-    if is_cached:
+    # 3. Rate limiting / Cooldown check (UX guard against rapid-fire / automated tapping)
+    allowed, wait = await operation_cooldown.check(
+        user.id, "qp_download",
+        cooldown_seconds=COOLDOWN_PAPER_DOWNLOAD,
+    )
+    if not allowed:
+        try:
+            await callback.answer(f"⏳ Please wait {wait}s between downloads.", show_alert=False)
+        except Exception:
+            pass
+        return
+
+    # 4. ACK callback immediately so spinner stops
+    try:
+        await callback.answer("⚡ Opening paper…")
+    except Exception:
+        pass
+
+    _inflight_downloads.add(inflight_key)
+    try:
+        # Check if paper is already available in cache for instant delivery
+        snap = await qpaper_registry.qpaper_service._read_cache(cache_id)
+        is_cached = bool(snap and snap[0] == "paper_available" and snap[1])
+
+        logger.info(
+            "QP delivery requested: user_id=%d telegram_id=%d cache_id=%d is_cached=%s",
+            user.id, telegram_id, cache_id, is_cached,
+        )
+
+        if is_cached:
+            result: QPResult = await qpaper_registry.qpaper_service.deliver(
+                cache_id, telegram_id, requester_user_id=requester_user_id,
+                nav_markup=_qp_nav_markup(),
+            )
+            if not result.delivered:
+                surf = Surface(await callback.message.answer("⚠️ Processing paper..."))
+                await _present_qp_result(surf, result)
+            return
+
+        # ONE bubble: acquisition progress -> slow-poke persona -> receipt/error.
+        surf = Surface(await callback.message.answer(
+            f"📝 <b>Acquiring paper from NITRIS…</b>\n"
+            + ui_theme.quote("<i>Big files take a moment. This bubble will update itself.</i>")
+        ))
+        surf.poke_later(6.0, ui_copy.slow_note("acquiring"))
         result: QPResult = await qpaper_registry.qpaper_service.deliver(
             cache_id, telegram_id, requester_user_id=requester_user_id,
             nav_markup=_qp_nav_markup(),
         )
-        if result.delivered:
-            # Receipt bubble with navigation — the PDF alone used to leave the
-            # student stranded with no way back to the menu.
-            await callback.message.answer(
-                ui_copy.QP_DROPPED,
-                reply_markup=_qp_nav_markup(),
-                parse_mode=ParseMode.HTML,
-            )
-        else:
-            surf = Surface(await callback.message.answer("⚠️ Processing paper..."))
-            await _present_qp_result(surf, result)
-        return
-
-    # ONE bubble: acquisition progress -> slow-poke persona -> receipt/error.
-    surf = Surface(await callback.message.answer(
-        f"📝 <b>Acquiring paper from NITRIS…</b>\n"
-        + ui_theme.quote("<i>Big files take a moment. This bubble will update itself.</i>")
-    ))
-    surf.poke_later(6.0, ui_copy.slow_note("acquiring"))
-    result: QPResult = await qpaper_registry.qpaper_service.deliver(
-        cache_id, telegram_id, requester_user_id=requester_user_id,
-        nav_markup=_qp_nav_markup(),
-    )
-    await _present_qp_result(surf, result)
+        await _present_qp_result(surf, result)
+    finally:
+        _inflight_downloads.discard(inflight_key)
 
 
 @router.callback_query(F.data == "qp_dlall_prompt")
@@ -468,28 +505,86 @@ async def handle_qp_download_all_go(callback: types.CallbackQuery, state: FSMCon
         return
 
     selected_year = YEAR_MAP.get(year_code)
-
-    # PERF F3 — ACK FIRST: spinner dies before any DB work.
-    try:
-        await callback.answer("⚡ Starting batch…")
-    except Exception:
-        pass
-
     if not selected_year:
         await show(callback.message, "❌ Invalid academic year selected.")
         return
 
     telegram_id = callback.from_user.id
-    status_msg = await callback.message.answer("⏳ Resolving current semester courses...")
 
+    # 1. In-flight check: drop concurrent batch downloads for the same student
+    if telegram_id in _inflight_batch_downloads:
+        try:
+            await callback.answer("⚡ A batch download is already in progress for your courses.", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    # 2. Resolve registered user
     async with get_db_session() as session:
         user_repo = UserRepository(session)
         user = await user_repo.get_by_telegram_id(telegram_id)
         if not user:
-            await status_msg.edit_text("❌ You are not registered. Use /start to register.")
+            try:
+                await callback.answer("❌ You are not registered. Use /start first.", show_alert=True)
+            except Exception:
+                pass
             return
+        user_id = user.id
+
+    # 3. Cooldown check: prevent repeated batch runs within COOLDOWN_PAPER_BATCH_DOWNLOAD
+    allowed, wait = await operation_cooldown.check(
+        user.id, "qp_batch_download",
+        cooldown_seconds=COOLDOWN_PAPER_BATCH_DOWNLOAD,
+    )
+    if not allowed:
+        try:
+            await callback.answer(
+                f"⏳ Please wait {wait}s before starting another batch download.",
+                show_alert=True,
+            )
+        except Exception:
+            pass
+        return
+
+    # 4. ACK callback spinner
+    try:
+        await callback.answer("⚡ Starting batch…")
+    except Exception:
+        pass
+
+    _inflight_batch_downloads.add(telegram_id)
+    try:
+        await _run_qp_batch_download(
+            callback=callback,
+            selected_year=selected_year,
+            target_exam=target_exam,
+            type_label=type_label,
+            telegram_id=telegram_id,
+            user_id=user_id,
+            user=user,
+        )
+    finally:
+        _inflight_batch_downloads.discard(telegram_id)
+
+
+async def _run_qp_batch_download(
+    callback: types.CallbackQuery,
+    selected_year: str,
+    target_exam: Optional[str],
+    type_label: Optional[str],
+    telegram_id: int,
+    user_id: int,
+    user: Any,
+) -> None:
+    logger.info(
+        "QP batch download started: user_id=%d telegram_id=%d year=%s type=%s",
+        user_id, telegram_id, selected_year, type_label,
+    )
+    status_msg = await callback.message.answer("⏳ Resolving current semester courses...")
+
+    async with get_db_session() as session:
         snapshot_repo = SnapshotRepository(session)
-        snapshot = await snapshot_repo.get_latest_snapshot(user.id, "attendance")
+        snapshot = await snapshot_repo.get_latest_snapshot(user_id, "attendance")
         if not snapshot or not getattr(snapshot, "snapshot_json", None) or "records" not in snapshot.snapshot_json:
             await status_msg.edit_text(
                 "❌ No registered subjects found in your latest attendance snapshot. "
@@ -497,7 +592,6 @@ async def handle_qp_download_all_go(callback: types.CallbackQuery, state: FSMCon
             )
             return
         courses = list(snapshot.snapshot_json["records"])
-        user_id = user.id
 
     total_courses = len(courses)
     await status_msg.edit_text(

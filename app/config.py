@@ -152,6 +152,8 @@ class Config:
     COOLDOWN_INBOX_REFRESH = int(os.getenv("COOLDOWN_INBOX_REFRESH", "60"))
     COOLDOWN_ATTACHMENT_DOWNLOAD = int(os.getenv("COOLDOWN_ATTACHMENT_DOWNLOAD", "10"))
     COOLDOWN_PAPERS_SEARCH = int(os.getenv("COOLDOWN_PAPERS_SEARCH", "10"))
+    COOLDOWN_PAPER_DOWNLOAD = int(os.getenv("COOLDOWN_PAPER_DOWNLOAD", "3"))
+    COOLDOWN_PAPER_BATCH_DOWNLOAD = int(os.getenv("COOLDOWN_PAPER_BATCH_DOWNLOAD", "60"))
     # Prune expired cooldown entries every N writes — the bounded-memory sweep.
     RATE_LIMITER_PRUNE_EVERY = int(os.getenv("RATE_LIMITER_PRUNE_EVERY", "256"))
 
