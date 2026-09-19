@@ -9,14 +9,14 @@
 [![Aiogram 3.6](https://img.shields.io/badge/aiogram-3.6.0-2CA5E0.svg?style=flat-square&logo=telegram)](https://github.com/aiogram/aiogram)
 [![PostgreSQL 16](https://img.shields.io/badge/PostgreSQL-16%2B-336791.svg?style=flat-square&logo=postgresql)](https://www.postgresql.org/)
 [![Tests](https://img.shields.io/badge/Tests-354%20Passed-success.svg?style=flat-square)](#testing)
-[![Telegram Bot](https://img.shields.io/badge/Telegram-@Nitrisclawbot-0088cc.svg?style=flat-square&logo=telegram)](https://t.me/Nitrisclawbot)
+[![Telegram Bot](https://img.shields.io/badge/Telegram-@Nitrclaw__bot-0088cc.svg?style=flat-square&logo=telegram)](https://t.me/Nitrclaw_bot)
 
 <br/>
 
 **Eliminate the daily friction of the legacy NITRIS portal.**  
 Get real-time attendance alerts, upcoming class countdowns, campus notices with instant PDF downloads, and 1,900+ previous year question papers—all from a snappy, mobile-first Telegram bot.
 
-👉 **Ready to use immediately:** [**@Nitrisclawbot on Telegram**](https://t.me/Nitrisclawbot)
+👉 **Ready to use immediately:** [**@Nitrclaw_bot on Telegram**](https://t.me/Nitrclaw_bot)
 
 ---
 
