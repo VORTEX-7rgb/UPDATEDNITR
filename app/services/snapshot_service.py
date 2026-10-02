@@ -15,6 +15,74 @@ from app.nitris.parser import AttendanceResult
 logger = logging.getLogger(__name__)
 
 
+def _to_clean_int(val) -> int:
+    if val is None:
+        return 0
+    s = str(val).strip()
+    if not s:
+        return 0
+    try:
+        return int(s)
+    except ValueError:
+        digits = "".join(ch for ch in s if ch.isdigit() or ch == "-")
+        return int(digits) if digits else 0
+
+
+def detect_changed_attendance_subjects(
+    previous_snapshot: Optional[Snapshot],
+    new_snapshot: Snapshot,
+) -> list[str]:
+    """Identify subject codes whose attendance metrics (tc/ua/le/oa) changed.
+
+    Used to trigger selective background sync of date-wise attendance details
+    for ONLY the subjects that actually had new classes or status changes,
+    avoiding redundant portal requests.
+    """
+    if not previous_snapshot or not getattr(previous_snapshot, "snapshot_json", None):
+        return []
+
+    if not new_snapshot or not getattr(new_snapshot, "snapshot_json", None):
+        return []
+
+    prev_records = previous_snapshot.snapshot_json.get("records") or []
+    new_records = new_snapshot.snapshot_json.get("records") or []
+
+    if not isinstance(prev_records, list) or not isinstance(new_records, list):
+        return []
+
+    prev_map = {
+        str(r.get("subject_code") or "").strip().upper(): r
+        for r in prev_records
+        if isinstance(r, dict) and r.get("subject_code")
+    }
+
+    changed_subjects: list[str] = []
+    for r in new_records:
+        if not isinstance(r, dict):
+            continue
+        code = str(r.get("subject_code") or "").strip().upper()
+        if not code:
+            continue
+
+        prev_r = prev_map.get(code)
+        if prev_r is None:
+            # Subject was newly added
+            changed_subjects.append(code)
+            continue
+
+        # Check if any attendance metric changed
+        tc_changed = _to_clean_int(prev_r.get("tc")) != _to_clean_int(r.get("tc"))
+        ua_changed = _to_clean_int(prev_r.get("ua")) != _to_clean_int(r.get("ua"))
+        le_changed = _to_clean_int(prev_r.get("le")) != _to_clean_int(r.get("le"))
+        oa_changed = _to_clean_int(prev_r.get("oa")) != _to_clean_int(r.get("oa"))
+
+        if tc_changed or ua_changed or le_changed or oa_changed:
+            changed_subjects.append(code)
+
+    return changed_subjects
+
+
+
 class SnapshotService:
     """Manages serialization, hash comparison, and snapshot persistence workflows."""
 

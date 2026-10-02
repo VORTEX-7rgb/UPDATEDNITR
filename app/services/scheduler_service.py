@@ -489,16 +489,42 @@ async def init_scheduler() -> None:
 
         # Phase 3: DB write -- OUTSIDE gateway
         try:
-            from app.services.snapshot_service import SnapshotService
+            from app.services.snapshot_service import SnapshotService, detect_changed_attendance_subjects
+            changed = False
+            prev_snap = None
+            new_snap = None
             async with get_db_session() as session:
                 async with session.begin():
                     snapshot_service = SnapshotService(session)
-                    await snapshot_service.create_snapshot_if_changed(
+                    changed, prev_snap, new_snap = await snapshot_service.create_snapshot_if_changed(
                         user_id=user_id,
                         module_name="attendance",
                         attendance_result=data,
                     )
             await _update_sync_state(user_id, success=True)
+
+            # PERF: selectively trigger background date-wise fetch ONLY for subjects that changed
+            if changed and prev_snap:
+                changed_subjects = detect_changed_attendance_subjects(prev_snap, new_snap)
+                if changed_subjects:
+                    for code in changed_subjects:
+                        try:
+                            await nitris_job_queue.enqueue(
+                                job_type="attendance_details_fetch",
+                                user_id=user_id,
+                                priority=Priority.LOW,
+                                dedup_key=f"attendance_details:user:{user_id}:{code.upper()}",
+                                payload={"subject_code": code},
+                            )
+                            logger.info(
+                                "Scheduler enqueued background date-wise sync for changed subject %s (user_id=%s)",
+                                code, user_id,
+                            )
+                        except Exception as q_err:
+                            logger.warning(
+                                "Scheduler failed to enqueue date-wise sync for %s: %r",
+                                code, q_err,
+                            )
         except Exception as e:
             logger.error("Failed to save attendance snapshot for user_id=%d: %r", user_id, e)
             await _update_sync_state(user_id, success=False, error_msg=str(e))

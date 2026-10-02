@@ -580,3 +580,79 @@ async def test_client_fetch_attendance_details_postback_flow():
     payload = client.client.post.call_args.kwargs["data"]
     assert payload["__EVENTTARGET"] == "ctl00$btnDetails"
     assert payload["__VIEWSTATE"] == "vs_data"
+
+
+def test_detect_changed_attendance_subjects():
+    from app.services.snapshot_service import detect_changed_attendance_subjects
+
+    # 1. Previous snapshot is None (e.g. initial onboarding) -> empty list
+    snap_new = MagicMock()
+    snap_new.snapshot_json = {
+        "records": [
+            {"subject_code": "CS201", "tc": "10", "ua": "1", "le": "0", "oa": "1"},
+        ]
+    }
+    assert detect_changed_attendance_subjects(None, snap_new) == []
+
+    # 2. Both snapshots identical -> empty list
+    snap_prev = MagicMock()
+    snap_prev.snapshot_json = {
+        "records": [
+            {"subject_code": "CS201", "tc": "10", "ua": "1", "le": "0", "oa": "1"},
+            {"subject_code": "MA201", "tc": "12", "ua": "0", "le": "0", "oa": "0"},
+        ]
+    }
+    snap_new.snapshot_json = {
+        "records": [
+            {"subject_code": "CS201", "tc": "10", "ua": "1", "le": "0", "oa": "1"},
+            {"subject_code": "MA201", "tc": "12", "ua": "0", "le": "0", "oa": "0"},
+        ]
+    }
+    assert detect_changed_attendance_subjects(snap_prev, snap_new) == []
+
+    # 3. Only CS201 changed (TC increased to 11, UA to 2) -> returns ['CS201']
+    snap_new.snapshot_json = {
+        "records": [
+            {"subject_code": "CS201", "tc": "11", "ua": "2", "le": "0", "oa": "2"},
+            {"subject_code": "MA201", "tc": "12", "ua": "0", "le": "0", "oa": "0"},
+        ]
+    }
+    assert detect_changed_attendance_subjects(snap_prev, snap_new) == ["CS201"]
+
+    # 4. Multi-subject change -> returns all changed subjects
+    snap_new.snapshot_json = {
+        "records": [
+            {"subject_code": "CS201", "tc": "11", "ua": "2", "le": "0", "oa": "2"},
+            {"subject_code": "MA201", "tc": "13", "ua": "0", "le": "0", "oa": "0"},
+            {"subject_code": "HS201", "tc": "5", "ua": "0", "le": "0", "oa": "0"},  # newly added
+        ]
+    }
+    assert detect_changed_attendance_subjects(snap_prev, snap_new) == ["CS201", "MA201", "HS201"]
+
+
+@pytest.mark.asyncio
+async def test_handle_attendance_refresh_selective_details_enqueue():
+    """Verify that when an attendance refresh detects changed subjects, details fetch is enqueued."""
+    from app.services.snapshot_service import detect_changed_attendance_subjects
+
+    # Prev snapshot has CS201 at tc=10
+    snap_prev = MagicMock()
+    snap_prev.snapshot_json = {
+        "records": [
+            {"subject_code": "CS201", "tc": "10", "ua": "1", "le": "0", "oa": "1"},
+            {"subject_code": "MA201", "tc": "12", "ua": "0", "le": "0", "oa": "0"},
+        ]
+    }
+    # New snapshot has CS201 at tc=11, MA201 unchanged
+    snap_new = MagicMock()
+    snap_new.snapshot_json = {
+        "records": [
+            {"subject_code": "CS201", "tc": "11", "ua": "1", "le": "0", "oa": "1"},
+            {"subject_code": "MA201", "tc": "12", "ua": "0", "le": "0", "oa": "0"},
+        ]
+    }
+
+    changed = detect_changed_attendance_subjects(snap_prev, snap_new)
+    assert changed == ["CS201"]
+
+
