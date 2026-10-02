@@ -189,11 +189,20 @@ async def cmd_admin_reset_qp(message: types.Message):
 BROADCAST_MAX_RETRIES = config.BROADCAST_MAX_RETRIES        # per-user FloodWait/transient retries
 BROADCAST_PACING_SECONDS = config.BROADCAST_PACING_SECONDS  # ~20 msg/s, under Telegram's ~30/s global limit
 BROADCAST_MAX_LEN = 4000        # Telegram hard limit is 4096; leave headroom (protocol constant)
+BROADCAST_MAX_CAPTION_LEN = 1024  # Telegram official limit for media captions
 BROADCAST_PROGRESS_EVERY = config.BROADCAST_PROGRESS_EVERY  # edit status message every N sends
 
 
-async def _send_broadcast_one(bot, telegram_id: int, text: str, pin: bool = False) -> str:
-    """Send one plain-text broadcast message, optionally pinning it in the user's chat.
+async def _send_broadcast_one(
+    bot,
+    telegram_id: int,
+    text: str = "",
+    pin: bool = False,
+    copy_from_chat_id: int | None = None,
+    copy_from_message_id: int | None = None,
+    caption: str | None = None,
+) -> str:
+    """Send one broadcast message (text or media copy), optionally pinning it in the user's chat.
 
     Returns a status string:
       'ok'         — sent (and pinned, when requested)
@@ -202,13 +211,25 @@ async def _send_broadcast_one(bot, telegram_id: int, text: str, pin: bool = Fals
       'inactive'   — chat not found / deactivated
       'failed'     — send failed after retries
 
-    Pinning works in private 1-on-1 chats WITHOUT admin rights (the "must be
-    admin" rule only applies to groups/channels), so a pin failure is rare and
-    is never treated as a delivery failure.
+    When copy_from_chat_id and copy_from_message_id are provided, uses bot.copy_message
+    to forward photos, videos, animations, documents, or formatted posts natively without
+    re-uploading file bytes. Otherwise sends text via bot.send_message.
     """
     for attempt in range(BROADCAST_MAX_RETRIES):
         try:
-            sent = await bot.send_message(chat_id=telegram_id, text=text)
+            if copy_from_chat_id is not None and copy_from_message_id is not None:
+                kw = {
+                    "chat_id": telegram_id,
+                    "from_chat_id": copy_from_chat_id,
+                    "message_id": copy_from_message_id,
+                }
+                if caption is not None:
+                    kw["caption"] = caption
+                    kw["parse_mode"] = ParseMode.HTML
+                sent = await bot.copy_message(**kw)
+            else:
+                sent = await bot.send_message(chat_id=telegram_id, text=text)
+
             if pin:
                 try:
                     await bot.pin_chat_message(
@@ -244,9 +265,16 @@ async def _send_broadcast_one(bot, telegram_id: int, text: str, pin: bool = Fals
 
 
 async def _run_broadcast(
-    bot, telegram_ids: list[int], text: str,
-    status_chat_id: int, status_message_id: int,
+    bot,
+    telegram_ids: list[int],
+    text: str = "",
+    status_chat_id: int = 0,
+    status_message_id: int = 0,
     pin: bool = False,
+    copy_from_chat_id: int | None = None,
+    copy_from_message_id: int | None = None,
+    caption: str | None = None,
+    media_label: str = "Message",
 ) -> None:
     """Background worker: fan out the broadcast and report a final summary.
 
@@ -257,7 +285,15 @@ async def _run_broadcast(
     total = len(telegram_ids)
 
     for idx, tid in enumerate(telegram_ids, start=1):
-        status = await _send_broadcast_one(bot, tid, text, pin=pin)
+        status = await _send_broadcast_one(
+            bot,
+            tid,
+            text=text,
+            pin=pin,
+            copy_from_chat_id=copy_from_chat_id,
+            copy_from_message_id=copy_from_message_id,
+            caption=caption,
+        )
         if status == "ok":
             sent += 1
         elif status == "pin_failed":
@@ -276,7 +312,7 @@ async def _run_broadcast(
                     chat_id=status_chat_id,
                     message_id=status_message_id,
                     text=(
-                        f"📣 <b>Broadcasting…</b> {idx}/{total}\n"
+                        f"📣 <b>Broadcasting ({media_label})…</b> {idx}/{total}\n"
                         f"✅ {sent} · 🚫 {blocked} · 👤 {inactive} · ❌ {failed}"
                     ),
                     parse_mode=ParseMode.HTML,
@@ -288,7 +324,7 @@ async def _run_broadcast(
         await asyncio.sleep(BROADCAST_PACING_SECONDS)
 
     summary_lines = [
-        f"✅ <b>Broadcast complete</b>",
+        f"✅ <b>Broadcast complete ({media_label})</b>",
         "",
         f"📨 Delivered: <b>{sent}</b>/{total}",
     ]
@@ -316,23 +352,105 @@ async def _run_broadcast(
 
 
 async def _broadcast_common(message: types.Message, pin: bool, command_name: str) -> None:
-    """Shared logic for /broadcast and /broadcastpin (admin-gated)."""
+    """Shared logic for /broadcast and /broadcastpin (admin-gated).
+
+    Supports 3 modes:
+      1. Reply Mode: Admin replies to any message (photo, video, doc, text) with /broadcast [optional caption].
+      2. Direct Media Mode: Admin sends photo/video/doc directly with /broadcast [caption] in caption.
+      3. Plain Text Mode: Admin sends /broadcast <message text>.
+    """
     if not is_admin(message.from_user.id):
         return
 
-    args = message.text.strip().split(maxsplit=1)
-    if len(args) < 2 or not args[1].strip():
-        pin_desc = " and pins it in their chat" if pin else ""
+    copy_from_chat_id: int | None = None
+    copy_from_message_id: int | None = None
+    caption: str | None = None
+    text: str = ""
+    media_label: str = "Text"
+
+    raw_caption = message.caption.strip() if message.caption else ""
+    raw_text = message.text.strip() if message.text else ""
+    content_str = raw_text or raw_caption
+
+    # Extract command arguments (e.g. from "/broadcast hello" -> "hello")
+    cmd_args = ""
+    if content_str:
+        parts = content_str.split(maxsplit=1)
+        if len(parts) > 1:
+            cmd_args = parts[1].strip()
+
+    # Mode 1: Reply-To an existing message
+    if message.reply_to_message is not None:
+        replied = message.reply_to_message
+        copy_from_chat_id = message.chat.id
+        copy_from_message_id = replied.message_id
+        # Override caption if provided; None preserves original caption and formatting
+        caption = cmd_args if cmd_args else None
+
+        if replied.photo:
+            media_label = "Photo"
+        elif replied.video:
+            media_label = "Video"
+        elif replied.animation:
+            media_label = "GIF"
+        elif replied.document:
+            media_label = "Document"
+        elif replied.audio or replied.voice:
+            media_label = "Audio"
+        else:
+            media_label = "Message"
+
+    # Mode 2: Direct media with command in caption
+    elif message.photo or message.video or message.document or message.animation:
+        copy_from_chat_id = message.chat.id
+        copy_from_message_id = message.message_id
+        # Strip command; if no extra text, empty string clears "/broadcast" caption
+        caption = cmd_args if cmd_args else ""
+
+        if message.photo:
+            media_label = "Photo"
+        elif message.video:
+            media_label = "Video"
+        elif message.animation:
+            media_label = "GIF"
+        elif message.document:
+            media_label = "Document"
+        else:
+            media_label = "Media"
+
+    # Mode 3: Plain text command
+    elif cmd_args:
+        text = cmd_args
+        media_label = "Text"
+
+    # Nothing provided -> Show multi-mode usage guide
+    else:
+        pin_desc = " and pin" if pin else ""
         await message.answer(
-            f"Usage: <code>/{command_name} &lt;message text&gt;</code>\n\n"
-            f"Sends the message to <b>ALL</b> registered users{pin_desc} as plain text.\n"
-            "Runs in the background and reports a summary when done.",
+            f"📣 <b>Broadcast Admin Guide</b>\n\n"
+            f"Usage options to send{pin_desc} to <b>ALL</b> registered users:\n\n"
+            f"1️⃣ <b>Reply Mode (Recommended):</b>\n"
+            f"   Send or forward any photo, video, document, or post, then reply to it with <code>/{command_name}</code> (optional: add override caption).\n\n"
+            f"2️⃣ <b>Direct Media Mode:</b>\n"
+            f"   Attach a photo or video and write <code>/{command_name} &lt;caption&gt;</code> in its caption.\n\n"
+            f"3️⃣ <b>Plain Text Mode:</b>\n"
+            f"   Send <code>/{command_name} &lt;message text&gt;</code>\n\n"
+            f"<i>Broadcast runs safely in background with ~20 msg/s rate pacing.</i>",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    text = args[1].strip()
-    if len(text) > BROADCAST_MAX_LEN:
+    # Validate lengths
+    if caption is not None and len(caption) > BROADCAST_MAX_CAPTION_LEN:
+        await message.answer(
+            f"⚠️ <b>Caption too long!</b>\n\n"
+            f"Your caption is {len(caption)} characters. Telegram limits media captions to "
+            f"<b>{BROADCAST_MAX_CAPTION_LEN}</b> characters. Please shorten it.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if text and len(text) > BROADCAST_MAX_LEN:
         text = text[:BROADCAST_MAX_LEN]
 
     # Fetch IDs in a SHORT DB session, then close it before any network send.
@@ -344,7 +462,7 @@ async def _broadcast_common(message: types.Message, pin: bool, command_name: str
         await message.answer("⚠️ No registered users to broadcast to.")
         return
 
-    action = "Broadcast + Pin" if pin else "Broadcast"
+    action = f"Broadcast ({media_label}) + Pin" if pin else f"Broadcast ({media_label})"
     status_msg = await message.answer(
         f"📣 <b>{action} started</b>\n\n"
         f"👥 Target: <b>{len(telegram_ids)}</b> users\n"
@@ -355,9 +473,16 @@ async def _broadcast_common(message: types.Message, pin: bool, command_name: str
     from app.utils import spawn_tracked
     spawn_tracked(
         _run_broadcast(
-            message.bot, telegram_ids, text,
-            status_msg.chat.id, status_msg.message_id,
+            message.bot,
+            telegram_ids,
+            text=text,
+            status_chat_id=status_msg.chat.id,
+            status_message_id=status_msg.message_id,
             pin=pin,
+            copy_from_chat_id=copy_from_chat_id,
+            copy_from_message_id=copy_from_message_id,
+            caption=caption,
+            media_label=media_label,
         ),
         name=f"broadcast-{len(telegram_ids)}-users",
     )

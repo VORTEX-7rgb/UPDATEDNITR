@@ -97,6 +97,50 @@ async def test_broadcast_one_pin_fails_but_delivered():
     # Message is still delivered; only the pin failed.
     assert await _send_broadcast_one(bot, 1, "hello", pin=True) == "pin_failed"
 
+
+@pytest.mark.asyncio
+async def test_broadcast_one_copy_message_ok():
+    bot = MagicMock()
+    bot.copy_message = AsyncMock(return_value=MagicMock())
+    assert await _send_broadcast_one(bot, 1, copy_from_chat_id=100, copy_from_message_id=200) == "ok"
+    bot.copy_message.assert_awaited_once_with(chat_id=1, from_chat_id=100, message_id=200)
+
+
+@pytest.mark.asyncio
+async def test_broadcast_one_copy_message_with_caption():
+    from aiogram.enums import ParseMode
+    bot = MagicMock()
+    bot.copy_message = AsyncMock(return_value=MagicMock())
+    assert (
+        await _send_broadcast_one(
+            bot, 1, copy_from_chat_id=100, copy_from_message_id=200, caption="campus notice"
+        )
+        == "ok"
+    )
+    bot.copy_message.assert_awaited_once_with(
+        chat_id=1, from_chat_id=100, message_id=200, caption="campus notice", parse_mode=ParseMode.HTML
+    )
+
+
+@pytest.mark.asyncio
+async def test_broadcast_one_copy_message_pin_ok():
+    bot = MagicMock()
+    sent = MagicMock()
+    sent.message_id = 456
+    bot.copy_message = AsyncMock(return_value=sent)
+    bot.pin_chat_message = AsyncMock()
+
+    assert (
+        await _send_broadcast_one(
+            bot, 1, pin=True, copy_from_chat_id=100, copy_from_message_id=200
+        )
+        == "ok"
+    )
+    bot.pin_chat_message.assert_awaited_once_with(
+        chat_id=1, message_id=456, disable_notification=True
+    )
+
+
 # ── /unpin — remove last pinned broadcast from every user's chat ────────────
 
 import pytest as _pytest
@@ -203,3 +247,136 @@ async def test_run_unpin_all_summary_counts():
     assert "✅ Unpinned: <b>1</b>" in summary
     assert "⚪ Nothing pinned: <b>1</b>" in summary
     assert "🚫 Blocked the bot: <b>1</b>" in summary
+
+
+# ── _broadcast_common multi-mode tests ─────────────────────────────────────
+
+from app.bot.handlers.admin import _broadcast_common, BROADCAST_MAX_CAPTION_LEN
+
+
+@_pytest.mark.asyncio
+async def test_broadcast_common_non_admin_ignored(monkeypatch):
+    monkeypatch.setattr("app.bot.handlers.admin.is_admin", lambda uid: False)
+    msg = MagicMock()
+    msg.from_user.id = 9999
+    msg.answer = AsyncMock()
+
+    await _broadcast_common(msg, pin=False, command_name="broadcast")
+    msg.answer.assert_not_called()
+
+
+@_pytest.mark.asyncio
+async def test_broadcast_common_direct_photo_with_caption(monkeypatch):
+    monkeypatch.setattr("app.bot.handlers.admin.is_admin", lambda uid: True)
+    spawn_mock = MagicMock(side_effect=lambda coro, **kw: coro.close())
+    monkeypatch.setattr("app.utils.spawn_tracked", spawn_mock)
+
+    result_mock = MagicMock()
+    result_mock.scalars.return_value.all.return_value = [101, 102]
+    mock_session = MagicMock()
+    mock_session.execute = AsyncMock(return_value=result_mock)
+
+    class DummyDBCtx:
+        async def __aenter__(self):
+            return mock_session
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            return None
+
+    monkeypatch.setattr("app.bot.handlers.admin.get_db_session", lambda: DummyDBCtx())
+
+    msg = MagicMock()
+    msg.from_user.id = 123
+    msg.chat.id = 555
+    msg.message_id = 777
+    msg.text = None
+    msg.caption = "/broadcast New semester schedule released!"
+    msg.photo = [MagicMock()]
+    msg.video = None
+    msg.document = None
+    msg.animation = None
+    msg.reply_to_message = None
+
+    status_msg = MagicMock()
+    status_msg.chat.id = 555
+    status_msg.message_id = 888
+    msg.answer = AsyncMock(return_value=status_msg)
+
+    await _broadcast_common(msg, pin=False, command_name="broadcast")
+
+    msg.answer.assert_awaited_once()
+    assert "Broadcast (Photo) started" in msg.answer.await_args[0][0]
+    spawn_mock.assert_called_once()
+
+
+@_pytest.mark.asyncio
+async def test_broadcast_common_reply_to_media(monkeypatch):
+    monkeypatch.setattr("app.bot.handlers.admin.is_admin", lambda uid: True)
+    spawn_mock = MagicMock(side_effect=lambda coro, **kw: coro.close())
+    monkeypatch.setattr("app.utils.spawn_tracked", spawn_mock)
+
+    result_mock = MagicMock()
+    result_mock.scalars.return_value.all.return_value = [101]
+    mock_session = MagicMock()
+    mock_session.execute = AsyncMock(return_value=result_mock)
+
+    class DummyDBCtx:
+        async def __aenter__(self):
+            return mock_session
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            return None
+
+    monkeypatch.setattr("app.bot.handlers.admin.get_db_session", lambda: DummyDBCtx())
+
+    replied = MagicMock()
+    replied.message_id = 999
+    replied.photo = None
+    replied.video = MagicMock()  # video attachment
+    replied.animation = None
+    replied.document = None
+    replied.audio = None
+    replied.voice = None
+
+    msg = MagicMock()
+    msg.from_user.id = 123
+    msg.chat.id = 555
+    msg.message_id = 1000
+    msg.text = "/broadcastpin Notice video"
+    msg.caption = None
+    msg.photo = None
+    msg.video = None
+    msg.document = None
+    msg.animation = None
+    msg.reply_to_message = replied
+
+    status_msg = MagicMock()
+    status_msg.chat.id = 555
+    status_msg.message_id = 1001
+    msg.answer = AsyncMock(return_value=status_msg)
+
+    await _broadcast_common(msg, pin=True, command_name="broadcastpin")
+
+    assert "Broadcast (Video) + Pin started" in msg.answer.await_args[0][0]
+    spawn_mock.assert_called_once()
+
+
+@_pytest.mark.asyncio
+async def test_broadcast_common_caption_too_long(monkeypatch):
+    monkeypatch.setattr("app.bot.handlers.admin.is_admin", lambda uid: True)
+    msg = MagicMock()
+    msg.from_user.id = 123
+    msg.chat.id = 555
+    msg.message_id = 777
+    msg.text = None
+    msg.caption = "/broadcast " + ("A" * (BROADCAST_MAX_CAPTION_LEN + 10))
+    msg.photo = [MagicMock()]
+    msg.video = None
+    msg.document = None
+    msg.animation = None
+    msg.reply_to_message = None
+    msg.answer = AsyncMock()
+
+    await _broadcast_common(msg, pin=False, command_name="broadcast")
+
+    msg.answer.assert_awaited_once()
+    assert "Caption too long" in msg.answer.await_args[0][0]
+
