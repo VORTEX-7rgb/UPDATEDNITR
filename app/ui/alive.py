@@ -54,13 +54,15 @@ def compose_today_block(
     elif now_next is not None:
         if now_next.current_class is not None:
             c = now_next.current_class
-            lines.append(f"🟢 Now: <b>{esc(c.subject_code)}</b>"
+            subj_title = f"{c.subject_name} ({c.subject_code})" if c.subject_name and c.subject_name.strip().upper() != c.subject_code.strip().upper() else c.subject_code
+            lines.append(f"🟢 Now: <b>{esc(subj_title)}</b>"
                          + (f" · {esc(c.room)}" if c.room else ""))
         elif now_next.next_class is not None:
             n = now_next.next_class
             mins = now_next.minutes_until_next
             eta = f" · in {mins // 60}h {mins % 60:02d}m" if mins else ""
-            lines.append(f"📅 Next: <b>{esc(n.subject_code)}</b>"
+            subj_title = f"{n.subject_name} ({n.subject_code})" if n.subject_name and n.subject_name.strip().upper() != n.subject_code.strip().upper() else n.subject_code
+            lines.append(f"📅 Next: <b>{esc(subj_title)}</b>"
                          + (f" · {esc(n.room)}" if n.room else "")
                          + f" · {n.start_time.strftime('%H:%M')}{eta}")
         elif now_next.is_weekend:

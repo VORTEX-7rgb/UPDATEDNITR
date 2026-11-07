@@ -871,8 +871,15 @@ def get_next_exam_banner_line(user_id: int, now: datetime) -> Optional[str]:
             hour = int(h) % 12 + (12 if p.upper() == "PM" else 0)
             end_t = dtime(hour, int(m))
 
-        subj = it.get("subject", "")
-        code = subj.split(":")[0].strip() if ":" in subj else subj[:8].strip()
+        subj = it.get("subject", "").strip()
+        if ":" in subj:
+            code_part, name_part = [p.strip() for p in subj.split(":", 1)]
+            if name_part and code_part:
+                display_subj = f"{name_part} ({code_part})"
+            else:
+                display_subj = name_part or code_part
+        else:
+            display_subj = subj
         room = it.get("room_no", "").strip()
         room_part = f" · Room {esc(room)}" if room else ""
 
@@ -883,17 +890,17 @@ def get_next_exam_banner_line(user_id: int, now: datetime) -> Optional[str]:
             if end_t and now_time > end_t:
                 continue
             if start_t and now_time >= start_t:
-                return f"🔴 Exam NOW: <b>{esc(code)}</b>{room_part}"
+                return f"🔴 Exam NOW: <b>{esc(display_subj)}</b>{room_part}"
             start_fmt = start_t.strftime("%I:%M %p").lstrip("0") if start_t else ""
             time_part = f" at {start_fmt}" if start_fmt else ""
-            return f"🚨 Today: <b>{esc(code)}</b>{time_part}{room_part}"
+            return f"🚨 Today: <b>{esc(display_subj)}</b>{time_part}{room_part}"
         elif delta == 1:
             start_fmt = start_t.strftime("%I:%M %p").lstrip("0") if start_t else ""
             time_part = f" at {start_fmt}" if start_fmt else ""
-            return f"⚠️ Tomorrow: <b>{esc(code)}</b>{time_part}{room_part}"
+            return f"⚠️ Tomorrow: <b>{esc(display_subj)}</b>{time_part}{room_part}"
         else:
             d_short = exam_date.strftime("%d %b")
-            return f"🎯 Next Exam: <b>{esc(code)}</b> in {delta}d ({d_short}){room_part}"
+            return f"🎯 Next Exam: <b>{esc(display_subj)}</b> in {delta}d ({d_short}){room_part}"
 
     return None
 
