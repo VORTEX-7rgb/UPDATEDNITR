@@ -908,7 +908,8 @@ def get_next_exam_banner_line(user_id: int, now: datetime, roll_number: str | No
             return f"⚠️ Tomorrow: <b>{esc(display_subj)}</b>{time_part}{room_part}"
         else:
             d_short = exam_date.strftime("%d %b")
-            return f"🎯 Next Exam: <b>{esc(display_subj)}</b> in {delta}d ({d_short}){room_part}"
+            days_str = f"{delta} days left" if delta > 1 else "1 day left"
+            return f"🎯 Next Exam: <b>{esc(display_subj)}</b> · {days_str} ({d_short}){room_part}"
 
     return None
 
