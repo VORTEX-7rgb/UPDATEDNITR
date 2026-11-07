@@ -829,3 +829,71 @@ def render_room_seating_message(result: dict) -> tuple[str, types.InlineKeyboard
     )
 
     return "\n".join(lines), builder.as_markup()
+
+def get_next_exam_banner_line(user_id: int, now: datetime) -> Optional[str]:
+    """Return a single-line dashboard banner for the student's next upcoming exam.
+
+    Returns None if no exam schedule is cached, all exams have concluded,
+    or the date is unparseable.
+    """
+    from datetime import time as dtime
+
+    cached_sched = get_cached_user_schedule(user_id, "end_sem")
+    if not cached_sched or not cached_sched.get("items"):
+        return None
+
+    today_date = now.date()
+    now_time = now.time()
+
+    for it in cached_sched["items"]:
+        d_str = it.get("date_str", "").strip()
+        exam_date = None
+        for fmt in ("%d %b %Y", "%d-%b-%Y", "%d/%m/%Y", "%Y-%m-%d"):
+            try:
+                exam_date = datetime.strptime(d_str, fmt).date()
+                break
+            except ValueError:
+                pass
+        if not exam_date:
+            continue
+
+        t_str = it.get("time_str", "")
+        times = re.findall(r"(\d{1,2})[.:](\d{2})\s*(AM|PM)", t_str, re.I)
+
+        start_t = None
+        end_t = None
+        if len(times) >= 1:
+            h, m, p = times[0]
+            hour = int(h) % 12 + (12 if p.upper() == "PM" else 0)
+            start_t = dtime(hour, int(m))
+        if len(times) >= 2:
+            h, m, p = times[1]
+            hour = int(h) % 12 + (12 if p.upper() == "PM" else 0)
+            end_t = dtime(hour, int(m))
+
+        subj = it.get("subject", "")
+        code = subj.split(":")[0].strip() if ":" in subj else subj[:8].strip()
+        room = it.get("room_no", "").strip()
+        room_part = f" · Room {esc(room)}" if room else ""
+
+        delta = (exam_date - today_date).days
+        if delta < 0:
+            continue
+        elif delta == 0:
+            if end_t and now_time > end_t:
+                continue
+            if start_t and now_time >= start_t:
+                return f"🔴 Exam NOW: <b>{esc(code)}</b>{room_part}"
+            start_fmt = start_t.strftime("%I:%M %p").lstrip("0") if start_t else ""
+            time_part = f" at {start_fmt}" if start_fmt else ""
+            return f"🚨 Today: <b>{esc(code)}</b>{time_part}{room_part}"
+        elif delta == 1:
+            start_fmt = start_t.strftime("%I:%M %p").lstrip("0") if start_t else ""
+            time_part = f" at {start_fmt}" if start_fmt else ""
+            return f"⚠️ Tomorrow: <b>{esc(code)}</b>{time_part}{room_part}"
+        else:
+            d_short = exam_date.strftime("%d %b")
+            return f"🎯 Next Exam: <b>{esc(code)}</b> in {delta}d ({d_short}){room_part}"
+
+    return None
+

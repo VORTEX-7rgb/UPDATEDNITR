@@ -44,6 +44,7 @@ def compose_today_block(
     unread_count: int,
     timetable_synced: bool,
     overall_pct: int | None = None,
+    exam_line: str | None = None,
 ) -> str:
     lines: list[str] = []
 
@@ -68,6 +69,10 @@ def compose_today_block(
             lines.append("🌙 Done for today")
         else:
             lines.append("☕ No class right now")
+
+    # Exam banner (single sleek line, zero clutter)
+    if exam_line:
+        lines.append(exam_line)
 
     # Attendance health
     if summary is not None and summary.subjects:
@@ -243,6 +248,9 @@ async def render_dashboard(session: AsyncSession, user: User, unread_count: int)
     if briefing_text:
         parts.append(briefing_text)
 
+    from app.services.exam_seating_service import get_next_exam_banner_line
+    exam_line = get_next_exam_banner_line(user.id, now)
+
     pct = overall_attended_pct(summary)
     today = compose_today_block(
         now_next=now_next,
@@ -250,6 +258,7 @@ async def render_dashboard(session: AsyncSession, user: User, unread_count: int)
         unread_count=unread_count,
         timetable_synced=bool(entries),
         overall_pct=pct,
+        exam_line=exam_line,
     )
     parts.append(today)
 
