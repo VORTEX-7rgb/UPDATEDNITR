@@ -251,7 +251,7 @@ async def render_dashboard(session: AsyncSession, user: User, unread_count: int)
         parts.append(briefing_text)
 
     from app.services.exam_seating_service import get_next_exam_banner_line
-    exam_line = get_next_exam_banner_line(user.id, now)
+    exam_line = get_next_exam_banner_line(user.id, now, roll_number=user.roll_number)
 
     pct = overall_attended_pct(summary)
     today = compose_today_block(

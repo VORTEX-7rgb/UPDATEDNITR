@@ -830,7 +830,7 @@ def render_room_seating_message(result: dict) -> tuple[str, types.InlineKeyboard
 
     return "\n".join(lines), builder.as_markup()
 
-def get_next_exam_banner_line(user_id: int, now: datetime) -> Optional[str]:
+def get_next_exam_banner_line(user_id: int, now: datetime, roll_number: str | None = None) -> Optional[str]:
     """Return a single-line dashboard banner for the student's next upcoming exam.
 
     Returns None if no exam schedule is cached, all exams have concluded,
@@ -839,6 +839,14 @@ def get_next_exam_banner_line(user_id: int, now: datetime) -> Optional[str]:
     from datetime import time as dtime
 
     cached_sched = get_cached_user_schedule(user_id, "end_sem")
+    if not cached_sched and roll_number:
+        now_mono = time.monotonic()
+        for (uid, et), (sched_data, exp) in list(_user_schedule_cache.items()):
+            if et == "end_sem" and sched_data.get("roll_number") == roll_number and exp > now_mono:
+                cached_sched = sched_data
+                _user_schedule_cache[(user_id, "end_sem")] = (sched_data, exp)
+                break
+
     if not cached_sched or not cached_sched.get("items"):
         return None
 
