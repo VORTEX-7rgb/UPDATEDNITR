@@ -50,7 +50,7 @@ def test_today_block_full_house():
     text = compose_today_block(now_next=nn,
                                summary=summarize(_records()),
                                unread_count=2, timetable_synced=True)
-    assert "📅 Next: <b>MN2105</b>" in text
+    assert "Next Class: <b>MN2105</b>" in text
     assert "in 1h 00m" in text or "in 1h 0m" in text
     assert "Attendance: <b>WATCH" in text or "🟡 Attendance" in text
     assert "⚠️ CS2011" in text          # riskiest surfaced
@@ -158,4 +158,4 @@ def test_resolver_feeds_today_block_tomorrow_case():
     nn = resolve_now_and_next(tt_entries, sat_evening)
     text = compose_today_block(now_next=nn, summary=summarize(_records()),
                                unread_count=0, timetable_synced=True)
-    assert "+2d" in text or "Next:" in text      # Monday lookahead surfaces
+    assert "+2d" in text or "Next Class:" in text      # Monday lookahead surfaces
