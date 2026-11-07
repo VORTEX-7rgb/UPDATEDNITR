@@ -1411,7 +1411,7 @@ async def handle_exam_seating_schedule_fetch(job: NitrisJob) -> dict:
     callback_chat_id = job.payload.get("callback_chat_id")
     callback_message_id = job.payload.get("callback_message_id")
     interaction_token = job.payload.get("interaction_token")
-    exam_type = job.payload.get("exam_type", "mid_sem")
+    exam_type = job.payload.get("exam_type", "end_sem")
     force_refresh = job.payload.get("force_refresh", False)
 
     from app.services.exam_seating_service import (
@@ -1471,7 +1471,7 @@ async def handle_exam_room_layout_fetch(job: NitrisJob) -> dict:
     callback_chat_id = job.payload.get("callback_chat_id")
     callback_message_id = job.payload.get("callback_message_id")
     interaction_token = job.payload.get("interaction_token")
-    exam_type = job.payload.get("exam_type", "mid_sem")
+    exam_type = job.payload.get("exam_type", "end_sem")
     item_num = job.payload.get("item_num", 1)
     force_refresh = job.payload.get("force_refresh", False)
 

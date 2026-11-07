@@ -127,7 +127,7 @@ def get_user_schedule_state(
 
 def get_cached_user_schedule(
     user_id: int,
-    exam_type: str = "mid_sem",
+    exam_type: str = "end_sem",
 ) -> Optional[dict]:
     """Retrieve persistently cached schedule dictionary for user and exam type."""
     entry = _user_schedule_cache.get((user_id, exam_type))
@@ -283,7 +283,7 @@ def store_cached_room_layout(cache_key: str, data: dict) -> None:
 
 async def fetch_user_exam_schedule(
     user_id: int,
-    exam_type: str = "mid_sem",
+    exam_type: str = "end_sem",
     force_refresh: bool = False,
 ) -> dict:
     """Fetch student's exam schedule for mid_sem or end_sem via pooled session."""
@@ -703,10 +703,10 @@ def format_neighbours_block(neighbours: Optional[dict]) -> str:
 
 def render_exam_schedule_message(result: dict) -> tuple[str, types.InlineKeyboardMarkup]:
     """Render the student's exam schedule overview with seating buttons."""
-    exam_type = result.get("exam_type", "mid_sem")
-    exam_title = "Mid Semester" if exam_type == "mid_sem" else "End Semester"
-    other_type = "end_sem" if exam_type == "mid_sem" else "mid_sem"
-    other_title = "End Sem" if exam_type == "mid_sem" else "Mid Sem"
+    exam_type = result.get("exam_type", "end_sem")
+    exam_title = "End Semester" if exam_type == "end_sem" else "Mid Semester"
+    other_type = "mid_sem" if exam_type == "end_sem" else "end_sem"
+    other_title = "Mid Sem" if exam_type == "end_sem" else "End Sem"
 
     items: list[dict] = result.get("items", [])
     roll_number = result.get("roll_number", "")
@@ -779,7 +779,7 @@ def render_room_seating_message(result: dict) -> tuple[str, types.InlineKeyboard
     item = result.get("item", {})
     layout = result.get("layout", {})
     roll_number = result.get("roll_number", "")
-    exam_type = result.get("exam_type", "mid_sem")
+    exam_type = result.get("exam_type", "end_sem")
     item_num = item.get("num", 1)
 
     builder = InlineKeyboardBuilder()

@@ -1769,7 +1769,7 @@ class NitrisClient:
     # ── Examination Seating Chart Flow ─────────────────────────
 
     async def fetch_exam_seating_schedule(
-        self, exam_type: str = "mid_sem"
+        self, exam_type: str = "end_sem"
     ) -> tuple[list[ExamScheduleItem], str, str]:
         """Fetch and parse the student's exam schedule for mid_sem or end_sem.
 

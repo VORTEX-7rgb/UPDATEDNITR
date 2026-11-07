@@ -46,7 +46,7 @@ async def _enqueue_schedule_fetch(
     chat_id: int,
     message_id: int,
     surf: Surface,
-    exam_type: str = "mid_sem",
+    exam_type: str = "end_sem",
     force_refresh: bool = False,
 ) -> None:
     token = getattr(surf, "owner_token", None)
@@ -78,7 +78,7 @@ async def _enqueue_room_layout_fetch(
     chat_id: int,
     message_id: int,
     surf: Surface,
-    exam_type: str = "mid_sem",
+    exam_type: str = "end_sem",
     item_num: int = 1,
     force_refresh: bool = False,
 ) -> None:
@@ -133,7 +133,7 @@ async def cmd_exams(message: types.Message):
     note_registered_user(telegram_id, user.id)
 
     # Fast-path: check persistent or in-memory cache (0ms response)
-    cached_sched = get_cached_user_schedule(user.id, "mid_sem")
+    cached_sched = get_cached_user_schedule(user.id, "end_sem")
     if cached_sched:
         res = {
             "success": True,
@@ -146,12 +146,11 @@ async def cmd_exams(message: types.Message):
         return
 
     cached_state = get_user_schedule_state(user.id)
-    if cached_state:
+    if cached_state and "End_Semester.aspx" in str(cached_state[0]):
         subpage_url, _, items_dicts = cached_state
-        exam_type = "mid_sem" if "Mid_Semester.aspx" in str(subpage_url) else "end_sem"
         res = {
             "success": True,
-            "exam_type": exam_type,
+            "exam_type": "end_sem",
             "items": items_dicts,
             "roll_number": user.roll_number,
         }
@@ -170,7 +169,7 @@ async def cmd_exams(message: types.Message):
         chat_id=message.chat.id,
         message_id=status_msg.message_id,
         surf=surf,
-        exam_type="mid_sem",
+        exam_type="end_sem",
     )
 
 
@@ -195,7 +194,7 @@ async def cb_dashboard_exams(callback: types.CallbackQuery):
     surf = Surface(callback.message)
 
     # Fast-path: check persistent or in-memory cache (0ms response)
-    cached_sched = get_cached_user_schedule(user.id, "mid_sem")
+    cached_sched = get_cached_user_schedule(user.id, "end_sem")
     if cached_sched:
         res = {
             "success": True,
@@ -209,12 +208,11 @@ async def cb_dashboard_exams(callback: types.CallbackQuery):
         return
 
     cached_state = get_user_schedule_state(user.id)
-    if cached_state:
+    if cached_state and "End_Semester.aspx" in str(cached_state[0]):
         subpage_url, _, items_dicts = cached_state
-        exam_type = "mid_sem" if "Mid_Semester.aspx" in str(subpage_url) else "end_sem"
         res = {
             "success": True,
-            "exam_type": exam_type,
+            "exam_type": "end_sem",
             "items": items_dicts,
             "roll_number": user.roll_number,
         }
@@ -229,7 +227,7 @@ async def cb_dashboard_exams(callback: types.CallbackQuery):
         chat_id=callback.message.chat.id,
         message_id=callback.message.message_id,
         surf=surf,
-        exam_type="mid_sem",
+        exam_type="end_sem",
     )
     await callback.answer()
 
@@ -238,7 +236,7 @@ async def cb_dashboard_exams(callback: types.CallbackQuery):
 async def cb_exams_switch_type(callback: types.CallbackQuery):
     """Switch exam type view (Mid Sem <-> End Sem)."""
     parts = callback.data.split(":")
-    exam_type = parts[1] if len(parts) > 1 else "mid_sem"
+    exam_type = parts[1] if len(parts) > 1 else "end_sem"
 
     telegram_id = callback.from_user.id
     async with get_db_session() as session:
@@ -282,7 +280,7 @@ async def cb_exams_switch_type(callback: types.CallbackQuery):
 async def cb_exams_refresh(callback: types.CallbackQuery):
     """Force-refresh exam schedule from NITRIS."""
     parts = callback.data.split(":")
-    exam_type = parts[1] if len(parts) > 1 else "mid_sem"
+    exam_type = parts[1] if len(parts) > 1 else "end_sem"
 
     telegram_id = callback.from_user.id
     async with get_db_session() as session:
@@ -319,7 +317,7 @@ async def cb_exams_seat_details(callback: types.CallbackQuery):
     """View seating layout & 360-degree neighbours for a specific exam item."""
     parts = callback.data.split(":")
     item_num = int(parts[1]) if len(parts) > 1 else 1
-    exam_type = parts[2] if len(parts) > 2 else "mid_sem"
+    exam_type = parts[2] if len(parts) > 2 else "end_sem"
 
     telegram_id = callback.from_user.id
     async with get_db_session() as session:
@@ -385,7 +383,7 @@ async def cb_exams_seat_refresh(callback: types.CallbackQuery):
     """Force-refresh room seating layout from NITRIS."""
     parts = callback.data.split(":")
     item_num = int(parts[1]) if len(parts) > 1 else 1
-    exam_type = parts[2] if len(parts) > 2 else "mid_sem"
+    exam_type = parts[2] if len(parts) > 2 else "end_sem"
 
     telegram_id = callback.from_user.id
     async with get_db_session() as session:
@@ -421,7 +419,7 @@ async def cb_exams_seat_refresh(callback: types.CallbackQuery):
 async def cb_exams_back_to_schedule(callback: types.CallbackQuery):
     """Return from room seating view back to the schedule overview."""
     parts = callback.data.split(":")
-    exam_type = parts[1] if len(parts) > 1 else "mid_sem"
+    exam_type = parts[1] if len(parts) > 1 else "end_sem"
 
     telegram_id = callback.from_user.id
     async with get_db_session() as session:
@@ -451,17 +449,20 @@ async def cb_exams_back_to_schedule(callback: types.CallbackQuery):
 
     cached_state = get_user_schedule_state(user.id)
     if cached_state:
-        _, _, items_dicts = cached_state
-        res = {
-            "success": True,
-            "exam_type": exam_type,
-            "items": items_dicts,
-            "roll_number": user.roll_number,
-        }
-        text, kb = render_exam_schedule_message(res)
-        await surf.edit(text, kb)
-        await callback.answer()
-        return
+        subpage_url, _, items_dicts = cached_state
+        if (exam_type == "end_sem" and "End_Semester.aspx" in str(subpage_url)) or (
+            exam_type == "mid_sem" and "Mid_Semester.aspx" in str(subpage_url)
+        ):
+            res = {
+                "success": True,
+                "exam_type": exam_type,
+                "items": items_dicts,
+                "roll_number": user.roll_number,
+            }
+            text, kb = render_exam_schedule_message(res)
+            await surf.edit(text, kb)
+            await callback.answer()
+            return
 
     await surf.edit("⏳ <b>Loading exam schedule…</b>", _kb_loading())
     await _enqueue_schedule_fetch(
